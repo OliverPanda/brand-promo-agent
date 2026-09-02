@@ -82,6 +82,7 @@
     <input id="styleReference" placeholder="例如：赛博朋克 / https://..." />
 
     <label style="margin-top:12px;"><input type="checkbox" id="hitlEnabled" checked style="width:auto;margin-right:8px;" />启用脚本人工审核门（生成素材前先确认脚本）</label>
+    <label style="margin-top:8px;"><input type="checkbox" id="finalGateEnabled" checked style="width:auto;margin-right:8px;" />启用成片人工审核门（合成后验收成片再交付）</label>
 
     <div style="margin-top:18px; display:flex; gap:10px;">
       <button id="genBtn" onclick="submitBrief()">生成宣传片</button>
@@ -111,11 +112,23 @@
   </div>
 </div>
 
+<!-- 成片 HITL 审核门（FR-9.2 / M3） -->
+<div class="modal hidden" id="finalGateModal">
+  <div class="box">
+    <h3 style="margin-top:0;">成片验收门</h3>
+    <div id="finalPreview"></div>
+    <div style="margin-top:14px; display:flex; gap:10px; justify-content:flex-end;">
+      <button class="ghost" onclick="approveFinal(false)">重生成（指定分镜）</button>
+      <button onclick="approveFinal(true)">验收并交付</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const AUDIENCE = ["Z世代","白领","企业采购","宝妈","学生","极客"];
 const TONES = ["科技感","温情","高端","国潮","搞笑","专业"];
 let audienceSel = new Set(), toneSel = new Set();
-let es = null, currentRunId = null, pendingScript = null, gateVoice = [], BUDGET_CAP = null;
+let es = null, currentRunId = null, pendingScript = null, gateVoice = [], BUDGET_CAP = null, QUOTA_CAP = null;
 
 function buildChips(containerId, items, sel) {
   const c = document.getElementById(containerId);
@@ -135,6 +148,7 @@ async function fetchMode() {
   try {
     const c = await (await fetch("/api/config")).json();
     BUDGET_CAP = c.budgetCap;
+    QUOTA_CAP = c.quotaCap;
     document.getElementById("modeBadge").textContent =
       c.mode === "real" ? `真实模式（one-api，预算上限 ¥${c.budgetCap}）` : "DEMO 离线模式";
   } catch {}
@@ -160,6 +174,7 @@ async function submitBrief() {
     audience: [...audienceSel], tones: [...toneSel],
     keyMessages: v("keyMessages").split("\n").map(s=>s.trim()).filter(Boolean),
     styleReference: v("styleReference") || undefined, hitlEnabled: document.getElementById("hitlEnabled").checked,
+    finalGateEnabled: document.getElementById("finalGateEnabled").checked,
   };
   if (!brief.brandName || !brief.productName || !brief.coreSellingPoint) { alert("请填品牌名、产品名、核心卖点"); return; }
   document.getElementById("genBtn").disabled = true;
@@ -177,6 +192,7 @@ function openStream(runId) {
   if (es) es.close();
   es = new EventSource("/api/generate/"+runId+"/stream");
   es.addEventListener("progress", e => onProgress(JSON.parse(e.data)));
+  es.addEventListener("final-review", e => onFinalReview(JSON.parse(e.data)));
   es.addEventListener("run-done", e => onDone(JSON.parse(e.data).run));
   es.addEventListener("run-failed", e => { alert("生成失败：" + e.data); es.close(); });
 }
@@ -209,6 +225,27 @@ function approveScript(useEdits) {
   document.getElementById("gateModal").classList.add("hidden");
   setStep("writeScript", "running", "已确认，继续…");
 }
+
+// 成片门（FR-9.2 / M3）：composite 完成后弹出验收门，approve=交付，reject=重新生成。
+function onFinalReview(ev) {
+  const p = ev.preview || {};
+  let html = "";
+  if (p.poster) html += `<img src="${p.poster}" style="max-width:280px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
+  if (p.videoUrl) html += `<p><a class="dl" href="${p.videoUrl}" target="_blank">预览成片</a></p>`;
+  const scenes = p.gallery || [];
+  if (scenes.length) {
+    html += `<div class="gallery">` + scenes.map(s=>`<div class="scene">${s.mediaUrl?`<img src="${s.mediaUrl}"/>`:`<div style="padding:16px;color:var(--bad)">缺失</div>`}<div class="cap">#${s.index} ${esc(s.subtitle||"")}</div></div>`).join("") + `</div>`;
+  }
+  if (p.note) html += `<div class="note">${p.note}</div>`;
+  document.getElementById("finalPreview").innerHTML = html;
+  document.getElementById("finalGateModal").classList.remove("hidden");
+}
+function approveFinal(approve) {
+  const body = approve ? { decision: "approve" } : { decision: "reject", scenes: [] };
+  fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  document.getElementById("finalGateModal").classList.add("hidden");
+  setStep("composite", approve ? "done" : "running", approve ? "验收通过，交付中…" : "重新生成中…");
+}
 function esc(s){ return String(s).replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
 
 function renderDelivery(run) {
@@ -220,7 +257,7 @@ function renderDelivery(run) {
   // 成本汇总（M2 / FR-10）
   if (run.cost && run.cost.length) {
     const total = run.cost.reduce((a,c)=>a+(c.amount||0),0);
-    html += `<div class="card" style="margin-top:12px;"><b>本次预估成本</b>：¥${total.toFixed(4)} / 上限 ¥${BUDGET_CAP ?? "?"}<ul style="margin:8px 0 0;padding-left:18px;font-size:13px;color:var(--sub);">`;
+    html += `<div class="card" style="margin-top:12px;"><b>本次预估成本</b>：¥${total.toFixed(4)} / 预算上限 ¥${BUDGET_CAP ?? "?"}${QUOTA_CAP!=null?` ｜ 账户配额上限 ¥${QUOTA_CAP}`:""}<ul style="margin:8px 0 0;padding-left:18px;font-size:13px;color:var(--sub);">`;
     run.cost.forEach(c=>{ html += `<li>${c.step}：¥${(c.amount||0).toFixed(4)}${c.tokens?` （${c.tokens} tokens）`:""}</li>`; });
     html += `</ul></div>`;
   }

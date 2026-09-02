@@ -3,10 +3,10 @@
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { mastra } from "./mastra/workflow.js";
-import { STEP } from "./mastra/workflow.js";
+import { mastra, publishDelivery, STEP } from "./mastra/workflow.js";
 import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
+import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { parseBrief } from "./schemas.js";
 import {
   newRunId,
@@ -18,7 +18,7 @@ import {
   clearResumer,
   updateRun,
 } from "./store.js";
-import { bus } from "./mastra/eventBus.js";
+import { bus, emitFinalReview } from "./mastra/eventBus.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, "../public");
@@ -28,16 +28,38 @@ const app = express();
 app.use(express.json());
 app.use(express.static(PUBLIC_DIR));
 
-// 第二段：基于已批准脚本冷启动成片工作流（无 suspend，跑到底）。
-// deliver 步会写 store.status=success 并 emit run-done，供 SSE 转发。
-async function runVideoPhase(runId, brief) {
-  const videoRunId = `${runId}:video`;
+// 第二段：基于已批准脚本冷启动成片工作流（无 suspend，止于 composite）。
+// composite 完成后：若 finalGate 开启 → 置 awaiting_delivery 并推送 final-review 事件（成片门）；否则直接交付。
+// 每次重跑用唯一 Mastra 内部 runId（attempt 后缀），避免复用 runId 冲突；用户态 runId 不变（store 键一致）。
+async function runVideoPhase(runId, brief, opts = {}) {
+  const attempt = (getRun(runId)?.videoAttempt || 0) + 1;
+  const run = getRun(runId);
+  updateRun(runId, {
+    videoAttempt: attempt,
+    status: "running",
+    note: opts.regenerateScenes?.length ? `重新生成分镜：${opts.regenerateScenes.join(",")}` : run?.note || "",
+  });
+  const videoRunId = `${runId}:video:${attempt}`;
   const script = getRun(runId)?.script;
-  const run = await mastra.getWorkflow("promoVideo").createRun({ runId: videoRunId });
+  const mrun = await mastra.getWorkflow("promoVideo").createRun({ runId: videoRunId });
   // 关键：与可工作的内联模式一致 —— 直接观察 run.start 的 Promise（detached + .then），
   // 避免在该 continuation 内 await 导致 Mastra 执行引擎卡在 storyboard 之后（Mastra v1.63 已知怪异行为）。
-  return run.start({ inputData: { brief, script, runId } })
-    .then((res) => res)
+  return mrun.start({ inputData: { brief, script, runId } })
+    .then(() => {
+      const finalGate = opts.finalGate ?? brief.finalGateEnabled !== false;
+      const r = getRun(runId);
+      if (finalGate) {
+        updateRun(runId, { status: "awaiting_delivery" });
+        emitFinalReview(runId, {
+          videoUrl: r.videoUrl,
+          gallery: r.storyboardGallery,
+          poster: r.poster,
+          note: r.note,
+        });
+      } else {
+        publishDelivery(runId); // 无成片门：composite 后直接交付
+      }
+    })
     .catch((err) => {
       console.error(`[video-phase] ${runId} failed:`, err?.message || err);
       updateRun(runId, { status: "failed" });
@@ -64,7 +86,11 @@ async function runScriptPhase(runId, brief) {
       updateRun(runId, { status: "suspended" });
       return; // 等待 /approve → resumer 接力
     }
-    // 非挂起（HITL 关闭）：直接进入成片阶段。
+    // 脚本步若因预算/配额（Budget/QuotaExceeded）已失败，run 已标记 failed 且为终态——
+    // 此时 promoScript.run.start 会「resolve 而非 reject」，不可再启动成片阶段（否则会落入
+    // Mastra 嵌套上下文卡死，storyboard 后莫名置 success）。直接返回，保留 failed 终态。
+    if (getRun(runId)?.status === "failed") return;
+    // 非挂起且脚本已产出（HITL 关闭 / 脚本成功）：进入成片阶段。
     // 关键：不能在 promoScript 的 run.start 续跑上下文里直接 await 新工作流（Mastra AsyncLocalStorage
     // 上下文嵌套会导致新 run 卡在 storyboard 之后）。用 setImmediate 切到全新事件循环 tick，脱离父上下文。
     setImmediate(() => runVideoPhase(runId, brief).catch((err) => {
@@ -110,6 +136,10 @@ app.get("/api/generate/:runId/stream", (req, res) => {
     if (e.runId !== runId) return;
     res.write(`event: progress\ndata: ${JSON.stringify(e)}\n\n`);
   };
+  const onFinalReview = (e) => {
+    if (e.runId !== runId) return;
+    res.write(`event: final-review\ndata: ${JSON.stringify(e)}\n\n`); // 非终态，不关闭流
+  };
   const finish = (type, e) => {
     if (e.runId !== runId) return;
     res.write(`event: ${type}\ndata: ${JSON.stringify(e)}\n\n`);
@@ -120,11 +150,13 @@ app.get("/api/generate/:runId/stream", (req, res) => {
   const onFailed = (e) => finish("run-failed", e);
 
   bus.on("progress", onProgress);
+  bus.on("final-review", onFinalReview);
   bus.on("run-done", onDone);
   bus.on("run-failed", onFailed);
 
   const cleanup = () => {
     bus.off("progress", onProgress);
+    bus.off("final-review", onFinalReview);
     bus.off("run-done", onDone);
     bus.off("run-failed", onFailed);
     clearResumer(runId);
@@ -132,22 +164,52 @@ app.get("/api/generate/:runId/stream", (req, res) => {
   req.on("close", cleanup);
 });
 
-// ── POST /api/generate/:runId/approve：HITL 脚本门 resume ──
+// ── POST /api/generate/:runId/approve：HITL 审核门（脚本门 + 成片门，按 run.status 分流） ──
 app.post("/api/generate/:runId/approve", async (req, res) => {
   const { runId } = req.params;
   const run = getRun(runId);
   if (!run) return res.status(404).json({ error: "run not found" });
-  const resumer = getResumer(runId);
-  if (!resumer) return res.status(409).json({ error: "no pending approval (already resumed or finished)" });
-  const { decision = "approve", edits } = req.body || {};
-  // 审批结果写入自有 store；Mastra 重跑 writeScript 步时从此读取（suspend 不回传 resume 数据）。
-  updateRun(runId, { approval: { decision, edits } });
-  try {
-    await resumer({ [STEP.SCRIPT]: { decision, edits } });
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: String(err?.message || err) });
+  const { decision = "approve", edits, scenes } = req.body || {};
+
+  // ① 脚本门（suspended）：恢复 promoScript，由 server 冷启动成片阶段。
+  if (run.status === "suspended") {
+    const resumer = getResumer(runId);
+    if (!resumer) return res.status(409).json({ error: "no pending script approval" });
+    updateRun(runId, { approval: { decision, edits } });
+    try {
+      await resumer({ [STEP.SCRIPT]: { decision, edits } });
+      return res.json({ ok: true, gate: "script" });
+    } catch (err) {
+      return res.status(500).json({ error: String(err?.message || err) });
+    }
   }
+
+  // ② 成片门（awaiting_delivery）：approve → 直接交付；reject → 重新跑成片阶段（FR-9.2 指定分镜重生成）。
+  if (run.status === "awaiting_delivery") {
+    if (decision === "approve") {
+      publishDelivery(runId);
+      return res.json({ ok: true, gate: "final" });
+    }
+    // reject：清除旧 resumer，重跑 video 阶段（beta 下整段重生成；scenes 为意图提示，供前端展示）。
+    clearResumer(runId);
+    updateRun(runId, { status: "running", finalRejected: (run.finalRejected || 0) + 1 });
+    setImmediate(() =>
+      runVideoPhase(runId, run.brief, {
+        finalGate: true,
+        regenerateScenes: Array.isArray(scenes) ? scenes : [],
+      }).catch((err) => {
+        console.error(`[video-phase regenerate] ${runId} failed:`, err?.message || err);
+        updateRun(runId, { status: "failed" });
+      })
+    );
+    return res.json({ ok: true, gate: "final", regenerated: true });
+  }
+
+  // 终态或无挂起门
+  if (run.status === "success" || run.status === "failed") {
+    return res.status(409).json({ error: `run 已 ${run.status}，无待审批门` });
+  }
+  return res.status(409).json({ error: "no pending approval (already resumed or finished)" });
 });
 
 // ── GET /api/runs/:runId：运行态详情 ──
@@ -157,17 +219,45 @@ app.get("/api/runs/:runId", (req, res) => {
   res.json(run);
 });
 
-// ── GET /api/runs：历史列表（进程内） ──
+// ── GET /api/runs：历史列表（持久化，重启不丢） ──
 app.get("/api/runs", (_req, res) => res.json(listRuns()));
 
-// ── GET /api/config：运行模式与预算上限（前端展示用，不含密钥） ──
+// ── GET /api/quota：账户级累计配额（FR-10.3 / M3 成本配额） ──
+app.get("/api/quota", (req, res) => {
+  const account = req.query.account || "anonymous";
+  res.json({ account, ...checkQuota(account) });
+});
+
+// ── GET /api/admin/costs：管理员成本报表（FR-10.3），按账户/步骤聚合 ──
+app.get("/api/admin/costs", (_req, res) => {
+  const runs = listRuns();
+  const byAccount = {};
+  const byStep = {};
+  let total = 0;
+  for (const run of runs) {
+    const acc = run.createdBy || "anonymous";
+    for (const c of run.cost || []) {
+      byAccount[acc] = round4((byAccount[acc] || 0) + c.amount);
+      byStep[c.step] = round4((byStep[c.step] || 0) + c.amount);
+      total = round4(total + c.amount);
+    }
+  }
+  res.json({ total, byAccount, byStep, runs: runs.length });
+});
+
+// ── GET /api/config：运行模式 / 预算上限 / 配额上限（前端展示用，不含密钥） ──
 app.get("/api/config", (_req, res) =>
   res.json({
     mode: getProviderMode(),
     budgetCap: getBudgetCap(),
+    quotaCap: getQuotaCap(),
     provider: getProviderMode() === "real" ? "one-api" : "demo",
   })
 );
+
+function round4(n) {
+  return Math.round((n + Number.EPSILON) * 10000) / 10000;
+}
 
 // 仅当作为主入口运行（node src/server.js）时自动监听；被测试 import 时由测试自行监听随机端口。
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);

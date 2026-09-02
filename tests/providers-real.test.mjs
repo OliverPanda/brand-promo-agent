@@ -144,6 +144,36 @@ test("generateSceneMedia 真实模式：POST /images/generations + 返回 url + 
   assert.equal(media._usage.images, 1);
 });
 
+test("generateSceneMedia 参考图为 data:image → 走图生图（image 字段 base64）", async () => {
+  calls = [];
+  const script = await generateScript(baseBrief);
+  const scenes = await generateStoryboard(baseBrief, script);
+  const media = await generateSceneMedia(scenes[0], { ...baseBrief, styleReference: "data:image/png;base64,iVBORw0KGgo=" });
+  const last = calls[calls.length - 1];
+  assert.match(last.url, /\/images\/generations$/);
+  assert.ok(last.body.image, "应携带 image 参考图字段");
+  assert.equal(last.body.image, "iVBORw0KGgo="); // 去 data: 前缀，留 base64
+  assert.equal(media._usage.images, 1);
+});
+
+test("generateSceneMedia 参考图为 http(s) URL → 走图生图（image 字段为 URL）", async () => {
+  calls = [];
+  const script = await generateScript(baseBrief);
+  const scenes = await generateStoryboard(baseBrief, script);
+  const media = await generateSceneMedia(scenes[0], { ...baseBrief, styleReference: "https://cdn.example/ref.png" });
+  assert.equal(calls[calls.length - 1].body.image, "https://cdn.example/ref.png");
+  assert.equal(media._usage.images, 1);
+});
+
+test("generateSceneMedia 参考图为纯关键词 → 追加到 prompt（M2 行为，向后兼容）", async () => {
+  calls = [];
+  const script = await generateScript(baseBrief);
+  const scenes = await generateStoryboard(baseBrief, script);
+  const media = await generateSceneMedia(scenes[0], { ...baseBrief, styleReference: "赛博朋克" });
+  assert.equal(calls[calls.length - 1].body.image, undefined, "关键词不应走 image 字段");
+  assert.match(calls[calls.length - 1].body.prompt, /赛博朋克/, "关键词应拼入 prompt");
+});
+
 test("generateVoiceover 真实模式：POST /audio/speech 二进制 + data URI + _usage.minutes", async () => {
   calls = [];
   const script = await generateScript(baseBrief);

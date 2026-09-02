@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "test": "node --test \"tests/**/*.test.mjs\""
+    "test": "node --import ./tests/setup.mjs --test-concurrency=1 --test \"tests/**/*.test.mjs\""
   },
   "dependencies": {
     "@mastra/core": "^1.63.2",

@@ -264,13 +264,22 @@ function demoStoryboard(brief, script) {
 export async function generateSceneMedia(scene, brief) {
   if (getProviderMode() !== "real") return demoSceneMedia(scene, brief);
   const model = process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
-  const prompt = scene.visualPrompt + (brief.styleReference ? `；参考风格：${brief.styleReference}` : "");
-  const data = await oneApiPost("/images/generations", {
-    model,
-    prompt,
-    n: 1,
-    size: process.env.PROMO_IMAGE_SIZE || "1024x576",
-  });
+  const prompt = scene.visualPrompt;
+  const body = { model, prompt, n: 1, size: process.env.PROMO_IMAGE_SIZE || "1024x576" };
+  // M3-D 真实参考图图生图（Seedream 参考图输入，M2 仅关键词透传）：
+  //   styleReference 为 data:image 或 http(s) URL → 作为 image 字段走图生图（参考图输入免费，见 PRD §10）。
+  //   纯关键词（非 URL）→ 追加到 prompt（M2 行为，向后兼容）。
+  const ref = brief.styleReference;
+  if (ref) {
+    if (/^data:image\//i.test(ref)) {
+      body.image = ref.replace(/^data:image\/[^;]+;base64,/, ""); // 去前缀，留 base64
+    } else if (/^https?:\/\//i.test(ref)) {
+      body.image = ref; // one-api 支持 URL 参考图
+    } else {
+      body.prompt = `${prompt}；参考风格：${ref}`;
+    }
+  }
+  const data = await oneApiPost("/images/generations", body);
   const item = data.data?.[0] || {};
   const mediaUrl = item.url || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null);
   return { mediaUrl, kind: "image", model, _usage: { images: 1 } };

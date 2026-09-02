@@ -19,3 +19,8 @@ export function emitRunDone(runId, run) {
 export function emitRunFailed(runId, error) {
   bus.emit("run-failed", { runId, ts: Date.now(), error: String(error?.message || error) });
 }
+
+/** 成片门（FR-9.2 / M3）：composite 完成、等待人工验收时广播预览信息（非终态） */
+export function emitFinalReview(runId, preview) {
+  bus.emit("final-review", { runId, ts: Date.now(), preview });
+}

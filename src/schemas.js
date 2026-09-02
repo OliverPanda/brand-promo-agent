@@ -17,6 +17,7 @@ export const BrandBriefSchema = z.object({
   language: z.enum(LANGUAGES).default("zh-CN"),
   voiceTone: z.string().default("男声"),
   hitlEnabled: z.boolean().default(true),
+  finalGateEnabled: z.boolean().default(true),
 });
 
 export function parseBrief(input) {

@@ -48,7 +48,7 @@ test("HITL 关闭：端到端产出分镜画廊 + SRT", async () => {
   try {
     const r = await fetch(`${BASE(port)}/api/generate`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...baseBrief, hitlEnabled: false }),
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
     });
     assert.equal(r.status, 200);
     const { runId } = await r.json();
@@ -69,7 +69,7 @@ test("HITL 开启：脚本门 suspend → approve → success", async () => {
   try {
     const r = await fetch(`${BASE(port)}/api/generate`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...baseBrief, hitlEnabled: true }),
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: true, finalGateEnabled: false }),
     });
     const { runId } = await r.json();
     const suspended = await waitStatus(port, runId, ["suspended"]);
@@ -83,6 +83,80 @@ test("HITL 开启：脚本门 suspend → approve → success", async () => {
     const done = await waitStatus(port, runId, ["success", "failed"]);
     assert.equal(done.status, "success");
     assert.ok(Array.isArray(done.storyboardGallery) && done.storyboardGallery.length >= 3);
+  } finally {
+    server.close();
+  }
+});
+
+test("成片门（FR-9.2）：awaiting_delivery → approve → success", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const r = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: true }),
+    });
+    const { runId } = await r.json();
+    const awaiting = await waitStatus(port, runId, ["awaiting_delivery"]);
+    assert.equal(awaiting.status, "awaiting_delivery");
+    assert.ok(awaiting.videoUrl !== undefined && awaiting.storyboardGallery.length >= 3, "成片预览应已就绪");
+
+    const approve = await fetch(`${BASE(port)}/api/generate/${runId}/approve`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "approve" }),
+    });
+    assert.equal(approve.status, 200);
+
+    const done = await waitStatus(port, runId, ["success", "failed"]);
+    assert.equal(done.status, "success");
+  } finally {
+    server.close();
+  }
+});
+
+test("成片门（FR-9.2）：reject 指定分镜 → 重新生成 → 再次 awaiting_delivery → approve", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const r = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: true }),
+    });
+    const { runId } = await r.json();
+    await waitStatus(port, runId, ["awaiting_delivery"]);
+
+    const reject = await fetch(`${BASE(port)}/api/generate/${runId}/approve`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "reject", scenes: [1] }),
+    });
+    assert.equal(reject.status, 200);
+
+    const awaiting2 = await waitStatus(port, runId, ["awaiting_delivery"]);
+    assert.equal(awaiting2.status, "awaiting_delivery");
+    assert.equal(awaiting2.finalRejected, 1);
+
+    await fetch(`${BASE(port)}/api/generate/${runId}/approve`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "approve" }),
+    });
+    const done = await waitStatus(port, runId, ["success", "failed"]);
+    assert.equal(done.status, "success");
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/quota：返回账户累计与剩余配额", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const r = await fetch(`${BASE(port)}/api/quota?account=acme`);
+    assert.equal(r.status, 200);
+    const q = await r.json();
+    assert.equal(q.account, "acme");
+    assert.equal(q.cap, 200);
+    assert.ok(q.remaining <= q.cap);
   } finally {
     server.close();
   }

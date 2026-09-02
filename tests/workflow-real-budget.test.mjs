@@ -86,7 +86,7 @@ test("真实模式 + 充足预算：端到端成功并归集 cost（≥5 步）"
   try {
     const r = await fetch(`${BASE(port)}/api/generate`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...baseBrief, hitlEnabled: false }),
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
     });
     assert.equal(r.status, 200);
     const { runId } = await r.json();
@@ -123,6 +123,28 @@ test("真实模式 + 极小预算：首步即触发 BudgetExceededError，run=fa
     assert.match(String(step?.error || ""), /预算超限/);
   } finally {
     process.env.PROMO_BUDGET_CAP = "100";
+    server.close();
+  }
+});
+
+test("真实模式 + 极小配额：首步即触发 QuotaExceededError，run=failed 且 cost 已记录一条", async () => {
+  process.env.PROMO_QUOTA_CAP = "0.0001"; // 已用(前序测试累计) + 120 tokens≈¥0.00048 > 上限
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const r = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
+    });
+    const { runId } = await r.json();
+    const run = await waitStatus(port, runId, ["failed"]);
+    assert.equal(run.status, "failed");
+    assert.ok(run.cost && run.cost.length === 1, "超限前已记录一条成本");
+    const step = run.steps.writeScript;
+    assert.equal(step?.status, "failed");
+    assert.match(String(step?.error || ""), /配额超限/);
+  } finally {
+    process.env.PROMO_QUOTA_CAP = "200";
     server.close();
   }
 });

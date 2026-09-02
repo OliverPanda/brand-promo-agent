@@ -2,12 +2,12 @@
 
 | 项 | 内容 |
 |----|------|
-| 文档版本 | v0.3（M1 + M2 执行基线） |
+| 文档版本 | v0.4（M1 + M2 + M3 执行基线） |
 | 日期 | 2026-09-03 |
 | 负责人 | 铭星链 MingStar 主理人 / 交付总监 |
 | 架构选型 | **Mastra（TypeScript）** —— 见 [ADR-001](./ADR-001-framework-selection.md) |
 | 交付形态 | 网页端（Web）单页应用 + 后端 Agent 工作流服务 |
-| 状态 | M1（DEMO 全跑通）+ M2（真实 one-api Provider + 成本预算）已完成；待 M3 持久化与真实计费回写 |
+| 状态 | M1（DEMO）+ M2（真实 one-api Provider + 成本预算）+ M3（HITL 成片门 + 账户配额 + 历史持久化 + 参考图图生图）已完成；**可上线内测**。待 M4（模板库 + 多语言 + 小程序并入） |
 
 ---
 
@@ -358,7 +358,7 @@ interface PromoRun {
 |------|------|------|
 | M1 | 选型 + PRD + 架构（本期） | 本文档 + ADR-001 + Web 原型（DEMO） |
 | M2 | 真实 Provider 接入（one-api/ai-core）+ FR-10 成本预算 | 产出真实 MP4 + 成本归集与预算闸门（详见 §16.9） |
-| M3 | HITL 完整化 + 成本配额 + 历史记录 | 可上线内测 |
+| M3 | HITL 完整化 + 成本配额 + 历史记录 | 可上线内测（已完成，见 §16.10） |
 | M4 | 模板库 + 多语言 + 小程序并入 | 全量上线 |
 
 ---
@@ -529,6 +529,68 @@ composite(scenes,voice,music,brief) -> ffmpegAssemble() (PROMO_FFMPEG_BIN)      
 - [x] `GET /api/config` 在真实模式返回 `provider:"one-api"` 与 `budgetCap`；前端徽标与成本卡片正确。
 - [x] DEMO 模式零密钥端到端仍跑通（分镜画廊 + SRT），且全部 `node --test` 冒烟（M2 新增 25 例，合计 35 例）全绿。
 - [x] 参考图 `styleReference` 在真实图像生成拼入 prompt。
+
+---
+
+## 16.10 M3 执行基线（v0.4 新增，HITL 完整化 + 成本配额 + 历史记录 + 参考图图生图）
+
+> M3 把 §13 的「HITL 完整化 + 成本配额 + 历史记录」全部落地，使产品达到**可上线内测**标准；并补齐 M2 推迟的「真实参考图图生图」。
+
+### 16.10.1 M3 范围锁定（相对 §16.9 的增量）
+- ✅ **FR-9.2 成片门（HITL 完整化）**：`promoVideo` 止于 `composite`（移除自动 `deliver`）；composite 完成后若 `finalGateEnabled` 开启，server 置 `awaiting_delivery` 并推送 `final-review` 事件（SSE），前端弹「成片验收门」；`approve` → `publishDelivery`（纯函数，标记 success + 广播 run-done），`reject` → 重跑成片阶段（整段重生成，beta 简化）。**规避 Mastra v1.63 resume 续跑陷阱**：成片门不放在 Mastra 内 suspend，改为 server 侧状态机。
+- ✅ **成本配额（账户级累计，FR-10 延伸）**：新增 `quota.js`，按 `createdBy`（账户）累计真实花费，受 `PROMO_QUOTA_CAP`（默认 ¥200）闸门；超限抛 `QuotaExceededError` 中止。`workflow.recordCost` 现在执行**两道闸门**（单 run `PROMO_BUDGET_CAP` + 账户 `PROMO_QUOTA_CAP`）。新增 `GET /api/quota`（账户剩余）、`GET /api/admin/costs`（按账户/步骤聚合报表）、`/api/config` 返回 `quotaCap`。
+- ✅ **历史记录持久化（M3-A）**：`store.js` 由进程内 Map 改为「内存 Map + 原子写穿（temp→rename）」，`<PROMO_DATA_DIR>/runs.json`；启动 hydrate 恢复。重启后 `GET /api/runs` 不丢。新增 `PROMO_PERSIST`（默认 1）/ `PROMO_DATA_DIR`（默认 `./data`）。`resumers`（Mastra resume 闭包，含函数）不持久化（beta 已知限制：跨重启的 suspended 运行会丢失 resumer）。
+- ✅ **真实参考图图生图（M3-D，关闭 M2 推迟项）**：`generateSceneMedia` 真实分支识别 `brief.styleReference`——`data:image` / `http(s)` URL 走 Seedream 图生图（`image` 字段，base64/URL，参考图免费），纯关键词仍追加到 prompt（M2 行为向后兼容）。
+- ⏸️ **仍推迟（Out of Scope §2.2）**：真实支付/计费扣星钻、四大阻断域分润回写（仅预留 `PromoRun.cost` 结构与配额扣减，未接 ai-core 计费）；M4 模板库 / 多语言 / 小程序并入。
+
+### 16.10.2 M3 文件落地清单
+```
+src/
+├── store.js              # 【重写】进程内 Map → 文件写穿 + hydrate；PROMO_PERSIST/PROMO_DATA_DIR
+├── quota.js              # 【新增】账户累计配额 + QuotaExceededError + 文件持久化(quotas.json)
+├── cost.js               # 【不变】
+├── mastra/workflow.js    # 【修改】recordCost 加配额闸门；移除 deliver 步；新增 publishDelivery()；promoVideo 止于 composite
+├── mastra/providers.js   # 【修改】generateSceneMedia 真实分支支持参考图图生图(image 字段)
+├── mastra/eventBus.js    # 【修改】新增 emitFinalReview（成片门 SSE 事件）
+├── server.js             # 【修改】成片门状态机 + 状态感知 /approve + GET /api/quota + GET /api/admin/costs + /api/config 加 quotaCap；脚本失败不再误启成片阶段
+├── schemas.js            # 【修改】新增 finalGateEnabled（默认 true）
+└── mastra/svg.js         # 【不变】
+public/index.html          # 【修改】成片验收门 UI(final-review) + finalGateEnabled 勾选 + 配额展示
+tests/
+├── store-persist.test.mjs   # 【新增】子进程 round-trip 验证写盘+rehydrate
+├── quota.test.mjs           # 【新增】配额上限/累计/QuotaExceededError
+├── server.test.mjs          # 【修改】适配成片门（awaiting_delivery→approve；reject→重生成）+ /api/quota
+├── providers-real.test.mjs  # 【修改】参考图 data:/URL/关键词 三用例
+├── workflow-real-budget.test.mjs # 【修改】成功路径 finalGateEnabled:false + 新增极小配额触发 QuotaExceededError
+├── cost.test.mjs            # 【不变】
+└── providers.test.mjs / eventBus.test.mjs # 【不变】
+.env.example             # 【修改】新增 PROMO_QUOTA_CAP / PROMO_PERSIST / PROMO_DATA_DIR
+```
+
+### 16.10.3 成片门（FR-9.2）交互契约
+- 状态机：`running → (suspended 脚本门) → running → (awaiting_delivery 成片门) → success | failed`。
+- `composite` 完成后：若 `finalGateEnabled`，`updateRun(status:"awaiting_delivery")` + `emitFinalReview({videoUrl, gallery, poster, note})`；否则直接 `publishDelivery`。
+- `POST /api/generate/:runId/approve` 按 `run.status` 分流：
+  - `suspended` → 恢复 `promoScript`（脚本门），由 server 冷启动成片阶段；
+  - `awaiting_delivery` + `approve` → `publishDelivery`；+ `reject`（`{scenes?}`）→ 清除 resumer、重跑成片阶段（整段重生成，beta 简化），完成后再次 `awaiting_delivery`；
+  - `success`/`failed` → 409 无待审批门。
+
+### 16.10.4 成本双闸门（FR-10 + M3 配额）
+- `recordCost(runId, step, out)`：`out._usage` 存在才计量（DEMO 零成本）。先 `checkBudget(per-run)` → `BudgetExceededError`；再 `checkQuota(account, amount)` → `QuotaExceededError`；均通过才 `addUsage(account, amount)`。
+- 单价表、预算上限读取（§16.9.4）不变；配额上限 `PROMO_QUOTA_CAP` 默认 ¥200，运行时实时读取。
+
+### 16.10.5 关键工程修正（M3 排障，必读）
+1. **成片门不放在 Mastra suspend（规避 v1.63 续跑陷阱）**：M2 已证实 `resume()` 重跑被挂起步骤后不继续下游 DAG。FR-9.2 成片门改用 **server 侧状态机 + `final-review` SSE 事件 + 纯函数 `publishDelivery`**，彻底绕开该陷阱。
+2. **M3 回归——脚本失败误启成片阶段**：Mastra `promoScript.run.start()` 在脚本步因预算/配额抛错时**以 resolve 而非 reject 返回**（status 落 `failed`）。原 `runScriptPhase` 的 `else` 分支会据此继续冷启动成片阶段，落入嵌套上下文卡死（storyboard 后莫名置 `success`）。**修复**：`runScriptPhase` 在 `run.start` 返回后检查 `getRun(runId).status === "failed"` 则直接返回，保留 failed 终态，不再启动成片阶段。
+3. **测试并发隔离**：`node --test` 同文件测试默认并发，会令 `PROMO_QUOTA_CAP`/`PROMO_BUDGET_CAP` 等全局环境变量在用例间竞态。测试脚本加 `--test-concurrency=1` 串行执行；并用 `tests/setup.mjs`（`--import` 预加载）统一设 `STEP_DELAY_MS` 与 `PROMO_PERSIST=0`（内存态、不落盘、互不污染）。
+
+### 16.10.6 M3 DoD（验收）
+- [x] 设 `PROMO_PROVIDER_MODE=real`：脚本门 + 成片门两段 HITL 均可在用户 approve 后继续；成片门 `reject` 触发整段重生成并可再次验收。
+- [x] 运行态持久化：进程重启后 `GET /api/runs` 仍含历史运行（原子写穿 + hydrate 验证通过 `store-persist.test.mjs`）。
+- [x] 账户配额：`PROMO_QUOTA_CAP` 调小至首步即超限时，run 中止于 `failed` 且提示「配额超限」；`GET /api/quota`、`GET /api/admin/costs` 正确聚合。
+- [x] 参考图：`styleReference` 为 data:/URL 时真实分支携带 `image` 字段走图生图；纯关键词追加 prompt。
+- [x] DEMO 模式零密钥端到端仍跑通（分镜画廊 + SRT + 成片门/脚本门），且全部 `node --test` 冒烟（M3 新增 13 例，合计 48 例）全绿。
+- [x] 前端「成片验收门」UI（final-review 监听 + approve/reject）+ 成片门/配额勾选与展示。
 
 ---
 

@@ -61,3 +61,16 @@
 **成本与预算（FR-10）**：真实 Provider 回传 `_usage`（tokens/images/minutes/tracks/videos）→ `cost.js` 单价表预估 → 归集 `PromoRun.cost` → `checkBudget` 对 `PROMO_BUDGET_CAP`（默认 ¥20，运行时实时读取）闸门，超限中止。M2 仅做预估+闸门+归集，不接四大阻断域真实计费/扣星钻（预留 `cost` 结构）。
 
 **验证**：`node --test tests/` 全绿（35 例，含 M2 新增 25 例：mock fetch 验证 one-api 请求构造/响应解析、成本/预算逻辑、真实端到端成本归集、极小预算触发超限中止、`/api/config`）；DEMO 与 real 两条路径均端到端跑通。
+
+## 6. M3 执行记录（v0.4 更新）
+
+**范围延展**：M3 按 §13 落地 HITL 完整化（FR-9.2 成片门）+ 成本配额（账户级累计）+ 历史记录（持久化）+ 真实参考图图生图，达到**可上线内测**。
+
+**M3 工程修正（已落实）**：
+1. **成片门改用 server 侧状态机，不放在 Mastra suspend**：M2 已证实 `resume()` 重跑被挂起步骤后不继续下游 DAG。FR-9.2 成片门改为——`promoVideo` 止于 `composite`；composite 完成后 server 置 `awaiting_delivery` + 广播 `final-review` SSE 事件；`/approve` 的 `approve` 分支调纯函数 `publishDelivery`（标记 success + run-done），`reject` 分支重跑成片阶段（整段重生成，beta 简化）。彻底规避 v1.63 续跑陷阱。
+2. **M3 回归——脚本失败误启成片阶段**：Mastra `promoScript.run.start()` 在脚本步因预算/配额抛错时**以 resolve 而非 reject 返回**（status 落 `failed`）。原 `runScriptPhase` 的 `else` 分支据此继续冷启动成片阶段，落入嵌套上下文卡死（storyboard 后莫名置 `success`）。修复：`runScriptPhase` 在 `run.start` 返回后检查 `getRun(runId).status === "failed"` 即返回，保留 failed 终态，不再启动成片阶段。
+3. **持久化落地**：`store.js` 由进程内 Map 改为「内存 Map + 原子写穿（temp→rename）」，`<PROMO_DATA_DIR>/runs.json`；启动 hydrate 恢复历史。`quota.js` 按账户累计配额，文件 `quotas.json` 持久化。`PROMO_PERSIST=0` 可关闭写穿（测试用）。
+
+**成本双闸门**：`workflow.recordCost` 对真实 `_usage` 先 `checkBudget(单 run PROMO_BUDGET_CAP)` 再 `checkQuota(账户 PROMO_QUOTA_CAP)`，均超限即中止。新增 `GET /api/quota`、`GET /api/admin/costs`、`/api/config.quotaCap`。
+
+**验证**：`node --test tests/` 全绿（48 例，M3 新增 13 例：store-persist 子进程 round-trip、quota 配额/累计/QuotaExceededError、server 成片门 awaiting→approve / reject→重生成、/api/quota、providers 参考图 data:/URL/关键词 三用例、workflow 极小配额触发 QuotaExceededError）；DEMO 与 real 两路径均端到端跑通，含两段 HITL 门与历史持久化。

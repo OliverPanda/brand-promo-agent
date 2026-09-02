@@ -1,19 +1,19 @@
 // Mastra 工作流：品牌宣传片自动生成（对应 PRD §9 / §16.4）。
 //
-// 设计要点（关键经验，详见 memory）：
+// 设计要点（关键经验，详见 memory + skill mastra-workflow-gotchas）：
 //   Mastra v1.63 的 suspend() 在步骤体内「始终以 undefined resolve」，且 resume() 重跑被挂起步骤后
-//   **不会继续后续 DAG**（实测会卡在 suspended 步骤、下游步骤永不触发）。因此 HITL 门采用「两段式工作流」：
-//     - promoScript：ingestBrief → writeScript（suspend 为人审门，是工作流的最后一步）→ 结束。
-//       单步挂起/恢复，不依赖 resume 后的 DAG 续跑，行为稳定。
-//     - promoVideo：prepareVideo → storyboard → scenes → voiceover → music → composite → deliver。
-//       人审通过后由 server 用「已批准脚本」冷启动，无 suspend，跑到底。
-//   两段通过 store 串接：server 在 script 段完成（immediate 或 approve 后）启动 video 段。
+//   **不会继续后续 DAG**（实测会卡在 suspended 步骤、下游步骤永不触发）。因此 HITL 门采用「短工作流 + server 冷启动」：
+//     - promoScript：ingestBrief → writeScript（suspend 为脚本人审门，是工作流最后一步）→ 结束。
+//     - promoVideo：prepareVideo → storyboard → scenes → voiceover → music → composite（终点，无 deliver）。
+//       脚本门通过后由 server 冷启动；composite 完成后由 server 决定走「成片门」还是「直接交付」。
+//   **成片门（FR-9.2 / M3）不放在 Mastra 内 suspend**——改为 server 侧状态机（awaiting_delivery + final-review
+//   事件），规避 resume 续跑陷阱；approve 时直接调用纯函数 publishDelivery（标记 success + 广播 run-done）。
 //
-// 成本（M2 / FR-10）：真实 Provider 在返回中携带 _usage，步骤经 recordCost 归集到 PromoRun.cost，
-//   并做预算闸门（超 PROMO_BUDGET_CAP 中止）。DEMO 模式无 _usage → 不计成本。
+// 成本（M2 FR-10 + M3 配额）：真实 Provider 返回 _usage，步骤经 recordCost 归集到 PromoRun.cost，
+//   并执行两道闸门——单 run 预算(PROMO_BUDGET_CAP) 与 账户累计配额(PROMO_QUOTA_CAP)。DEMO 无 _usage → 不计。
 //
-// runId 透传：两段用不同的 Mastra 内部 runId（script/video 后缀），但都通过 inputData.runId 携带
-// 用户态 runId，使所有步骤回写同一个 PromoRun（store 以用户态 runId 为键）。
+// runId 透传：两段用不同 Mastra 内部 runId（script/video 后缀），均经 inputData.runId 携带用户态 runId，
+// 使所有步骤回写同一 PromoRun（store 以用户态 runId 为键）。
 import { createWorkflow, createStep } from "@mastra/core/workflows";
 import { Mastra } from "@mastra/core/mastra";
 import { InMemoryStore } from "@mastra/core/storage";
@@ -29,6 +29,7 @@ import {
 import { emitProgress, emitRunDone, emitRunFailed } from "./eventBus.js";
 import { updateRun, setStep, getRun } from "../store.js";
 import { costFor, checkBudget, getBudgetCap, BudgetExceededError } from "../cost.js";
+import { checkQuota, addUsage, QuotaExceededError } from "../quota.js";
 
 const STEP = {
   INGEST: "ingestBrief",
@@ -47,12 +48,16 @@ export { STEP };
 const STEP_DELAY_MS = Number(process.env.STEP_DELAY_MS ?? 400);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 归集单步成本并做预算闸门；超上限抛 BudgetExceededError（被 withStep 捕获 → run=failed）。
+// 归集单步成本并做两道闸门：
+//  1) 单 run 预算闸门（PROMO_BUDGET_CAP，FR-10.1）—— 超限抛 BudgetExceededError。
+//  2) 账户级累计配额（PROMO_QUOTA_CAP，M3「成本配额」）—— 超限抛 QuotaExceededError。
+// 两道均无 _usage（DEMO）时不计量；仅真实 Provider 产生费用时才扣减配额。
 function recordCost(runId, step, out) {
   const usage = out?._usage;
   if (!usage) return; // DEMO 模式无 _usage，不计量
   const c = costFor(step, usage);
   const run = getRun(runId);
+  const account = run?.createdBy || "anonymous";
   const costs = [...(run?.cost || []), c];
   updateRun(runId, { cost: costs });
   const guard = checkBudget(costs, { amount: 0 }, getBudgetCap());
@@ -61,6 +66,13 @@ function recordCost(runId, step, out) {
       `预算超限：已累计 ¥${guard.total.toFixed(4)}，超过上限 ¥${guard.cap}。运行已中止。`
     );
   }
+  const q = checkQuota(account, c.amount);
+  if (!q.ok) {
+    throw new QuotaExceededError(
+      `账户 ${account} 累计配额超限：已用 ¥${q.used.toFixed(4)} + 本次 ¥${c.amount.toFixed(4)} > 上限 ¥${q.cap}。运行已中止。`
+    );
+  }
+  addUsage(account, c.amount);
 }
 
 async function withStep(runId, step, fn) {
@@ -251,20 +263,6 @@ const compositeStep = createStep({
   },
 });
 
-const deliver = createStep({
-  id: STEP.DELIVER,
-  execute: async ({ runId, inputData }) => {
-    const rid = inputData.runId || runId;
-    const { brief, script, storyboard, voice, music, composite } = inputData;
-    return withStep(rid, STEP.DELIVER, async () => {
-      updateRun(rid, { status: "success" });
-      const run = getRun(rid);
-      emitRunDone(rid, run);
-      return { runId: rid, status: "success", poster: composite.poster, gallery: composite.storyboardGallery };
-    });
-  },
-});
-
 export const videoWorkflow = createWorkflow({ id: "promoVideo" })
   .then(prepareVideo)
   .then(storyboard)
@@ -272,8 +270,17 @@ export const videoWorkflow = createWorkflow({ id: "promoVideo" })
   .then(voiceover)
   .then(music)
   .then(compositeStep)
-  .then(deliver)
   .commit();
+
+// 成片门（FR-9.2，M3 完整化）：promoVideo 止于 composite（不自动 deliver）。
+// 由 server 在 composite 完成后：若开启 finalGate → 置 awaiting_delivery 并 push final-review 事件让前端验收；
+// 否则直接 publishDelivery。publishDelivery 是纯函数（不依赖 Mastra resume 续跑，规避 v1.63 陷阱），标记 success 并广播 run-done。
+export function publishDelivery(runId) {
+  updateRun(runId, { status: "success" });
+  const run = getRun(runId);
+  emitRunDone(runId, run);
+  return run;
+}
 
 export const mastra = new Mastra({
   workflows: { promoScript: scriptWorkflow, promoVideo: videoWorkflow },
