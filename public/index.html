@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>铭星链 · 自动化品宣机器人</title>
+<style>
+  :root { --bg:#0b1020; --card:#151b30; --line:#26304d; --txt:#e8ecf6; --sub:#9aa6c4; --accent:#6366f1; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); }
+  .wrap { max-width:880px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--sub); font-size:13px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:16px; }
+  label { display:block; font-size:13px; color:var(--sub); margin:12px 0 6px; }
+  input, select, textarea { width:100%; background:#0e1426; border:1px solid var(--line); color:var(--txt); border-radius:9px; padding:10px 12px; font-size:14px; }
+  textarea { resize:vertical; min-height:64px; }
+  .row { display:flex; gap:12px; } .row > div { flex:1; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { border:1px solid var(--line); background:#0e1426; color:var(--sub); padding:6px 12px; border-radius:999px; cursor:pointer; font-size:13px; user-select:none; }
+  .chip.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:11px 18px; font-size:14px; cursor:pointer; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .steps { list-style:none; margin:0; padding:0; }
+  .step { display:flex; align-items:center; gap:10px; padding:9px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--line); flex:none; }
+  .dot.running { background:var(--warn); animation:pulse 1s infinite; }
+  .dot.done { background:var(--ok); } .dot.failed { background:var(--bad); }
+  .step .meta { color:var(--sub); font-size:12px; margin-left:auto; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:12px; margin-top:12px; }
+  .scene { background:#0e1426; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .scene img { width:100%; display:block; }
+  .scene .cap { padding:8px 10px; font-size:12px; color:var(--sub); }
+  .scene.failed { border-color:var(--bad); }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; padding:16px; }
+  .modal .box { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; max-width:560px; width:100%; max-height:86vh; overflow:auto; }
+  pre { white-space:pre-wrap; background:#0e1426; border:1px solid var(--line); border-radius:9px; padding:12px; font-size:12px; max-height:240px; overflow:auto; }
+  .vline { display:flex; gap:8px; margin:6px 0; align-items:flex-start; }
+  .vline input { flex:1; }
+  .hidden { display:none; }
+  .note { color:var(--warn); font-size:12px; margin-top:10px; }
+  a.dl { color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>铭星链 · 自动化品宣机器人</h1>
+  <div class="sub">填一份品牌简报，自动产出宣传片脚本 / 分镜 / 画面 / 配音 / 配乐 / 合成（DEMO 离线模式）。</div>
+
+  <div class="card" id="formCard">
+    <div class="row">
+      <div><label>品牌名 *</label><input id="brandName" placeholder="例如：铭星科技" /></div>
+      <div><label>产品/服务名 *</label><input id="productName" placeholder="例如：星链 Pro" /></div>
+    </div>
+    <label>一句话核心卖点 *（≤60字）</label>
+    <input id="coreSellingPoint" maxlength="60" placeholder="例如：一句话生成专业宣传片" />
+
+    <div class="row">
+      <div><label>期望时长</label>
+        <select id="durationSec"><option>30</option><option>15</option><option>60</option><option>90</option></select></div>
+      <div><label>语言</label>
+        <select id="language">
+          <option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option>
+          <option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option>
+        </select></div>
+      <div><label>配音音色</label>
+        <select id="voiceTone"><option>男声</option><option>女声</option><option>沉稳</option><option>活泼</option></select></div>
+    </div>
+
+    <label>目标受众（可多选）</label>
+    <div class="chips" id="audienceChips"></div>
+
+    <label>宣传调性（可多选）</label>
+    <div class="chips" id="toneChips"></div>
+
+    <label>核心信息点（每行一条，可选）</label>
+    <textarea id="keyMessages" placeholder="例如：&#10;续航 30 小时&#10;支持离线生成"></textarea>
+
+    <label>风格参考（关键词或图片 URL，可选）</label>
+    <input id="styleReference" placeholder="例如：赛博朋克 / https://..." />
+
+    <label style="margin-top:12px;"><input type="checkbox" id="hitlEnabled" checked style="width:auto;margin-right:8px;" />启用脚本人工审核门（生成素材前先确认脚本）</label>
+
+    <div style="margin-top:18px; display:flex; gap:10px;">
+      <button id="genBtn" onclick="submitBrief()">生成宣传片</button>
+    </div>
+  </div>
+
+  <div class="card hidden" id="progressCard">
+    <h3 style="margin-top:0;">生成进度</h3>
+    <ul class="steps" id="steps"></ul>
+  </div>
+
+  <div class="card hidden" id="resultCard">
+    <h3 style="margin-top:0;">成片交付</h3>
+    <div id="delivery"></div>
+  </div>
+</div>
+
+<!-- 脚本 HITL 审核门 -->
+<div class="modal hidden" id="gateModal">
+  <div class="box">
+    <h3 style="margin-top:0;">脚本确认门</h3>
+    <div id="gateScript"></div>
+    <div style="margin-top:14px; display:flex; gap:10px; justify-content:flex-end;">
+      <button class="ghost" onclick="approveScript(false)">直接采用</button>
+      <button onclick="approveScript(true)">采用我的修改</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const AUDIENCE = ["Z世代","白领","企业采购","宝妈","学生","极客"];
+const TONES = ["科技感","温情","高端","国潮","搞笑","专业"];
+let audienceSel = new Set(), toneSel = new Set();
+let es = null, currentRunId = null, pendingScript = null, gateVoice = [];
+
+function buildChips(containerId, items, sel) {
+  const c = document.getElementById(containerId);
+  c.innerHTML = "";
+  items.forEach(it => {
+    const el = document.createElement("div");
+    el.className = "chip"; el.textContent = it;
+    el.onclick = () => { if (sel.has(it)) { sel.delete(it); el.classList.remove("on"); } else { sel.add(it); el.classList.add("on"); } };
+    c.appendChild(el);
+  });
+}
+buildChips("audienceChips", AUDIENCE, audienceSel);
+buildChips("toneChips", TONES, toneSel);
+
+function stepRow(id) {
+  const ul = document.getElementById("steps");
+  let li = document.getElementById("step-"+id);
+  if (!li) { li = document.createElement("li"); li.id = "step-"+id; li.className = "step";
+    li.innerHTML = `<span class="dot"></span><span class="name"></span><span class="meta"></span>`; ul.appendChild(li); }
+  return li;
+}
+function setStep(id, status, meta) {
+  const li = stepRow(id); li.querySelector(".name").textContent = id;
+  li.querySelector(".dot").className = "dot " + (status==="running"?"running":status==="done"?"done":status==="failed"?"failed":"");
+  li.querySelector(".meta").textContent = meta || "";
+}
+
+async function submitBrief() {
+  const brief = {
+    brandName: v("brandName"), productName: v("productName"), coreSellingPoint: v("coreSellingPoint"),
+    durationSec: Number(v("durationSec")), language: v("language"), voiceTone: v("voiceTone"),
+    audience: [...audienceSel], tones: [...toneSel],
+    keyMessages: v("keyMessages").split("\n").map(s=>s.trim()).filter(Boolean),
+    styleReference: v("styleReference") || undefined, hitlEnabled: document.getElementById("hitlEnabled").checked,
+  };
+  if (!brief.brandName || !brief.productName || !brief.coreSellingPoint) { alert("请填品牌名、产品名、核心卖点"); return; }
+  document.getElementById("genBtn").disabled = true;
+  const r = await fetch("/api/generate", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(brief) });
+  const j = await r.json();
+  if (!r.ok) { alert("提交失败：" + (j.error||r.status)); document.getElementById("genBtn").disabled = false; return; }
+  currentRunId = j.runId;
+  document.getElementById("progressCard").classList.remove("hidden");
+  document.getElementById("steps").innerHTML = "";
+  openStream(currentRunId);
+}
+function v(id){ return document.getElementById(id).value.trim(); }
+
+function openStream(runId) {
+  if (es) es.close();
+  es = new EventSource("/api/generate/"+runId+"/stream");
+  es.addEventListener("progress", e => onProgress(JSON.parse(e.data)));
+  es.addEventListener("run-done", e => onDone(JSON.parse(e.data).run));
+  es.addEventListener("run-failed", e => { alert("生成失败：" + e.data); es.close(); });
+}
+function onProgress(ev) {
+  const map = { "step-start":"running", "step-done":"done", "step-suspended":"running", "step-failed":"failed" };
+  if (map[ev.status]) setStep(ev.step, map[ev.status]);
+  if (ev.step === "writeScript" && ev.status === "step-suspended") showGate(ev.script);
+  if (ev.step === "generateScenes" && ev.status === "step-progress") {
+    setStep("generateScenes", "running", "场景 #" + ev.scene + " " + (ev.result||""));
+  }
+}
+function onDone(run) {
+  es && es.close();
+  document.getElementById("genBtn").disabled = false;
+  renderDelivery(run);
+}
+
+function showGate(script) {
+  pendingScript = script; gateVoice = (script.voiceover||[]).map(x=>({...x}));
+  let html = `<div><b>标题：</b>${script.title||""}</div>`;
+  html += `<div style="margin-top:10px;"><b>旁白（可编辑）：</b></div>`;
+  gateVoice.forEach((x,i)=>{ html += `<div class="vline"><span style="color:var(--sub);font-size:12px;margin-top:10px;">${x.timecode}</span><input data-i="${i}" value="${esc(x.text)}" /></div>`; });
+  html += `<div style="margin-top:10px;color:var(--sub);font-size:12px;">结构：${(script.structure||[]).join(" → ")} ｜ 情绪：${(script.moodCurve||[]).join(" → ")}</div>`;
+  document.getElementById("gateScript").innerHTML = html;
+  document.getElementById("gateModal").classList.remove("hidden");
+}
+function approveScript(useEdits) {
+  const edits = useEdits ? { voiceover: gateVoice.map((x,i)=>({ timecode:x.timecode, text: document.querySelector(`input[data-i="${i}"]`).value })) } : undefined;
+  fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ decision:"approve", edits }) });
+  document.getElementById("gateModal").classList.add("hidden");
+  setStep("writeScript", "running", "已确认，继续…");
+}
+function esc(s){ return String(s).replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+
+function renderDelivery(run) {
+  const card = document.getElementById("resultCard"); card.classList.remove("hidden");
+  let html = "";
+  if (run.poster) html += `<img src="${run.poster}" style="max-width:320px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
+  html += `<p style="color:var(--sub)">状态：${run.status} ｜ 语言：${run.brief.language} ｜ 时长：${run.brief.durationSec}s</p>`;
+  if (run.srt) html += `<p><a class="dl" href="${srtBlob(run.srt)}" download="script.srt">下载字幕 SRT</a></p>`;
+  if (run.note) html += `<div class="note">${run.note}</div>`;
+  // 分镜画廊
+  const scenes = (run.storyboardGallery && run.storyboardGallery.length) ? run.storyboardGallery : (run.storyboard||[]).map(s=>({index:s.index, mediaUrl:s.mediaUrl, subtitle:s.subtitle||s.visualPrompt, status:s.status}));
+  if (scenes.length) {
+    html += `<h4>分镜画廊（${scenes.length} 镜）</h4><div class="gallery">`;
+    scenes.forEach(s=>{ const fail = s.status==="failed"?" failed":""; html += `<div class="scene${fail}">${s.mediaUrl?`<img src="${s.mediaUrl}"/>`:`<div style="padding:20px;color:var(--bad)">素材生成失败</div>`}<div class="cap">#${s.index} ${esc(s.subtitle||"")}</div></div>`; });
+    html += `</div>`;
+  }
+  // 脚本全文
+  if (run.script) {
+    html += `<h4>脚本全文</h4><pre>${esc(JSON.stringify(run.script, null, 2))}</pre>`;
+  }
+  document.getElementById("delivery").innerHTML = html;
+}
+function srtBlob(srt){ return "data:text/plain;charset=utf-8," + encodeURIComponent(srt); }
+</script>
+</body>
+</html>
