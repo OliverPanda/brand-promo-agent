@@ -177,4 +177,4 @@ if (isMain) {
   });
 }
 
-export { app, runScriptPhase, runVideoPhase };
+export { app };
