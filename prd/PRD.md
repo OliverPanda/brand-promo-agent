@@ -2,12 +2,12 @@
 
 | 项 | 内容 |
 |----|------|
-| 文档版本 | v0.2（细化版，M1 执行基线） |
+| 文档版本 | v0.3（M1 + M2 执行基线） |
 | 日期 | 2026-09-03 |
 | 负责人 | 铭星链 MingStar 主理人 / 交付总监 |
 | 架构选型 | **Mastra（TypeScript）** —— 见 [ADR-001](./ADR-001-framework-selection.md) |
 | 交付形态 | 网页端（Web）单页应用 + 后端 Agent 工作流服务 |
-| 状态 | v0.2 细化完成，进入 M1 执行 |
+| 状态 | M1（DEMO 全跑通）+ M2（真实 one-api Provider + 成本预算）已完成；待 M3 持久化与真实计费回写 |
 
 ---
 
@@ -357,7 +357,7 @@ interface PromoRun {
 | 阶段 | 内容 | 交付 |
 |------|------|------|
 | M1 | 选型 + PRD + 架构（本期） | 本文档 + ADR-001 + Web 原型（DEMO） |
-| M2 | 真实 Provider 接入（one-api/ai-core） | 产出真实 MP4 |
+| M2 | 真实 Provider 接入（one-api/ai-core）+ FR-10 成本预算 | 产出真实 MP4 + 成本归集与预算闸门（详见 §16.9） |
 | M3 | HITL 完整化 + 成本配额 + 历史记录 | 可上线内测 |
 | M4 | 模板库 + 多语言 + 小程序并入 | 全量上线 |
 
@@ -465,6 +465,70 @@ ingestBrief(Zod BrandBrief)
 3. `node src/server.js` 启动，用 `curl` 跑 `POST /api/generate` + 读 SSE + `GET /api/runs/:runId` 验证。
 4. `node --test tests/` 跑单测。
 5. 满足 §16.7 DoD 即 M1 完成；提交 git（本期首次纳入版本控制）。
+
+### 16.9 M2 执行基线（v0.3 新增，真实 Provider + 成本预算）
+
+> M2 把 §10 选定的「one-api（OpenAI 兼容统一网关）」真实通道接通，并补齐 §15 决议中推迟到 M2 的 **FR-10 成本配额与预算上限**、FR-9.2 成片门（成片阶段已纳入预算闸门）、参考图图生图透传、成本报表（复用 ai-core 计费埋点结构）。**DEMO 路径完全保留、零回归**；真实路径仅在 `PROMO_PROVIDER_MODE=real` 时启用。
+
+#### 16.9.1 M2 范围锁定（相对 §16.1 的增量）
+- ✅ **真实 Provider 接入（one-api）**：脚本/分镜（LLM `/chat/completions`）、场景图（`/images/generations`，Seedream `doubao-seedream-4-0-250828`）、配音（`/audio/speech` TTS）、配乐（`/audio/music`，Mureka 桥），均经 `globalThis.fetch` 调 one-api，请求/响应严格按 OpenAI 兼容协议解析。
+- ✅ **真实 MP4 合成**：服务端 FFmpeg（`PROMO_FFMPEG_BIN`）将场景图 + 配音 + 配乐合流为 MP4；未配置 FFmpeg 或合成失败时优雅降级为分镜包（DEMO 同款），不阻断交付。
+- ✅ **FR-10 成本配额与预算上限**：真实 Provider 回传 `_usage`（tokens / images / minutes / tracks / videos），经 `cost.js` 单价表预估 → 归集到 `PromoRun.cost` → `checkBudget` 对 `PROMO_BUDGET_CAP`（默认 ¥20）闸门，超限抛 `BudgetExceededError` 中止并提示。
+- ✅ **参考图图生图透传**：`brief.styleReference` 在真实图像生成时拼入 prompt（「参考风格：…」），DEMO 仅做 SVG 文案标注。
+- ✅ **成本可见性**：前端 `GET /api/config` 暴露 `mode`/`provider`/`budgetCap`；交付页渲染每步 ¥ 明细与总额/上限对比。
+- ⏸️ **仍推迟**：四大阻断域真实计费/扣星钻（仅预留 `cost` 结构，不接计费回写）；运行态持久化（M3，进程内 Map）；真实图生图模型（Seedream 参考图输入，M2 仅关键词透传）。
+
+#### 16.9.2 M2 文件落地清单
+```
+src/
+├── mastra/providers.js   # 【重写】getProviderMode() 门控；real 分支 oneApiPost() 调 one-api；DEMO 分支原样保留
+├── cost.js               # 【新增】PRICING 单价表 + costFor/sumCost/checkBudget/BudgetExceededError/getBudgetCap
+├── mastra/workflow.js    # 【修改】recordCost() 归集成本 + 预算闸门；各步透传 runId 修复（见 §16.9.5）
+├── server.js             # 【修改】runVideoPhase 以 .then 观察 run.start（规避 Mastra 嵌套上下文卡死）；新增 GET /api/config
+├── store.js              # 【不变】
+├── schemas.js            # 【不变】
+├── mastra/eventBus.js    # 【不变】
+└── mastra/svg.js         # 【不变】
+public/index.html          # 【修改】模式徽标（DEMO/真实）+ 成本卡片
+tests/
+├── providers.test.mjs    # 【不变】DEMO 确定性
+├── providers-real.test.mjs # 【新增】mock fetch 验证 one-api 请求构造 + 响应解析 + _usage
+├── cost.test.mjs         # 【新增】单价/汇总/预算闸门/BudgetExceededError
+├── workflow-real-budget.test.mjs # 【新增】真实端到端成本归集 + 极小预算触发超限中止 + /api/config
+└── server.test.mjs       # 【不变】HITL 开/关门 + 端到端
+```
+
+#### 16.9.3 真实 Provider 接口签名（M2 接通，对应 §10）
+```js
+// 真实模式（PROMO_PROVIDER_MODE=real）下，以下函数改走 one-api（OpenAI 兼容）：
+generateScript(brief)          -> /chat/completions (response_format=json_object) -> {..., _usage:{tokens}}
+generateStoryboard(brief,script)-> /chat/completions                              -> Scene[] 每镜 {..., _usage:{tokens}}
+generateSceneMedia(scene,brief)-> /images/generations (model=PROMO_IMAGE_MODEL)    -> {mediaUrl, kind, _usage:{images:1}}
+generateVoiceover(script,brief)-> /audio/speech (isBinary)                        -> {voiceUrl:data:audio/mp3;base64, srt, _usage:{minutes}}
+generateMusic(brief,storyboard)-> /audio/music (model=PROMO_MUSIC_MODEL)          -> {musicUrl, mood, _usage:{tracks:1}}
+composite(scenes,voice,music,brief) -> ffmpegAssemble() (PROMO_FFMPEG_BIN)        -> {videoUrl:file://...mp4, ..., _usage:{videos:1}}
+// 任一真实步无 _usage（如未配置 FFmpeg 的合成降级）则不计成本；DEMO 模式全程无 _usage 不计成本。
+```
+> 模式判定：`getProviderMode()` 仅在 `PROMO_PROVIDER_MODE==="real"` 返回 `"real"`，否则 `"demo"`（安全默认，零外部依赖）。工作流代码不变，仅 env 切换。
+
+#### 16.9.4 成本与预算（FR-10，对应 §15 决议）
+- 单价表 `PRICING`（CNY，元）：`writeScript/storyboard` ¥0.004/1k tokens；`generateScenes` ¥0.20/张；`voiceover` ¥0.1/分钟；`music` ¥0.5/曲；`composite` ¥1.0/视频。
+- 归集：`withStep` 完成后调 `recordCost(runId, step, out)`，仅当 `out._usage` 存在时计入；`checkBudget(costs, {amount:0}, getBudgetCap())` 累算，超限抛 `BudgetExceededError`，`withStep` 捕获后置 `run.status=failed` 并 emit `run-failed`。
+- 上限 `PROMO_BUDGET_CAP`（默认 20）每次运行实时读取环境变量，便于不改代码调整。
+- M2 仅做「预估 + 闸门 + 归集」，不接入四大阻断域真实计费/扣星钻（仅预留 `PromoRun.cost` 结构，见 §7）。
+
+#### 16.9.5 关键工程修正（M2 排障，必读）
+1. **Mastra v1.63 suspend/resume 陷阱（M1 已记录）**：`suspend()` 始终以 `undefined` resolve 且不回传 resume 数据；`resume()` 重跑被挂起步骤后**不会继续下游 DAG**（实测卡在 suspended 步骤）。HITL 门采用两段式工作流（`promoScript` 收尾 suspend，`promoVideo` 由 server 冷启动）。
+2. **M2 新增——嵌套工作流 `run.start` 卡死**：在 `promoScript.run.start()` 的续跑上下文（或 `/approve` 的 `resume` 续跑上下文）内直接 `await` 第二个工作流的 `run.start()`，Mastra 执行引擎会卡在 `storyboard` 之后不再调度 `generateScenes`。**修复**：以 `run.start(...).then(...)` 观察 Promise（detached 观测），并用 `setImmediate` 把 `runVideoPhase` 切到全新事件循环 tick，脱离父 continuation 的 AsyncLocalStorage 上下文。
+3. **M2 新增——runId 透传断链**：两段式拆分后，`promoVideo` 的 `storyboard` 步在返回对象中**漏带 `runId`**，导致其后所有步骤与 `deliver` 的 `rid` 退化为 Mastra 内部 runId（`${runId}:video`），写入进程内 `store` 的键错位——表现为成片阶段完成但 `PromoRun.status` 永远 `running`、SSE `run-done` 被前端按 user-runId 过滤掉。**修复**：`storyboard/generateScenes/voiceover/music/composite` 各步返回对象均补回 `runId: rid`，确保 `deliver` 命中正确 store 键。
+
+#### 16.9.6 M2 DoD（验收）
+- [x] 设 `PROMO_PROVIDER_MODE=real` + one-api 环境变量后，`generateScript/storyboard/sceneMedia/voiceover/music` 实际构造正确请求（鉴权 `Bearer`、模型、size、voice 映射、响应 JSON 解析）并产出真实 `mediaUrl`/音频 data URI/音乐 URL。
+- [x] 设 `PROMO_FFMPEG_BIN` 后 `composite` 真实合成为 MP4（或缺失时优雅降级为分镜包、不报错）。
+- [x] 真实路径下 `PromoRun.cost` 累计每步 ¥ 预估；`PROMO_BUDGET_CAP` 调小至首步即超限时，run 中止于 `failed` 且提示「预算超限」，已归集成本保留 1 条。
+- [x] `GET /api/config` 在真实模式返回 `provider:"one-api"` 与 `budgetCap`；前端徽标与成本卡片正确。
+- [x] DEMO 模式零密钥端到端仍跑通（分镜画廊 + SRT），且全部 `node --test` 冒烟（M2 新增 25 例，合计 35 例）全绿。
+- [x] 参考图 `styleReference` 在真实图像生成拼入 prompt。
 
 ---
 

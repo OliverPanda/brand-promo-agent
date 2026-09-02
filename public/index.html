@@ -47,7 +47,7 @@
 <body>
 <div class="wrap">
   <h1>铭星链 · 自动化品宣机器人</h1>
-  <div class="sub">填一份品牌简报，自动产出宣传片脚本 / 分镜 / 画面 / 配音 / 配乐 / 合成（DEMO 离线模式）。</div>
+  <div class="sub">填一份品牌简报，自动产出宣传片脚本 / 分镜 / 画面 / 配音 / 配乐 / 合成（<span id="modeBadge">DEMO 离线模式</span>）。</div>
 
   <div class="card" id="formCard">
     <div class="row">
@@ -115,7 +115,7 @@
 const AUDIENCE = ["Z世代","白领","企业采购","宝妈","学生","极客"];
 const TONES = ["科技感","温情","高端","国潮","搞笑","专业"];
 let audienceSel = new Set(), toneSel = new Set();
-let es = null, currentRunId = null, pendingScript = null, gateVoice = [];
+let es = null, currentRunId = null, pendingScript = null, gateVoice = [], BUDGET_CAP = null;
 
 function buildChips(containerId, items, sel) {
   const c = document.getElementById(containerId);
@@ -129,6 +129,16 @@ function buildChips(containerId, items, sel) {
 }
 buildChips("audienceChips", AUDIENCE, audienceSel);
 buildChips("toneChips", TONES, toneSel);
+fetchMode();
+
+async function fetchMode() {
+  try {
+    const c = await (await fetch("/api/config")).json();
+    BUDGET_CAP = c.budgetCap;
+    document.getElementById("modeBadge").textContent =
+      c.mode === "real" ? `真实模式（one-api，预算上限 ¥${c.budgetCap}）` : "DEMO 离线模式";
+  } catch {}
+}
 
 function stepRow(id) {
   const ul = document.getElementById("steps");
@@ -207,6 +217,13 @@ function renderDelivery(run) {
   if (run.poster) html += `<img src="${run.poster}" style="max-width:320px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
   html += `<p style="color:var(--sub)">状态：${run.status} ｜ 语言：${run.brief.language} ｜ 时长：${run.brief.durationSec}s</p>`;
   if (run.srt) html += `<p><a class="dl" href="${srtBlob(run.srt)}" download="script.srt">下载字幕 SRT</a></p>`;
+  // 成本汇总（M2 / FR-10）
+  if (run.cost && run.cost.length) {
+    const total = run.cost.reduce((a,c)=>a+(c.amount||0),0);
+    html += `<div class="card" style="margin-top:12px;"><b>本次预估成本</b>：¥${total.toFixed(4)} / 上限 ¥${BUDGET_CAP ?? "?"}<ul style="margin:8px 0 0;padding-left:18px;font-size:13px;color:var(--sub);">`;
+    run.cost.forEach(c=>{ html += `<li>${c.step}：¥${(c.amount||0).toFixed(4)}${c.tokens?` （${c.tokens} tokens）`:""}</li>`; });
+    html += `</ul></div>`;
+  }
   if (run.note) html += `<div class="note">${run.note}</div>`;
   // 分镜画廊
   const scenes = (run.storyboardGallery && run.storyboardGallery.length) ? run.storyboardGallery : (run.storyboard||[]).map(s=>({index:s.index, mediaUrl:s.mediaUrl, subtitle:s.subtitle||s.visualPrompt, status:s.status}));

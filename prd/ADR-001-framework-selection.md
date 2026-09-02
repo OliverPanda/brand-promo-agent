@@ -48,3 +48,16 @@
 - **视频/图像素材**：优先复用 MingStar ai-core 的 `/api/v1/ai/...`（Seedream 图生图、`doubao-seedream-4-0-250828` 等已预接），其次外部视频 API。
 - **TTS / 配乐**：接入 one-api 音频通道（Mureka 已切 one-api 桥）。
 - 所有外部依赖均通过 **Provider 接口** 抽象，默认 **DEMO 模式**（确定性离线生成，便于本地运行与演示），环境变量注入真实密钥后切生产。
+
+## 5. M2 执行记录（v0.3 更新）
+
+**决策延续**：M2 按 §4 选定策略落地——真实 Provider 全部经 **one-api（OpenAI 兼容统一网关）** 接入：脚本/分镜走 `/chat/completions`，场景图走 `/images/generations`（Seedream `doubao-seedream-4-0-250828`），配音走 `/audio/speech`，配乐走 Mureka 桥 `/audio/music`；合成走服务端 **FFmpeg**（`PROMO_FFMPEG_BIN`）。工作流代码零改动，仅由 `PROMO_PROVIDER_MODE=real` 切换，DEMO 路径完整保留、零回归。
+
+**M2 工程修正（已落实，详见 PRD §16.9.5）**：
+1. **两段式工作流 + store 审批门**（继承 M1 对 Mastra v1.63 suspend/resume 陷阱的规避）：HITL 脚本门放在 `promoScript` 收尾步 suspend，审批通过由 server 冷启动 `promoVideo`。
+2. **嵌套工作流 `run.start` 卡死**：在 `promoScript.run.start()` 续跑上下文内直接 `await` 第二个工作流的 `run.start()`，Mastra 引擎会卡在 `storyboard` 之后不再调度后续步骤。改为以 `run.start(...).then(...)` 观察 Promise，并用 `setImmediate` 把成片阶段切到全新事件循环 tick，脱离父 continuation 的 AsyncLocalStorage 上下文。
+3. **runId 透传断链**：两段式拆分后 `promoVideo` 的 `storyboard` 步漏带 `runId`，导致其后所有步骤与 `deliver` 的 store 键退化为 Mastra 内部 runId，成片完成却 `PromoRun.status` 永远 `running`、SSE `run-done` 被前端按 user-runId 过滤。已为各步返回对象补回 `runId: rid`。
+
+**成本与预算（FR-10）**：真实 Provider 回传 `_usage`（tokens/images/minutes/tracks/videos）→ `cost.js` 单价表预估 → 归集 `PromoRun.cost` → `checkBudget` 对 `PROMO_BUDGET_CAP`（默认 ¥20，运行时实时读取）闸门，超限中止。M2 仅做预估+闸门+归集，不接四大阻断域真实计费/扣星钻（预留 `cost` 结构）。
+
+**验证**：`node --test tests/` 全绿（35 例，含 M2 新增 25 例：mock fetch 验证 one-api 请求构造/响应解析、成本/预算逻辑、真实端到端成本归集、极小预算触发超限中止、`/api/config`）；DEMO 与 real 两条路径均端到端跑通。

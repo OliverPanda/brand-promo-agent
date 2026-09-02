@@ -5,6 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mastra } from "./mastra/workflow.js";
 import { STEP } from "./mastra/workflow.js";
+import { getProviderMode } from "./mastra/providers.js";
+import { getBudgetCap } from "./cost.js";
 import { parseBrief } from "./schemas.js";
 import {
   newRunId,
@@ -32,12 +34,15 @@ async function runVideoPhase(runId, brief) {
   const videoRunId = `${runId}:video`;
   const script = getRun(runId)?.script;
   const run = await mastra.getWorkflow("promoVideo").createRun({ runId: videoRunId });
-  try {
-    await run.start({ inputData: { brief, script, runId } });
-  } catch (err) {
-    // withStep 已将 store 置 failed 并 emit run-failed；此处仅防止未捕获 rejection。
-    console.error(`[video-phase] ${runId} failed:`, err?.message || err);
-  }
+  // 关键：与可工作的内联模式一致 —— 直接观察 run.start 的 Promise（detached + .then），
+  // 避免在该 continuation 内 await 导致 Mastra 执行引擎卡在 storyboard 之后（Mastra v1.63 已知怪异行为）。
+  return run.start({ inputData: { brief, script, runId } })
+    .then((res) => res)
+    .catch((err) => {
+      console.error(`[video-phase] ${runId} failed:`, err?.message || err);
+      updateRun(runId, { status: "failed" });
+      throw err;
+    });
 }
 
 // 第一段：脚本生成 + HITL 门。suspend 时挂起等待 /approve；通过后进入第二段。
@@ -47,7 +52,11 @@ async function runScriptPhase(runId, brief) {
   // 审批恢复闭包：恢复被挂起的脚本工作流，完成后接力启动成片工作流。
   registerResumer(runId, async (resumeData) => {
     await run.resume({ resumeData });
-    await runVideoPhase(runId, brief);
+    // 同上：脱离 resume 上下文，切到新 tick 启动成片工作流。
+    setImmediate(() => runVideoPhase(runId, brief).catch((err) => {
+      console.error(`[video-phase] ${runId} failed:`, err?.message || err);
+      updateRun(runId, { status: "failed" });
+    }));
   });
   try {
     const result = await run.start({ inputData: { brief, runId } });
@@ -56,7 +65,12 @@ async function runScriptPhase(runId, brief) {
       return; // 等待 /approve → resumer 接力
     }
     // 非挂起（HITL 关闭）：直接进入成片阶段。
-    await runVideoPhase(runId, brief);
+    // 关键：不能在 promoScript 的 run.start 续跑上下文里直接 await 新工作流（Mastra AsyncLocalStorage
+    // 上下文嵌套会导致新 run 卡在 storyboard 之后）。用 setImmediate 切到全新事件循环 tick，脱离父上下文。
+    setImmediate(() => runVideoPhase(runId, brief).catch((err) => {
+      console.error(`[video-phase] ${runId} failed:`, err?.message || err);
+      updateRun(runId, { status: "failed" });
+    }));
   } catch (err) {
     console.error(`[script-phase] ${runId} failed:`, err?.message || err);
     updateRun(runId, { status: "failed" });
@@ -146,6 +160,15 @@ app.get("/api/runs/:runId", (req, res) => {
 // ── GET /api/runs：历史列表（进程内） ──
 app.get("/api/runs", (_req, res) => res.json(listRuns()));
 
+// ── GET /api/config：运行模式与预算上限（前端展示用，不含密钥） ──
+app.get("/api/config", (_req, res) =>
+  res.json({
+    mode: getProviderMode(),
+    budgetCap: getBudgetCap(),
+    provider: getProviderMode() === "real" ? "one-api" : "demo",
+  })
+);
+
 // 仅当作为主入口运行（node src/server.js）时自动监听；被测试 import 时由测试自行监听随机端口。
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
@@ -154,4 +177,4 @@ if (isMain) {
   });
 }
 
-export { app };
+export { app, runScriptPhase, runVideoPhase };

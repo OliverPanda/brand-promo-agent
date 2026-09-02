@@ -1,17 +1,18 @@
-// Provider 抽象层：所有外部能力（LLM / 图像视频 / TTS / 音乐 / 合成）均经此适配。
+// Provider 抽象层：所有外部能力（LLM / 图像 / TTS / 音乐 / 合成）均经此适配。
 // 默认 DEMO 模式：完全离线、确定性的占位生成，无需任何外部密钥即可端到端运行。
-// 生产模式：注入对应环境变量后，自动切换到真实供应商（one-api / MingStar ai-core）。
+// 生产模式（PROMO_PROVIDER_MODE=real）：经 one-api（OpenAI 兼容统一网关）调用真实能力，
+//   图像走 /v1/images/generations（Seedream 等），TTS 走 /v1/audio/speech，音乐走 Mureka 桥；
+//   合成走服务端 FFmpeg（PROMO_FFMPEG_BIN）。每个真实能力回传 _usage 供成本归集。
 //
-// 切换只需实现对应 Provider 接口并设置环境变量，【工作流代码不变】。
+// 切换只需设置环境变量，【工作流代码不变】。本文件不含网络调用时机之外的业务逻辑。
 
 import { encodeSVG } from "./svg.js";
 
-// ───────────────────────── 环境判定 ─────────────────────────
-const ENV = process.env;
-const hasLLM = !!(ENV.MINGSTAR_LLM_BASE_URL || ENV.OPENAI_API_KEY);
-const hasMedia = !!(ENV.MINGSTAR_AI_CORE_URL);
-const hasTTS = !!(ENV.MINGSTAR_TTS_URL || ENV.MINGSTAR_LLM_BASE_URL);
-const hasMusic = !!(ENV.MINGSTAR_MUSIC_URL || ENV.MINGSTAR_LLM_BASE_URL);
+// ───────────────────────── 模式判定 ─────────────────────────
+// 仅在显式 PROMO_PROVIDER_MODE=real 时启用真实 Provider；其余一律 DEMO（安全默认，零外部依赖）。
+export function getProviderMode() {
+  return process.env.PROMO_PROVIDER_MODE === "real" ? "real" : "demo";
+}
 
 // ───────────────────────── 工具：确定性随机（按 brief 稳定） ─────────────────────────
 function hashSeed(str = "") {
@@ -46,12 +47,99 @@ function paletteFor(tones = []) {
   return ["#6366f1", "#0ea5e9"];
 }
 
+// ───────────────────────── one-api HTTP 客户端（OpenAI 兼容） ─────────────────────────
+async function oneApiPost(path, body, { isBinary = false } = {}) {
+  const base = process.env.PROMO_ONEAPI_BASE_URL || process.env.MINGSTAR_LLM_BASE_URL;
+  const key = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY;
+  if (!base || !key) throw new Error("one-api 未配置：请设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
+  const url = base.replace(/\/$/, "") + path;
+  const res = await (globalThis.fetch || fetch)(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`one-api ${path} ${res.status}: ${txt.slice(0, 300)}`);
+  }
+  if (isBinary) return Buffer.from(await res.arrayBuffer());
+  return res.json();
+}
+
+function parseJSONSafe(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) {
+      try {
+        return JSON.parse(m[0]);
+      } catch {
+        return {};
+      }
+    }
+    return {};
+  }
+}
+function estimateTokens(s = "") {
+  // 粗略估算（中文约 1.5 字/token，英文约 4 字符/token）。仅用于成本预估兜底。
+  return Math.max(1, Math.round(s.length / 2));
+}
+function mapVoiceTone(tone = "男声") {
+  const t = tone.toLowerCase();
+  if (t.includes("女")) return "female";
+  if (t.includes("沉稳") || t.includes("男")) return "male";
+  if (t.includes("活泼")) return "young";
+  return "male";
+}
+
+function langInstruction(lang) {
+  switch (lang) {
+    case "zh-TW":
+      return "输出使用繁体中文。";
+    case "en":
+      return "Output in English.";
+    case "ja":
+      return "出力は日本語で。";
+    case "ko":
+      return "출력은 한국어로.";
+    default:
+      return "输出使用简体中文。";
+  }
+}
+
 // ───────────────────────── 1) LLM：脚本生成 ─────────────────────────
 export async function generateScript(brief) {
-  if (!hasLLM) return demoScript(brief);
-  // 生产：POST {MINGSTAR_LLM_BASE_URL}/chat/completions，model = MINGSTAR_LLM_MODEL（默认 deepseek-v4-flash）
-  // 见 ADR-001：经 one-api 统一路由。下面为真实调用骨架（本环境未注入密钥，不会走到）。
-  throw new Error("real LLM provider not wired in demo runtime");
+  if (getProviderMode() !== "real") return demoScript(brief);
+  const model = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
+  const sys = "你是资深品牌文案，依据品牌简报产出宣传片脚本，严格只输出 JSON（不含解释），结构：{title, voiceover:[{timecode,text}], structure:[], moodCurve:[]}。";
+  const user =
+    `品牌：${brief.brandName}\n产品：${brief.productName}\n核心卖点：${brief.coreSellingPoint}\n` +
+    `受众：${(brief.audience || []).join("、")}\n调性：${(brief.tones || []).join("、")}\n` +
+    `核心信息：${(brief.keyMessages || []).join("；")}\n时长：${brief.durationSec}s\n` +
+    `配音音色：${brief.voiceTone}\n${langInstruction(brief.language)}\n` +
+    `voiceover 需按时长均分时间轴（timecode 格式 HH:MM:SS.mmm），结构含开场钩子/痛点/方案/卖点/CTA。`;
+  const data = await oneApiPost("/chat/completions", {
+    model,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.7,
+  });
+  const content = data.choices?.[0]?.message?.content || "{}";
+  const parsed = parseJSONSafe(content);
+  const tokens = data.usage?.total_tokens ?? estimateTokens(user + content);
+  const fallback = demoScript(brief);
+  return {
+    title: parsed.title || fallback.title,
+    voiceover: parsed.voiceover?.length ? parsed.voiceover : fallback.voiceover,
+    structure: parsed.structure?.length ? parsed.structure : fallback.structure,
+    moodCurve: parsed.moodCurve?.length ? parsed.moodCurve : fallback.moodCurve,
+    language: brief.language || "zh-CN",
+    _usage: { tokens },
+  };
 }
 
 function demoScript(brief) {
@@ -116,8 +204,38 @@ function demoScript(brief) {
 
 // ───────────────────────── 2) LLM：分镜生成 ─────────────────────────
 export async function generateStoryboard(brief, script) {
-  if (!hasLLM) return demoStoryboard(brief, script);
-  throw new Error("real LLM provider not wired in demo runtime");
+  if (getProviderMode() !== "real") return demoStoryboard(brief, script);
+  const model = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
+  const sys = "你是资深分镜师，把脚本拆为若干 Scene，严格只输出 JSON 数组，结构：[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]。";
+  const vo = (script?.voiceover || []).map((v) => `${v.timecode} ${v.text}`).join("\n");
+  const user =
+    `品牌：${brief.brandName} 产品：${brief.productName}\n调性：${(brief.tones || []).join("、")}\n` +
+    `时长：${brief.durationSec}s\n旁白：\n${vo}\n${langInstruction(brief.language)}\n` +
+    `约每 5s 一个镜头；camera ∈ push/pull/pan/fixed；视觉风格全程统一。`;
+  const data = await oneApiPost("/chat/completions", {
+    model,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.7,
+  });
+  const content = data.choices?.[0]?.message?.content || "{}";
+  const parsed = parseJSONSafe(content);
+  const arr = Array.isArray(parsed) ? parsed : parsed.scenes || [];
+  const tokens = data.usage?.total_tokens ?? estimateTokens(user + content);
+  if (!arr.length) return demoStoryboard(brief, script);
+  const scenes = arr.map((s, i) => ({
+    index: s.index || i + 1,
+    visualPrompt: s.visualPrompt || `${brief.brandName} ${brief.productName} 画面`,
+    subtitle: s.subtitle || script?.voiceover?.[i]?.text || `场景 ${i + 1}`,
+    camera: ["push", "pull", "pan", "fixed"].includes(s.camera) ? s.camera : "fixed",
+    durationSec: Number(s.durationSec) || Math.round((brief.durationSec / arr.length) * 10) / 10,
+    musicClimax: !!s.musicClimax,
+    status: "pending",
+  }));
+  return scenes.map((s) => ({ ...s, _usage: { tokens: Math.round(tokens / scenes.length) } }));
 }
 
 function demoStoryboard(brief, script) {
@@ -144,9 +262,18 @@ function demoStoryboard(brief, script) {
 
 // ───────────────────────── 3) 图像/视频素材 ─────────────────────────
 export async function generateSceneMedia(scene, brief) {
-  if (!hasMedia) return demoSceneMedia(scene, brief);
-  // 生产：POST {MINGSTAR_AI_CORE_URL}/api/v1/ai/... （Seedream 图生图 / 视频生成）
-  throw new Error("real media provider not wired in demo runtime");
+  if (getProviderMode() !== "real") return demoSceneMedia(scene, brief);
+  const model = process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
+  const prompt = scene.visualPrompt + (brief.styleReference ? `；参考风格：${brief.styleReference}` : "");
+  const data = await oneApiPost("/images/generations", {
+    model,
+    prompt,
+    n: 1,
+    size: process.env.PROMO_IMAGE_SIZE || "1024x576",
+  });
+  const item = data.data?.[0] || {};
+  const mediaUrl = item.url || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null);
+  return { mediaUrl, kind: "image", model, _usage: { images: 1 } };
 }
 
 function demoSceneMedia(scene, brief) {
@@ -157,8 +284,20 @@ function demoSceneMedia(scene, brief) {
 
 // ───────────────────────── 4) TTS 配音 ─────────────────────────
 export async function generateVoiceover(script, brief) {
-  if (!hasTTS) return demoVoiceover(script, brief);
-  throw new Error("real TTS provider not wired in demo runtime");
+  if (getProviderMode() !== "real") return demoVoiceover(script, brief);
+  const model = process.env.PROMO_TTS_MODEL || "tiny-iceberg";
+  const text = (script?.voiceover || []).map((v) => v.text).join("\n");
+  const audio = await oneApiPost(
+    "/audio/speech",
+    { model, input: text, voice: mapVoiceTone(brief.voiceTone), response_format: "mp3" },
+    { isBinary: true }
+  );
+  const voiceUrl = `data:audio/mp3;base64,${audio.toString("base64")}`;
+  const srt = (script?.voiceover || [])
+    .map((v, i) => `${i + 1}\n${v.timecode} --> ${fmtTC((i + 1) * 3)}\n${v.text}\n`)
+    .join("\n");
+  const minutes = (script?.voiceover?.length || 1) * 3 / 60;
+  return { voiceUrl, srt, voiceTone: brief.voiceTone || "男声", model, _usage: { minutes } };
 }
 
 function demoVoiceover(script, brief) {
@@ -168,34 +307,104 @@ function demoVoiceover(script, brief) {
   return { voiceUrl: null, srt, voiceTone: brief.voiceTone || "男声", model: "demo-tts" };
 }
 
-// ───────────────────────── 5) 音乐 ─────────────────────────
+// ───────────────────────── 5) 音乐（Mureka 桥 / one-api 音乐通道） ─────────────────────────
 export async function generateMusic(brief, storyboard) {
-  if (!hasMusic) return demoMusic(brief);
-  throw new Error("real music provider not wired in demo runtime");
+  if (getProviderMode() !== "real") return demoMusic(brief);
+  const model = process.env.PROMO_MUSIC_MODEL || "mureka-v1";
+  const path = process.env.PROMO_MUSIC_PATH || "/audio/music";
+  const prompt = `背景音乐：${(brief.tones || ["专业"]).join("/")}风格，匹配宣传片情绪曲线`;
+  const data = await oneApiPost(path, { model, prompt, lyrics: "", instrumental: true });
+  const item = data.data?.[0] || {};
+  const musicUrl = item.url || (item.b64_json ? `data:audio/mp3;base64,${item.b64_json}` : null);
+  return { musicUrl, mood: (brief.tones || ["专业"]).join("/"), model, _usage: { tracks: 1 } };
 }
 
 function demoMusic(brief) {
   return { musicUrl: null, mood: (brief.tones || ["专业"]).join("/"), model: "demo-mureka" };
 }
 
-// ───────────────────────── 6) 合成 ─────────────────────────
+// ───────────────────────── 6) 合成（服务端 FFmpeg） ─────────────────────────
 export async function composite(scenes, voice, music, brief) {
-  if (!hasMedia) return demoComposite(scenes, voice, music, brief);
-  throw new Error("real composite provider not wired in demo runtime");
+  if (getProviderMode() !== "real") return demoComposite(scenes, voice, music, brief);
+  const ffmpeg = process.env.PROMO_FFMPEG_BIN;
+  const gallery = scenes.map((s) => ({ index: s.index, mediaUrl: s.mediaUrl, subtitle: s.subtitle }));
+  if (!ffmpeg) {
+    return fallbackComposite(scenes, voice, music, brief, "未配置 PROMO_FFMPEG_BIN，已降级为分镜包");
+  }
+  try {
+    const videoUrl = await ffmpegAssemble(ffmpeg, scenes, voice, music, brief);
+    return {
+      videoUrl,
+      poster: scenes[0]?.mediaUrl || null,
+      storyboardGallery: gallery,
+      srt: voice?.srt || "",
+      note: "已合成为 MP4（服务端 FFmpeg）。",
+      model: "ffmpeg",
+      _usage: { videos: 1 },
+    };
+  } catch (e) {
+    return fallbackComposite(scenes, voice, music, brief, `合成失败已降级：${String(e?.message || e)}`);
+  }
+}
+
+function fallbackComposite(scenes, voice, music, brief, reason) {
+  return {
+    videoUrl: null,
+    poster: scenes[0]?.mediaUrl || null,
+    storyboardGallery: scenes.map((s) => ({ index: s.index, mediaUrl: s.mediaUrl, subtitle: s.subtitle })),
+    srt: voice?.srt || "",
+    note: `DEMO/降级模式：${reason}（生产环境将合成为 MP4）。`,
+    model: "demo-composite",
+  };
 }
 
 function demoComposite(scenes, voice, music, brief) {
-  // 真实场景：服务端 FFmpeg / MingStar 合成服务将素材+配音+配乐合为 MP4。
-  // DEMO：返回可下载的分镜包描述 + 封面，前端以「分镜轮播」模拟播放。
-  const poster = scenes[0]?.mediaUrl || null;
-  return {
-    videoUrl: null, // 生产环境回填 MP4 直链
-    poster,
-    storyboardGallery: scenes.map((s) => ({ index: s.index, mediaUrl: s.mediaUrl, subtitle: s.subtitle })),
-    srt: voice?.srt || "",
-    note: "DEMO 模式：未接入真实合成服务，以下为分镜故事板（生产环境将合成为 MP4）。",
-    model: "demo-composite",
-  };
+  return fallbackComposite(scenes, voice, music, brief, "未接入真实合成服务，以下为分镜故事板");
+}
+
+// 服务端 FFmpeg 组装：将场景图 + 配音 + 配乐合为 MP4。要求 ffmpeg 可用且素材可本地读取。
+async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "promo-"));
+  const list = path.join(tmp, "list.txt");
+  const lines = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const s = scenes[i];
+    const img = path.join(tmp, `s${i}.png`);
+    if (s.mediaUrl?.startsWith("data:image")) {
+      const b64 = s.mediaUrl.split(",")[1];
+      fs.writeFileSync(img, Buffer.from(b64, "base64"));
+    } else if (s.mediaUrl?.startsWith("http")) {
+      // 远程图需可访问；此处用 curl 拉取（生产建议预下载到对象存储）。
+      execFileSync("curl", ["-sL", s.mediaUrl, "-o", img]);
+    } else {
+      continue;
+    }
+    const dur = (s.durationSec || 5).toFixed(2);
+    lines.push(`file '${img.replace(/'/g, "'\\''")}'\nDuration:00:00:${dur}`);
+  }
+  fs.writeFileSync(list, lines.join("\n"));
+  const out = path.join(tmp, "out.mp4");
+  const args = ["-f", "concat", "-safe", "0", "-i", list];
+  if (voice?.voiceUrl?.startsWith("data:audio")) {
+    const a = path.join(tmp, "voice.mp3");
+    fs.writeFileSync(a, Buffer.from(voice.voiceUrl.split(",")[1], "base64"));
+    args.push("-i", a);
+    if (music?.musicUrl?.startsWith("data:audio")) {
+      const m = path.join(tmp, "music.mp3");
+      fs.writeFileSync(m, Buffer.from(music.musicUrl.split(",")[1], "base64"));
+      args.push("-i", m, "-filter_complex", "[1:a][2:a]amix=inputs=2[a]", "-map", "0:v", "-map", "[a]");
+    } else {
+      args.push("-map", "0:v", "-map", "1:a");
+    }
+  }
+  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", out);
+  execFileSync(ffmpeg, args, { stdio: "pipe" });
+  // 返回本地文件路径（生产应上传对象存储并返回直链）
+  return `file://${out}`;
 }
 
 // ───────────────────────── 内部工具 ─────────────────────────

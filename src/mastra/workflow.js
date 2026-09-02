@@ -9,6 +9,9 @@
 //       人审通过后由 server 用「已批准脚本」冷启动，无 suspend，跑到底。
 //   两段通过 store 串接：server 在 script 段完成（immediate 或 approve 后）启动 video 段。
 //
+// 成本（M2 / FR-10）：真实 Provider 在返回中携带 _usage，步骤经 recordCost 归集到 PromoRun.cost，
+//   并做预算闸门（超 PROMO_BUDGET_CAP 中止）。DEMO 模式无 _usage → 不计成本。
+//
 // runId 透传：两段用不同的 Mastra 内部 runId（script/video 后缀），但都通过 inputData.runId 携带
 // 用户态 runId，使所有步骤回写同一个 PromoRun（store 以用户态 runId 为键）。
 import { createWorkflow, createStep } from "@mastra/core/workflows";
@@ -21,9 +24,11 @@ import {
   generateVoiceover,
   generateMusic,
   composite,
+  getProviderMode,
 } from "./providers.js";
 import { emitProgress, emitRunDone, emitRunFailed } from "./eventBus.js";
 import { updateRun, setStep, getRun } from "../store.js";
+import { costFor, checkBudget, getBudgetCap, BudgetExceededError } from "../cost.js";
 
 const STEP = {
   INGEST: "ingestBrief",
@@ -42,12 +47,29 @@ export { STEP };
 const STEP_DELAY_MS = Number(process.env.STEP_DELAY_MS ?? 400);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 归集单步成本并做预算闸门；超上限抛 BudgetExceededError（被 withStep 捕获 → run=failed）。
+function recordCost(runId, step, out) {
+  const usage = out?._usage;
+  if (!usage) return; // DEMO 模式无 _usage，不计量
+  const c = costFor(step, usage);
+  const run = getRun(runId);
+  const costs = [...(run?.cost || []), c];
+  updateRun(runId, { cost: costs });
+  const guard = checkBudget(costs, { amount: 0 }, getBudgetCap());
+  if (!guard.ok) {
+    throw new BudgetExceededError(
+      `预算超限：已累计 ¥${guard.total.toFixed(4)}，超过上限 ¥${guard.cap}。运行已中止。`
+    );
+  }
+}
+
 async function withStep(runId, step, fn) {
   setStep(runId, step, { status: "running", startedAt: Date.now() });
   emitProgress(runId, step, "step-start");
   await sleep(STEP_DELAY_MS);
   try {
     const out = await fn();
+    recordCost(runId, step, out);
     setStep(runId, step, { status: "done", doneAt: Date.now(), output: out });
     emitProgress(runId, step, "step-done", { output: out });
     return out;
@@ -72,9 +94,14 @@ const writeScript = createStep({
     emitProgress(rid, STEP.SCRIPT, "step-start");
     await sleep(STEP_DELAY_MS);
     try {
-      const script = await generateScript(brief);
-      updateRun(rid, { script });
+      // 复用首轮已生成脚本，避免 HITL resume 重复调用 LLM（成本 + 一致性）。
+      let script = getRun(rid)?.script;
+      if (!script) {
+        script = await generateScript(brief);
+        updateRun(rid, { script });
+      }
       if (!brief.hitlEnabled) {
+        recordCost(rid, STEP.SCRIPT, script);
         setStep(rid, STEP.SCRIPT, { status: "done", doneAt: Date.now() });
         emitProgress(rid, STEP.SCRIPT, "step-done", { output: { script } });
         return { brief, script, runId: rid };
@@ -97,6 +124,7 @@ const writeScript = createStep({
       }
       updateRun(rid, { script: finalScript, status: "running" });
       emitProgress(rid, STEP.SCRIPT, "step-approved", { decision });
+      recordCost(rid, STEP.SCRIPT, finalScript); // 仅最终确认时归集一次
       setStep(rid, STEP.SCRIPT, { status: "done", doneAt: Date.now() });
       emitProgress(rid, STEP.SCRIPT, "step-done", { output: { script: finalScript } });
       return { brief, script: finalScript, runId: rid };
@@ -144,8 +172,9 @@ const storyboard = createStep({
     const { brief, script } = inputData;
     return withStep(rid, STEP.STORYBOARD, async () => {
       const storyboard = await generateStoryboard(brief, script);
+      const tokens = (storyboard || []).reduce((a, s) => a + (s._usage?.tokens || 0), 0);
       updateRun(rid, { storyboard });
-      return { brief, script, storyboard, runId: rid };
+      return { brief, script, storyboard, runId: rid, _usage: tokens ? { tokens } : undefined };
     });
   },
 });
@@ -171,7 +200,8 @@ const generateScenes = createStep({
         }
       }
       updateRun(rid, { storyboard: scenes });
-      return { brief, script, storyboard: scenes, runId: rid };
+      const images = getProviderMode() === "real" ? scenes.length : 0;
+      return { brief, script, storyboard: scenes, runId: rid, _usage: images ? { images } : undefined };
     });
   },
 });
@@ -184,7 +214,7 @@ const voiceover = createStep({
     return withStep(rid, STEP.VOICE, async () => {
       const voice = await generateVoiceover(script, brief);
       updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt });
-      return { brief, script, storyboard, voice, runId: rid };
+      return { brief, script, storyboard, voice, runId: rid, _usage: voice._usage };
     });
   },
 });
@@ -197,7 +227,7 @@ const music = createStep({
     return withStep(rid, STEP.MUSIC, async () => {
       const music = await generateMusic(brief, storyboard);
       updateRun(rid, { musicUrl: music.musicUrl });
-      return { brief, script, storyboard, voice, music, runId: rid };
+      return { brief, script, storyboard, voice, music, runId: rid, _usage: music._usage };
     });
   },
 });
@@ -216,7 +246,7 @@ const compositeStep = createStep({
         videoUrl: result.videoUrl,
         note: result.note,
       });
-      return { brief, script, storyboard, voice, music, composite: result, runId: rid };
+      return { brief, script, storyboard, voice, music, composite: result, runId: rid, _usage: result._usage };
     });
   },
 });
