@@ -380,8 +380,10 @@ export async function generateSceneVideo(scene, brief) {
   if (!data) throw submitErr || new Error("视频提交失败（所有端点均不可用）");
   const videoUrl = extractVideoUrl(data);
   if (videoUrl) return { videoUrl, kind: "video", model, _usage: { videos: 1 } };
-  // 异步任务：轮询直至完成
-  const id = data?.id || data?.data?.[0]?.id || data?.task_id || data?.request_id;
+  // 异步任务：轮询直至完成。提交响应也可能是 new-api 包装形态 {code:"success", data:{id,status}}，
+  // 先解包再取 id（unwrap 对非包装形态原样返回，数组形态 data.data[] 不会被守卫吞掉）。
+  const submitted = unwrapVideoTask(data);
+  const id = submitted?.id || submitted?.data?.[0]?.id || submitted?.task_id || submitted?.request_id;
   if (!id) throw new Error(`视频接口未返回 url 或任务 id：${JSON.stringify(data).slice(0, 200)}`);
   const deadline = Date.now() + Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 180000);
   let lastErr = null;
@@ -414,9 +416,11 @@ export async function generateSceneVideo(scene, brief) {
 
 // new-api 任务查询包装解包：{code:"success", data:{status, result_url, fail_reason}} → 返回 data 层。
 function unwrapVideoTask(raw) {
+  // new-api 统一包装：{code:"success", data:{...}}。提交响应 data 可能只有 id（status 在轮询才有），
+  // 轮询响应 data 含 status/result_url/fail_reason —— 三种都解包；非包装形态原样返回。
   if (raw && raw.code && raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)) {
     const d = raw.data;
-    if ("status" in d || "result_url" in d || "fail_reason" in d) return d;
+    if ("id" in d || "status" in d || "result_url" in d || "fail_reason" in d) return d;
   }
   return raw;
 }
