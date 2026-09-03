@@ -181,7 +181,8 @@ test("generateVoiceover 真实模式：POST /audio/speech 二进制 + data URI +
   const script = await generateScript(baseBrief);
   const v = await generateVoiceover(script, baseBrief);
   assert.match(calls[calls.length - 1].url, /\/audio\/speech$/);
-  assert.equal(calls[calls.length - 1].body.voice, "male"); // 男声 → male
+  assert.equal(calls[calls.length - 1].body.voice, "onyx"); // 男声 → onyx（OpenAI 标准名，MiniMax 兼容渠道可识别）
+  assert.equal(calls[calls.length - 1].body.response_format, undefined, "非 OpenAI 原生 TTS 不应带 response_format（MiniMax 会 406）");
   assert.match(v.voiceUrl, /^data:audio\/mp3;base64,/);
   assert.ok(v.srt.includes("-->"));
   assert.ok(v._usage.minutes > 0);

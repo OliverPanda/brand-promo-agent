@@ -132,10 +132,10 @@ function estimateTokens(s = "") {
 }
 function mapVoiceTone(tone = "男声") {
   const t = tone.toLowerCase();
-  if (t.includes("女")) return "female";
-  if (t.includes("沉稳") || t.includes("男")) return "male";
-  if (t.includes("活泼")) return "young";
-  return "male";
+  // 返回 OpenAI 标准 voice 名（MiniMax/speech 等兼容渠道只认这套，male/female/young 会 406）
+  if (t.includes("女")) return "nova";
+  if (t.includes("活泼")) return "shimmer";
+  return "onyx"; // 沉稳/男声/默认
 }
 
 // ───────────────────────── 1) LLM：脚本生成 ─────────────────────────
@@ -457,11 +457,12 @@ export async function generateVoiceover(script, brief) {
   if (getProviderMode() !== "real") return demoVoiceover(script, brief);
   const model = process.env.PROMO_TTS_MODEL || "tiny-iceberg";
   const text = (script?.voiceover || []).map((v) => v.text).join("\n");
-  const audio = await oneApiPost(
-    "/audio/speech",
-    { model, input: text, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN", response_format: "mp3" },
-    { isBinary: true }
-  );
+  // response_format 是 OpenAI 专属字段：MiniMax speech 系上游只认自己的 output_format(hex|url)，带它会 406。
+  // 仅在 OpenAI 原生系模型名（tts-1*/gpt-4o-mini-tts）时携带，其余（speech-* 等）不带，网关默认 mp3。
+  const openaiTts = /^tts-|gpt-4o-mini-tts/.test(model);
+  const body = { model, input: text, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN" };
+  if (openaiTts) body.response_format = "mp3";
+  const audio = await oneApiPost("/audio/speech", body, { isBinary: true });
   const voiceUrl = `data:audio/mp3;base64,${audio.toString("base64")}`;
   const srt = (script?.voiceover || [])
     .map((v, i) => `${i + 1}\n${v.timecode} --> ${fmtTC((i + 1) * 3)}\n${v.text}\n`)
