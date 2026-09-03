@@ -201,7 +201,8 @@ const generateScenes = createStep({
       for (const scene of storyboard) {
         try {
           const media = await generateSceneMedia(scene, brief);
-          const done = { ...scene, mediaUrl: media.mediaUrl, status: "done" };
+          // mediaModel 透传实际使用的图像模型（brief.imageModel 请求级覆盖 > env 默认），供交付页展示
+          const done = { ...scene, mediaUrl: media.mediaUrl, mediaModel: media.model, status: "done" };
           scenes.push(done);
           emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: "done" });
         } catch (err) {

@@ -98,6 +98,12 @@
     </div>
     <div class="sub" style="font-size:12px;">主色与禁用词会约束脚本、分镜与画面配色；可从下方模板库一键套用（FR-1.3）。</div>
 
+    <div class="row" style="margin-top:12px;">
+      <div><label>脚本/分镜模型</label><select id="llmModel"></select></div>
+      <div><label>场景图模型</label><select id="imageModel"></select></div>
+    </div>
+    <div class="sub" style="font-size:12px;">模型清单与默认值由服务端 /api/config 提供（可用 PROMO_LLM_CHOICES / PROMO_IMAGE_CHOICES 扩展）；TTS/配乐模型在交付页展示。</div>
+
     <label style="margin-top:12px;"><input type="checkbox" id="hitlEnabled" checked style="width:auto;margin-right:8px;" />启用脚本人工审核门（生成素材前先确认脚本）</label>
     <label style="margin-top:8px;"><input type="checkbox" id="finalGateEnabled" checked style="width:auto;margin-right:8px;" />启用成片人工审核门（合成后验收成片再交付）</label>
 
@@ -154,7 +160,7 @@
 const AUDIENCE = ["Z世代","白领","企业采购","宝妈","学生","极客"];
 const TONES = ["科技感","温情","高端","国潮","搞笑","专业"];
 let audienceSel = new Set(), toneSel = new Set();
-let es = null, currentRunId = null, pendingScript = null, gateVoice = [], BUDGET_CAP = null, QUOTA_CAP = null;
+let es = null, currentRunId = null, pendingScript = null, gateVoice = [], BUDGET_CAP = null, QUOTA_CAP = null, SERVER_CONFIG = null;
 
 function buildChips(containerId, items, sel) {
   const c = document.getElementById(containerId);
@@ -263,9 +269,29 @@ async function fetchMode() {
     const c = await (await fetch("/api/config")).json();
     BUDGET_CAP = c.budgetCap;
     QUOTA_CAP = c.quotaCap;
+    SERVER_CONFIG = c;
     document.getElementById("modeBadge").textContent =
       c.mode === "real" ? `真实模式（one-api，预算上限 ¥${c.budgetCap}）` : "DEMO 离线模式";
+    fillModelSelect("llmModel", c.models?.llm);
+    fillModelSelect("imageModel", c.models?.image);
   } catch {}
+}
+
+// 模型下拉：首项「默认（当前: xxx）」值留空 = 用服务端 env 默认；其余为可选清单。
+function fillModelSelect(id, def) {
+  const sel = document.getElementById(id);
+  if (!sel || !def) return;
+  sel.innerHTML = "";
+  const opt = document.createElement("option");
+  opt.value = "";
+  opt.textContent = `默认（${def.current}）`;
+  sel.appendChild(opt);
+  (def.choices || []).forEach((m) => {
+    if (m === def.current) return; // 默认项已含 current，避免重复
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    sel.appendChild(o);
+  });
 }
 
 function stepRow(id) {
@@ -293,6 +319,9 @@ async function submitBrief() {
     // M4 品牌约束（FR-1.3）：评审 F1 修复前这两个字段从未随 brief 提交，
     // 导致 providers 中 if (brief.logoColor) / if (brief.bannedWords?.length) 恒为假。
     logoColor, bannedWords,
+    // 模型偏好：下拉留空 = 用服务端默认（不传字段）
+    llmModel: v("llmModel") || undefined,
+    imageModel: v("imageModel") || undefined,
   };
   if (!brief.brandName || !brief.productName || !brief.coreSellingPoint) { alert("请填品牌名、产品名、核心卖点"); return; }
   document.getElementById("genBtn").disabled = true;
@@ -371,6 +400,17 @@ function renderDelivery(run) {
   let html = "";
   if (run.poster) html += `<img src="${run.poster}" style="max-width:320px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
   html += `<p style="color:var(--sub)">状态：${run.status} ｜ 语言：${run.brief.language} ｜ 时长：${run.brief.durationSec}s</p>`;
+  // 模型可见性（用户诉求：知道用的什么模型）—— 本次 brief 覆盖值优先，否则显示服务端当前默认
+  if (SERVER_CONFIG?.models) {
+    const m = SERVER_CONFIG.models;
+    const bits = [
+      `脚本/分镜 ${run.script?.model || run.brief.llmModel || m.llm?.current || "?"}`,
+      `场景图 ${run.brief.imageModel || m.image?.current || "?"}`,
+      `配音 ${m.tts?.current || "?"}`,
+      `配乐 ${m.music?.current || "?"}`,
+    ];
+    html += `<p style="color:var(--sub);font-size:13px;">模型：${bits.join(" ｜ ")}</p>`;
+  }
   if (run.srt) html += `<p><a class="dl" href="${srtBlob(run.srt)}" download="script.srt">下载字幕 SRT</a></p>`;
   // 成本汇总（M2 / FR-10）
   if (run.cost && run.cost.length) {

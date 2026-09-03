@@ -281,3 +281,19 @@ test("模板库端点（M4）：非法 logoColor 返回 400（评审 F6）", asy
     server.close();
   }
 });
+
+test("/api/config 暴露模型清单（能选模型、知道用的什么模型）", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const cfg = await (await fetch(`${BASE(port)}/api/config`)).json();
+    assert.ok(cfg.models, "config 应含 models 字段");
+    assert.ok(Array.isArray(cfg.models.llm.choices) && cfg.models.llm.choices.length >= 2, "llm 应有可选清单");
+    assert.ok(cfg.models.llm.choices.includes(cfg.models.llm.current), "current 应在清单内");
+    assert.ok(Array.isArray(cfg.models.image.choices) && cfg.models.image.current, "image 应有清单与当前值");
+    assert.ok(cfg.models.tts.current && cfg.models.music.current, "tts/music 应展示当前模型");
+  } finally {
+    server.close();
+  }
+});

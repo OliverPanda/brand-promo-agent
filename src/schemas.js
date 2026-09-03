@@ -28,6 +28,10 @@ export const BrandBriefSchema = z.object({
   // M4 模板库：Logo 主色 / 禁用词（从品牌模板回灌，用于约束生成与配色统一）
   logoColor: LOGO_COLOR,
   bannedWords: z.array(z.string()).default([]),
+  // 模型偏好：请求级覆盖（脚本/分镜用 LLM、场景图用图像模型）；不传则用服务端 env 默认。
+  // 服务端在 /api/config.models 暴露 current/choices 供前端下拉选择。
+  llmModel: z.string().max(80).optional(),
+  imageModel: z.string().max(80).optional(),
 });
 
 // 品牌模板（FR-1.3 / M4 模板库）：市场运营保存一套品牌预设，下次一键套用，保证调性统一。

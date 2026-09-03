@@ -97,7 +97,7 @@ function mapVoiceTone(tone = "男声") {
 // ───────────────────────── 1) LLM：脚本生成 ─────────────────────────
 export async function generateScript(brief) {
   if (getProviderMode() !== "real") return demoScript(brief);
-  const model = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
+  const model = brief.llmModel || process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
   const sys = "你是资深品牌文案，依据品牌简报产出宣传片脚本，严格只输出 JSON（不含解释），结构：{title, voiceover:[{timecode,text}], structure:[], moodCurve:[]}。";
   let user =
     `品牌：${brief.brandName}\n产品：${brief.productName}\n核心卖点：${brief.coreSellingPoint}\n` +
@@ -126,6 +126,7 @@ export async function generateScript(brief) {
     structure: parsed.structure?.length ? parsed.structure : fallback.structure,
     moodCurve: parsed.moodCurve?.length ? parsed.moodCurve : fallback.moodCurve,
     language: brief.language || "zh-CN",
+    model, // 实际使用的 LLM 模型（brief.llmModel 请求级覆盖 > env 默认），供前端展示
     _usage: { tokens },
   };
 }
@@ -187,13 +188,14 @@ function demoScript(brief) {
     structure,
     moodCurve,
     language: lang,
+    model: brief.llmModel || "demo-llm", // DEMO 下为声明路由；切 real 后即真实调用该模型
   };
 }
 
 // ───────────────────────── 2) LLM：分镜生成 ─────────────────────────
 export async function generateStoryboard(brief, script) {
   if (getProviderMode() !== "real") return demoStoryboard(brief, script);
-  const model = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
+  const model = brief.llmModel || process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
   const sys = "你是资深分镜师，把脚本拆为若干 Scene，严格只输出 JSON 数组，结构：[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]。";
   const vo = (script?.voiceover || []).map((v) => `${v.timecode} ${v.text}`).join("\n");
   let user =
@@ -254,7 +256,7 @@ function demoStoryboard(brief, script) {
 // ───────────────────────── 3) 图像/视频素材 ─────────────────────────
 export async function generateSceneMedia(scene, brief) {
   if (getProviderMode() !== "real") return demoSceneMedia(scene, brief);
-  const model = process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
+  const model = brief.imageModel || process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
   let prompt = scene.visualPrompt;
   if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
   const body = { model, prompt, n: 1, size: process.env.PROMO_IMAGE_SIZE || "1024x576" };
@@ -281,7 +283,7 @@ function demoSceneMedia(scene, brief) {
   let [c1, c2] = paletteFor(brief.tones);
   if (brief.logoColor) c1 = brief.logoColor; // M4 模板库：Logo 主色优先
   const svg = buildPosterSVG(scene, brief, c1, c2);
-  return { mediaUrl: encodeSVG(svg), kind: "image", model: "demo-seedream" };
+  return { mediaUrl: encodeSVG(svg), kind: "image", model: brief.imageModel || "demo-seedream" };
 }
 
 // ───────────────────────── 4) TTS 配音 ─────────────────────────

@@ -247,14 +247,40 @@ app.get("/api/admin/costs", (_req, res) => {
 });
 
 // ── GET /api/config：运行模式 / 预算上限 / 配额上限（前端展示用，不含密钥） ──
-app.get("/api/config", (_req, res) =>
+app.get("/api/config", (_req, res) => {
+  const llmCurrent = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
+  const imgCurrent = process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
+  // choices = current + PROMO_*_CHOICES(env 逗号分隔扩展) + 内置默认候选，去重
+  const mergeChoices = (envKey, current, fallbackList) => [
+    ...new Set([
+      current,
+      ...(process.env[envKey] || "").split(",").map((s) => s.trim()).filter(Boolean),
+      ...fallbackList,
+    ]),
+  ];
   res.json({
     mode: getProviderMode(),
     budgetCap: getBudgetCap(),
     quotaCap: getQuotaCap(),
     provider: getProviderMode() === "real" ? "one-api" : "demo",
-  })
-);
+    // 模型清单（用户诉求：能选模型、知道用的什么模型）。
+    // llm/image 可由 Brief.llmModel / Brief.imageModel 请求级覆盖；tts/music 仅展示当前值。
+    models: {
+      llm: {
+        label: "脚本/分镜（文本模型）",
+        current: llmCurrent,
+        choices: mergeChoices("PROMO_LLM_CHOICES", llmCurrent, ["deepseek-v4-flash", "deepseek-v4", "qwen3-max", "glm-5"]),
+      },
+      image: {
+        label: "场景图（图像模型）",
+        current: imgCurrent,
+        choices: mergeChoices("PROMO_IMAGE_CHOICES", imgCurrent, ["doubao-seedream-4-0-250828", "doubao-seedream-3-0-t2i"]),
+      },
+      tts: { label: "配音（TTS）", current: process.env.PROMO_TTS_MODEL || "tiny-iceberg" },
+      music: { label: "配乐", current: process.env.PROMO_MUSIC_MODEL || "mureka-v1" },
+    },
+  });
+});
 
 // ── 模板库（M4 / FR-1.3）：品牌预设的保存 / 复用，保证调性统一 ──
 app.get("/api/templates", (_req, res) => res.json(listTemplates()));

@@ -233,6 +233,26 @@ test("generateStoryboard / generateSceneMedia 真实模式：logoColor 注入品
   assert.match(img.body.prompt, /主色 #0ea5e9/, "图像 prompt 应含品牌主色");
 });
 
+test("真实模式：Brief.llmModel / Brief.imageModel 请求级覆盖模型（模型可见可选）", async () => {
+  calls = [];
+  await generateScript({ ...baseBrief, llmModel: "glm-5" });
+  assert.equal(calls[0].body.model, "glm-5", "脚本请求应用 brief.llmModel 覆盖 env 默认");
+
+  const script = await generateScript({ ...baseBrief, llmModel: "glm-5" });
+  assert.equal(script.model, "glm-5", "返回值应带实际使用的模型名（前端展示用）");
+
+  calls = [];
+  await generateSceneMedia({ visualPrompt: "城市航拍" }, { ...baseBrief, imageModel: "doubao-seedream-3-0-t2i" });
+  const img = calls.find((c) => c.url.endsWith("/images/generations"));
+  assert.equal(img.body.model, "doubao-seedream-3-0-t2i", "图像请求应用 brief.imageModel 覆盖");
+
+  // 不传时回落 env 默认
+  calls = [];
+  const def = await generateScript(baseBrief);
+  assert.equal(calls[0].body.model, process.env.PROMO_LLM_MODEL || "deepseek-v4-flash");
+  assert.equal(def.model, process.env.PROMO_LLM_MODEL || "deepseek-v4-flash");
+});
+
 test("generateMusic 真实模式：POST /audio/music + 返回 url + _usage.tracks", async () => {
   calls = [];
   const script = await generateScript(baseBrief);
