@@ -674,6 +674,7 @@ tests/
 
 ### 16.11.6 M4 DoD（验收）
 - [x] 多语言：设 `brief.language="en"`，真实脚本/分镜 prompt 末尾含 `Output in English.`；`generateVoiceover` 真实 TTS body 携带 `language:"en"`；`zh-CN` 下 prompt 零污染（确定性输出不变）。
+- [x] **真实 TTS 配音打通（2026-09，new-api 网关实测）**：默认 `tiny-iceberg` 不在任何渠道（曾误判「网关无 TTS」），实际 TTS 模型在 apilio 聚合渠道——`speech-02-hd` 实测可出音（200/audio-mpeg），`minimax/speech-02-hd` 406、`tts-1` 超时。渠道适配：① `response_format` 仅 OpenAI 原生系模型（`tts-*`/`gpt-4o-mini-tts`）携带，MiniMax `speech-*` 上游只认 `output_format: hex|url`，带 OpenAI 字段直接 406；② `mapVoiceTone` 输出 OpenAI 标准 voice 名（男声→onyx/女声→nova/活泼→fable/沉稳→alloy），原 `male/female/young` 对 MiniMax 通道全 406。真实出片 run 实测：deepseek 脚本 + seedream 5 镜 + speech-02-hd 配音 → ffmpeg 合成 **896KB/30s 有声 MP4**（h264+aac，volumedetect mean -23dB 非空音轨）。
 - [x] 品牌安全：`brief.bannedWords` 注入脚本/分镜 prompt（真实用例验证「禁用词：最、第一」）；`logoColor` 注入分镜/图像 prompt 与 DEMO 占位图主色。
 - [x] **品牌约束全链路闭环（评审 F1）**：表单可采集主色/禁用词 → `applyTemplate` 全字段回填 → `submitBrief` 随 Brief 提交 → Provider 注入生效（真实 + DEMO 双路径均有用例覆盖）。
 - [x] 模板库：`GET /api/templates` 首启返回 5 预置；`POST` 新建自定义、`PUT` 更新、`DELETE` 自定义成功；**DELETE 预置返回 409**；非法模板名 `POST` 返回 400。
