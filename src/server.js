@@ -307,9 +307,25 @@ function round4(n) {
 // 仅当作为主入口运行（node src/server.js）时自动监听；被测试 import 时由测试自行监听随机端口。
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
-  app.listen(PORT, () => {
-    console.log(`[brand-promo-agent] listening on http://localhost:${PORT}`);
-  });
+  // 端口自动回退（portfinder，零依赖）：默认端口（PORT 或 3000）被占用时依次向上探测。
+  // 同机常驻服务常占死固定端口（如 mingstar-bff 用 3000），故不能假设默认端口可用；
+  // 直接利用 listen 自身的 EADDRINUSE 事件探测，无需第三方依赖。
+  const MAX_TRIES = 10;
+  const start = (port, remaining = MAX_TRIES) => {
+    const srv = app.listen(port);
+    srv.once("error", (err) => {
+      if (err.code !== "EADDRINUSE" || remaining <= 0) {
+        console.error(`[brand-promo-agent] 端口 ${PORT}~${port} 均不可用：${err.message}`);
+        process.exit(1);
+      }
+      console.warn(`[brand-promo-agent] 端口 ${port} 已被占用，自动尝试 ${port + 1} …`);
+      start(port + 1, remaining - 1);
+    });
+    srv.once("listening", () => {
+      console.log(`[brand-promo-agent] listening on http://localhost:${srv.address().port}（浏览器打开即用；DEMO 模式零密钥，真实模式需设 PROMO_PROVIDER_MODE=real）`);
+    });
+  };
+  start(PORT);
 }
 
 export { app };
