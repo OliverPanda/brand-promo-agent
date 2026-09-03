@@ -10,7 +10,7 @@ import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { parseBrief } from "./schemas.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import { listCopyIdeas } from "./copyideas.js";
-import { getEffectiveOneApiBase, setRuntimeConfig, validateProviderBaseUrl } from "./runtime-config.js";
+import { getEffectiveOneApiBase, getEffectiveOneApiKey, setRuntimeConfig, validateProviderBaseUrl, validateProviderMode, validateApiKey } from "./runtime-config.js";
 import { fetchRemoteModels, demoVideoChoices } from "./models-gateway.js";
 import {
   newRunId,
@@ -266,9 +266,9 @@ app.get("/api/config", (_req, res) => {
     budgetCap: getBudgetCap(),
     quotaCap: getQuotaCap(),
     provider: getProviderMode() === "real" ? "one-api" : "demo",
-    // 供应商网关（右侧「模型与服务」面板）：运行时覆盖值 > env 默认；只回显地址，绝不回显密钥。
+    // 供应商网关（右侧「模型与服务」面板）：运行时覆盖值 > env 默认；只回显地址与「密钥是否配置」，绝不回显密钥本身。
     providerBaseUrl: getEffectiveOneApiBase(),
-    apiKeySet: !!(process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY),
+    apiKeySet: !!getEffectiveOneApiKey(),
     // 模型清单（用户诉求：能选模型、知道用的什么模型）。
     // llm/image 可由 Brief.llmModel / Brief.imageModel 请求级覆盖；tts/music 仅展示当前值。
     models: {
@@ -294,20 +294,31 @@ app.get("/api/config", (_req, res) => {
 // ── POST /api/config：运行时配置（当前仅供应商网关地址，免重启生效）。不含密钥。 ──
 app.post("/api/config", (req, res) => {
   const body = req.body || {};
-  if (body.providerBaseUrl === undefined && Object.keys(body).length === 0) {
-    return res.status(400).json({ error: "无可保存配置（支持字段：providerBaseUrl）" });
+  const hasAny = ["providerBaseUrl", "providerMode", "apiKey"].some((k) => body[k] !== undefined);
+  if (!hasAny) {
+    return res.status(400).json({ error: "无可保存配置（支持字段：providerBaseUrl / providerMode / apiKey）" });
   }
   if (body.providerBaseUrl !== undefined) {
     const chk = validateProviderBaseUrl(body.providerBaseUrl);
     if (!chk.ok) return res.status(400).json({ error: chk.error });
     setRuntimeConfig({ providerBaseUrl: chk.value });
   }
+  if (body.providerMode !== undefined) {
+    const chk = validateProviderMode(body.providerMode);
+    if (!chk.ok) return res.status(400).json({ error: chk.error });
+    setRuntimeConfig({ providerMode: chk.value });
+  }
+  if (body.apiKey !== undefined) {
+    const chk = validateApiKey(body.apiKey);
+    if (!chk.ok) return res.status(400).json({ error: chk.error });
+    setRuntimeConfig({ apiKey: chk.value });
+  }
   res.json({
     ok: true,
     mode: getProviderMode(),
     providerBaseUrl: getEffectiveOneApiBase(),
-    apiKeySet: !!(process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY),
-    note: "供应商地址已保存（覆盖 env 默认）；密钥仍从环境变量读取，重启后仍生效",
+    apiKeySet: !!getEffectiveOneApiKey(),
+    note: "配置已保存并即时生效（地址/模式/密钥，均免重启）；密钥为可写不可读——仅回显是否已配置，绝不下发明文",
   });
 });
 
@@ -331,11 +342,11 @@ app.get("/api/models", async (req, res) => {
       models: { llm: staticLlm, image: staticImg, audio: [], video: demoVideoChoices() },
     });
   }
-  if (!getEffectiveOneApiBase() || !(process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY)) {
+  if (!getEffectiveOneApiBase() || !getEffectiveOneApiKey()) {
     return res.json({
       source: "fallback",
       mode,
-      note: "真实模式但未配置网关/密钥：视频清单需连接网关后列出。",
+      note: "真实模式但未配置网关/密钥：请在右侧面板填供应商地址 + API Key 保存；视频清单需连接网关后列出。",
       models: { llm: staticLlm, image: staticImg, audio: [], video: [] },
     });
   }

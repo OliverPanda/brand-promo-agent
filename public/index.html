@@ -143,10 +143,20 @@
   <aside class="side">
     <div class="card" id="cfgCard">
       <h3 style="margin-top:0;font-size:15px;">模型与服务配置</h3>
+      <label>运行模式</label>
+      <select id="providerMode">
+        <option value="demo">DEMO 离线（占位生成，无需供应商）</option>
+        <option value="real">real 真实（调用下方供应商 one-api）</option>
+      </select>
       <label>供应商 API 地址（one-api 兼容）</label>
       <input id="providerBaseUrl" placeholder="http://127.0.0.1:8080/v1（留空 = env 默认）" />
+      <label>API Key <span style="color:var(--sub);font-weight:normal;">（可写不可读，保存后仅显示「已配置」）</span></label>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input id="apiKeyInput" type="password" style="flex:1;" placeholder="sk-…（留空不改动）" autocomplete="off" />
+        <button id="clearKeyBtn" onclick="clearSavedKey()" style="display:none;flex:0 0 auto;" title="清除已保存的密钥（回退 env）">清除</button>
+      </div>
       <div id="cfgHint" style="color:var(--sub);font-size:12px;margin:6px 0 8px;"></div>
-      <button id="saveCfgBtn" onclick="saveProviderConfig()" style="width:100%;">保存供应商配置</button>
+      <button id="saveCfgBtn" onclick="saveProviderConfig()" style="width:100%;">保存并生效（地址 / 模式 / 密钥）</button>
 
       <hr class="sep" />
       <label>脚本/分镜模型</label>
@@ -319,35 +329,71 @@ async function fetchMode() {
   } catch {}
 }
 
-// 右侧「模型与服务」面板：供应商地址回显（只读展示，密钥永不下发）+ TTS/配乐当前模型。
+// 右侧「模型与服务」面板：模式/地址/密钥状态回显（密钥仅占位提示，永不下发）+ TTS/配乐当前模型。
 function syncSidePanel(c) {
   const urlInput = document.getElementById("providerBaseUrl");
+  const modeSel = document.getElementById("providerMode");
+  const keyInput = document.getElementById("apiKeyInput");
+  const clearBtn = document.getElementById("clearKeyBtn");
   const hint = document.getElementById("cfgHint");
   if (urlInput && urlInput.value === "") urlInput.value = c.providerBaseUrl || "";
+  if (modeSel) modeSel.value = c.mode === "real" ? "real" : "demo";
+  if (keyInput) {
+    keyInput.placeholder = c.apiKeySet ? "已配置，输入新值可覆盖（留空不改）" : "sk-…（页面配置，保存后仅显示已配置）";
+    keyInput.value = ""; // 永不回显
+  }
+  if (clearBtn) clearBtn.style.display = c.apiKeySet ? "inline-block" : "none";
   if (hint) {
     hint.textContent = c.mode === "real"
-      ? `真实模式：网关 ${c.providerBaseUrl || "(env 默认)"}；密钥${c.apiKeySet ? "已配置" : "未配置（设 PROMO_ONEAPI_API_KEY）"}。`
-      : "当前 DEMO 离线模式，无需供应商。设 PROMO_PROVIDER_MODE=real 后此地址对真实调用生效。";
+      ? `真实模式：网关 ${c.providerBaseUrl || "(env 默认)"}；API Key ${c.apiKeySet ? "已配置" : "未配置"}。`
+      : "DEMO 离线模式（占位生成）。切到 real 并填供应商地址 + API Key 保存后，即为真实调用 one-api。";
   }
   const vi = document.getElementById("voiceInfo");
-  if (vi) vi.textContent = `配音 ${c.models?.tts?.current || "?"} ｜ 配乐 ${c.models?.music?.current || "?"}（展示用，当前不可切换）`;
+  const mdls = c.models || SERVER_CONFIG?.models;
+  if (vi) vi.textContent = `配音 ${mdls?.tts?.current || "?"} ｜ 配乐 ${mdls?.music?.current || "?"}（展示用，当前不可切换）`;
 }
 
-// 保存供应商 API 地址（运行时覆盖，免重启生效；空串 = 清除覆盖回落 env）。
+// 保存后统一刷新徽标/面板提示（不重置用户已选的模型下拉）。
+function applyCfgResponse(j) {
+  const badge = document.getElementById("modeBadge");
+  if (badge) badge.textContent = j.mode === "real" ? `真实模式（one-api，预算上限 ¥${BUDGET_CAP ?? "?"}）` : "DEMO 离线模式";
+  syncSidePanel({ mode: j.mode, providerBaseUrl: j.providerBaseUrl, apiKeySet: j.apiKeySet });
+  loadRemoteModels(true); // 地址/模式变了 → 强制从（新）网关拉取模型清单（含视频渠道）
+}
+
+// 保存供应商配置（地址 + 运行模式 + API Key，运行时覆盖、免重启即时生效）。
 async function saveProviderConfig() {
   const url = document.getElementById("providerBaseUrl").value.trim();
+  const mode = document.getElementById("providerMode").value; // demo | real
+  const key = document.getElementById("apiKeyInput").value.trim();
   const btn = document.getElementById("saveCfgBtn");
   btn.disabled = true;
   try {
-    const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ providerBaseUrl: url }) });
+    const body = { providerBaseUrl: url, providerMode: mode };
+    if (key) body.apiKey = key; // 留空 = 不改动已存密钥
+    const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json();
     if (!r.ok) { alert("保存失败：" + (j.error || r.status)); return; }
-    document.getElementById("cfgHint").textContent = `已保存：网关 ${j.providerBaseUrl || "(env 默认，已清除覆盖)"}（密钥${j.apiKeySet ? "已配置" : "未配置"}）。`;
-    loadRemoteModels(true); // 地址变了 → 强制从新网关拉取模型清单（含视频渠道）
+    document.getElementById("apiKeyInput").value = ""; // 输入即焚，不留痕
+    applyCfgResponse(j);
+    document.getElementById("cfgHint").textContent = `已保存并生效：${j.mode === "real" ? "real 真实" : "DEMO"} ｜ 网关 ${j.providerBaseUrl || "(env 默认)"} ｜ API Key ${j.apiKeySet ? "已配置" : "未配置"}。`;
   } catch (e) {
     alert("保存失败：" + e.message);
   } finally {
     btn.disabled = false;
+  }
+}
+
+// 清除页面保存的 API Key（回退 env 读取），不动地址与模式。
+async function clearSavedKey() {
+  try {
+    const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: "" }) });
+    const j = await r.json();
+    if (!r.ok) { alert("清除失败：" + (j.error || r.status)); return; }
+    applyCfgResponse(j);
+    document.getElementById("cfgHint").textContent = "已清除页面保存的 API Key（现读取 env 密钥，若有）。";
+  } catch (e) {
+    alert("清除失败：" + e.message);
   }
 }
 

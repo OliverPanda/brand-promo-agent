@@ -343,6 +343,69 @@ test("POST /api/config 保存供应商地址：非法 URL 400、合法保存并�
   }
 });
 
+test("POST /api/config 保存运行模式 + API Key：real 即时生效、密钥可写不可读、非法值 400", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  const { getProviderMode } = await import("../src/mastra/providers.js");
+  const { setRuntimeConfig } = await import("../src/runtime-config.js");
+  const prevMode = process.env.PROMO_PROVIDER_MODE;
+  const envKey = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY || "";
+  try {
+    // 隔离：确保本次验证走「运行时配置」开关，而不是 env 的 real
+    delete process.env.PROMO_PROVIDER_MODE;
+
+    // 非法值：mode 非 demo|real → 400；key 超长 → 400
+    let r = await fetch(`${BASE(port)}/api/config`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerMode: "turbo" }),
+    });
+    assert.equal(r.status, 400);
+    r = await fetch(`${BASE(port)}/api/config`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: "x".repeat(201) }),
+    });
+    assert.equal(r.status, 400);
+
+    // 保存 real + API Key + 地址（页面「模型与服务」一次提交三项）
+    r = await fetch(`${BASE(port)}/api/config`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerMode: "real", apiKey: "sk-page-123", providerBaseUrl: "https://one-api.page/v1" }),
+    });
+    assert.equal(r.status, 200);
+    const saved = await r.json();
+    assert.equal(saved.mode, "real");
+    assert.equal(saved.apiKeySet, true);
+
+    // provider 层免重启生效（这正是「页面配完即可真跑」的核心）
+    assert.equal(getProviderMode(), "real", "保存 real 后 getProviderMode 应立即返回 real");
+
+    // GET 回显：mode/地址/是否配置齐全，但绝不含密钥明文
+    const cfg = await (await fetch(`${BASE(port)}/api/config`)).json();
+    assert.equal(cfg.mode, "real");
+    assert.equal(cfg.apiKeySet, true);
+    assert.equal(cfg.providerBaseUrl, "https://one-api.page/v1");
+    assert.ok(!JSON.stringify(cfg).includes("sk-page-123"), "GET 绝不回显密钥明文（可写不可读）");
+
+    // 空串清除 mode + key → 回落 env/demo
+    r = await fetch(`${BASE(port)}/api/config`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerMode: "", apiKey: "" }),
+    });
+    assert.equal(r.status, 200);
+    const cleared = await (await fetch(`${BASE(port)}/api/config`)).json();
+    assert.equal(cleared.mode, process.env.PROMO_PROVIDER_MODE === "real" ? "real" : "demo", "清空后回落 env/demo");
+    assert.equal(cleared.apiKeySet, !!envKey, "清空后密钥状态回落 env");
+    assert.equal(getProviderMode(), cleared.mode);
+  } finally {
+    // 还原 env 与 runtime，避免污染同进程后续用例
+    if (prevMode === undefined) delete process.env.PROMO_PROVIDER_MODE;
+    else process.env.PROMO_PROVIDER_MODE = prevMode;
+    setRuntimeConfig({ providerMode: "", apiKey: "", providerBaseUrl: "" });
+    server.close();
+  }
+});
+
 test("/api/copyideas 文案灵感：结合铭星链产品线预置，3 批轮换 + 未知模板回落通用", async () => {
   const { app } = await import("../src/server.js");
   const server = app.listen(0);

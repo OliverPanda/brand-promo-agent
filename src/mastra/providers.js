@@ -9,12 +9,18 @@
 
 import { encodeSVG } from "./svg.js";
 import { withGlobalLanguage } from "../i18n.js";
-import { getEffectiveOneApiBase } from "../runtime-config.js";
+import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey } from "../runtime-config.js";
 
 // ───────────────────────── 模式判定 ─────────────────────────
-// 仅在显式 PROMO_PROVIDER_MODE=real 时启用真实 Provider；其余一律 DEMO（安全默认，零外部依赖）。
+// 生效顺序：运行时配置（页面「模型与服务」保存的 providerMode）> env（PROMO_PROVIDER_MODE=real）；
+// 其余一律 DEMO（安全默认，零外部依赖）。页面保存 real 即立即生效、无需重启。
 export function getProviderMode() {
-  return process.env.PROMO_PROVIDER_MODE === "real" ? "real" : "demo";
+  return getEffectiveProviderMode();
+}
+
+// 当前生效的网关密钥（页面保存的 apiKey 优先，回退 env）。
+function activeKey() {
+  return getEffectiveOneApiKey();
 }
 
 // ───────────────────────── 工具：确定性随机（按 brief 稳定） ─────────────────────────
@@ -52,10 +58,10 @@ function paletteFor(tones = []) {
 
 // ───────────────────────── one-api HTTP 客户端（OpenAI 兼容） ─────────────────────────
 async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } = {}) {
-  // base = 运行时配置覆盖（前端「模型与服务」保存的供应商链接）> env 默认；每次调用现取，改完即生效。
+  // base/key = 运行时配置覆盖（前端「模型与服务」保存的供应商地址与密钥）> env 默认；每次调用现取，改完即生效。
   const base = getEffectiveOneApiBase();
-  const key = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY;
-  if (!base || !key) throw new Error("one-api 未配置：请设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
+  const key = activeKey();
+  if (!base || !key) throw new Error("one-api 未配置：请先在页面「模型与服务」保存供应商地址与 API Key，或设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
   const url = base.replace(/\/$/, "") + path;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -83,8 +89,8 @@ async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } =
 // GET 辅助（视频异步任务轮询等只读查询复用同一 base/key 约定）。
 async function oneApiGet(path, { timeoutMs = 15000 } = {}) {
   const base = getEffectiveOneApiBase();
-  const key = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY;
-  if (!base || !key) throw new Error("one-api 未配置：请设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
+  const key = activeKey();
+  if (!base || !key) throw new Error("one-api 未配置：请先在页面「模型与服务」保存供应商地址与 API Key，或设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
   const url = base.replace(/\/$/, "") + path;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);

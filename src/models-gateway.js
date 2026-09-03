@@ -4,7 +4,7 @@
 //   - 分类优先取条目自带 type 字段（new-api 部分版本返回 type=llm/image/tts/videogeneration…），
 //     缺省按模型 id 关键词回退分类：video > audio(tts/music) > image > llm。
 //   - 网关不可达 / 未配置：由调用方（server.js）决定回落策略 —— DEMO 给占位候选，real 报错不误导。
-import { getEffectiveOneApiBase } from "./runtime-config.js";
+import { getEffectiveOneApiBase, getEffectiveOneApiKey } from "./runtime-config.js";
 
 // ── 分类（纯函数，便于测试） ──
 const TYPE_MAP = {
@@ -66,9 +66,9 @@ let cache = { at: 0, result: null };
 
 export async function fetchRemoteModels({ refresh = false } = {}) {
   const base = getEffectiveOneApiBase();
-  const key = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY;
-  if (!base) throw new Error("未配置供应商地址：请先保存或设置 PROMO_ONEAPI_BASE_URL");
-  if (!key) throw new Error("未配置 API 密钥：请设置 PROMO_ONEAPI_API_KEY 后重试");
+  const key = getEffectiveOneApiKey();
+  if (!base) throw new Error("未配置供应商地址：请在页面保存或设置 PROMO_ONEAPI_BASE_URL");
+  if (!key) throw new Error("未配置 API 密钥：请在页面「模型与服务」保存 API Key，或设置 PROMO_ONEAPI_API_KEY 后重试");
   const now = Date.now();
   if (!refresh && cache.result && now - cache.at < TTL_MS) return cache.result;
   const url = `${base.replace(/\/$/, "")}/models`;
