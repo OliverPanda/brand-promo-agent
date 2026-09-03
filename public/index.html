@@ -8,7 +8,15 @@
   :root { --bg:#0b1020; --card:#151b30; --line:#26304d; --txt:#e8ecf6; --sub:#9aa6c4; --accent:#6366f1; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
   * { box-sizing: border-box; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); }
-  .wrap { max-width:880px; margin:0 auto; padding:24px 16px 64px; }
+  .wrap { max-width:1120px; margin:0 auto; padding:24px 16px 64px; }
+  /* 左主右栏：表单/进度/交付在主列，模型与服务配置固定右侧（≥960px 时双栏，窄屏回落单栏） */
+  .layout { display:flex; gap:16px; align-items:flex-start; }
+  .main { flex:1; min-width:0; }
+  .side { width:300px; flex:none; position:sticky; top:16px; }
+  @media (max-width:960px) { .layout { flex-direction:column; } .side { width:100%; position:static; } }
+  .copy-bar { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:8px; }
+  button.mini { padding:5px 12px; font-size:12px; border-radius:8px; }
+  hr.sep { border:0; border-top:1px solid var(--line); margin:14px 0; }
   h1 { font-size:22px; margin:0 0 4px; }
   .sub { color:var(--sub); font-size:13px; margin-bottom:20px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:16px; }
@@ -52,6 +60,8 @@
   <h1>铭星链 · 自动化品宣机器人</h1>
   <div class="sub">填一份品牌简报，自动产出宣传片脚本 / 分镜 / 画面 / 配音 / 配乐 / 合成（<span id="modeBadge">DEMO 离线模式</span>）。</div>
 
+  <div class="layout">
+  <div class="main">
   <div class="card" id="formCard">
     <div class="row">
       <div><label>品牌名 *</label><input id="brandName" placeholder="例如：铭星科技" /></div>
@@ -59,6 +69,10 @@
     </div>
     <label>一句话核心卖点 *（≤60字）</label>
     <input id="coreSellingPoint" maxlength="60" placeholder="例如：一句话生成专业宣传片" />
+    <div class="copy-bar">
+      <span id="copyIdeaNote" style="color:var(--sub);font-size:12px;">文案灵感：结合铭星链产品线预置 —— 套用下方模板或点「换一批」，即回填卖点与核心信息点。</span>
+      <button class="ghost mini" id="copyRollBtn" onclick="rollCopyIdeas()" title="换一批结合本项目产品线特点的文案">换一批</button>
+    </div>
 
     <div class="row">
       <div><label>期望时长</label>
@@ -96,13 +110,7 @@
         <input id="bannedWords" placeholder="例如：最、第一、绝对" />
       </div>
     </div>
-    <div class="sub" style="font-size:12px;">主色与禁用词会约束脚本、分镜与画面配色；可从下方模板库一键套用（FR-1.3）。</div>
-
-    <div class="row" style="margin-top:12px;">
-      <div><label>脚本/分镜模型</label><select id="llmModel"></select></div>
-      <div><label>场景图模型</label><select id="imageModel"></select></div>
-    </div>
-    <div class="sub" style="font-size:12px;">模型清单与默认值由服务端 /api/config 提供（可用 PROMO_LLM_CHOICES / PROMO_IMAGE_CHOICES 扩展）；TTS/配乐模型在交付页展示。</div>
+    <div class="sub" style="font-size:12px;">主色与禁用词会约束脚本、分镜与画面配色；可从下方模板库一键套用（FR-1.3）。模型与供应商配置在右侧「模型与服务」面板。</div>
 
     <label style="margin-top:12px;"><input type="checkbox" id="hitlEnabled" checked style="width:auto;margin-right:8px;" />启用脚本人工审核门（生成素材前先确认脚本）</label>
     <label style="margin-top:8px;"><input type="checkbox" id="finalGateEnabled" checked style="width:auto;margin-right:8px;" />启用成片人工审核门（合成后验收成片再交付）</label>
@@ -130,6 +138,28 @@
     <h3 style="margin-top:0;">成片交付</h3>
     <div id="delivery"></div>
   </div>
+  </div><!-- /main -->
+
+  <aside class="side">
+    <div class="card" id="cfgCard">
+      <h3 style="margin-top:0;font-size:15px;">模型与服务配置</h3>
+      <label>供应商 API 地址（one-api 兼容）</label>
+      <input id="providerBaseUrl" placeholder="http://127.0.0.1:8080/v1（留空 = env 默认）" />
+      <div id="cfgHint" style="color:var(--sub);font-size:12px;margin:6px 0 8px;"></div>
+      <button id="saveCfgBtn" onclick="saveProviderConfig()" style="width:100%;">保存供应商配置</button>
+
+      <hr class="sep" />
+      <label>脚本/分镜模型</label>
+      <select id="llmModel"></select>
+      <label>场景图模型</label>
+      <select id="imageModel"></select>
+      <div style="color:var(--sub);font-size:12px;margin-top:6px;">留空 = 服务端默认（清单来自 /api/config，可用 PROMO_LLM_CHOICES / PROMO_IMAGE_CHOICES 扩展）。</div>
+
+      <hr class="sep" />
+      <div id="voiceInfo" style="color:var(--sub);font-size:12px;"></div>
+    </div>
+  </aside>
+  </div><!-- /layout -->
 </div>
 
 <!-- 脚本 HITL 审核门 -->
@@ -161,6 +191,8 @@ const AUDIENCE = ["Z世代","白领","企业采购","宝妈","学生","极客"];
 const TONES = ["科技感","温情","高端","国潮","搞笑","专业"];
 let audienceSel = new Set(), toneSel = new Set();
 let es = null, currentRunId = null, pendingScript = null, gateVoice = [], BUDGET_CAP = null, QUOTA_CAP = null, SERVER_CONFIG = null;
+// 文案灵感状态（「换一批」轮换）：preset=当前模板场景，platform 为通用回落。
+let COPY = { preset: null, batch: 0, total: 1 };
 
 function buildChips(containerId, items, sel) {
   const c = document.getElementById(containerId);
@@ -226,6 +258,8 @@ function applyTemplate(t) {
     colorEn.checked = false;
   }
   document.getElementById("bannedWords").value = (t.bannedWords || []).join("、");
+  // 模板带出铭星链产品线第一批文案（卖点 + 核心信息点）；可再点「换一批」轮换。
+  seedTemplateCopy(t);
 }
 
 // 读取当前表单的品牌约束（主色 + 禁用词），供保存模板与提交生成共用。
@@ -274,7 +308,59 @@ async function fetchMode() {
       c.mode === "real" ? `真实模式（one-api，预算上限 ¥${c.budgetCap}）` : "DEMO 离线模式";
     fillModelSelect("llmModel", c.models?.llm);
     fillModelSelect("imageModel", c.models?.image);
+    syncSidePanel(c);
   } catch {}
+}
+
+// 右侧「模型与服务」面板：供应商地址回显（只读展示，密钥永不下发）+ TTS/配乐当前模型。
+function syncSidePanel(c) {
+  const urlInput = document.getElementById("providerBaseUrl");
+  const hint = document.getElementById("cfgHint");
+  if (urlInput && urlInput.value === "") urlInput.value = c.providerBaseUrl || "";
+  if (hint) {
+    hint.textContent = c.mode === "real"
+      ? `真实模式：网关 ${c.providerBaseUrl || "(env 默认)"}；密钥${c.apiKeySet ? "已配置" : "未配置（设 PROMO_ONEAPI_API_KEY）"}。`
+      : "当前 DEMO 离线模式，无需供应商。设 PROMO_PROVIDER_MODE=real 后此地址对真实调用生效。";
+  }
+  const vi = document.getElementById("voiceInfo");
+  if (vi) vi.textContent = `配音 ${c.models?.tts?.current || "?"} ｜ 配乐 ${c.models?.music?.current || "?"}（展示用，当前不可切换）`;
+}
+
+// 保存供应商 API 地址（运行时覆盖，免重启生效；空串 = 清除覆盖回落 env）。
+async function saveProviderConfig() {
+  const url = document.getElementById("providerBaseUrl").value.trim();
+  const btn = document.getElementById("saveCfgBtn");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ providerBaseUrl: url }) });
+    const j = await r.json();
+    if (!r.ok) { alert("保存失败：" + (j.error || r.status)); return; }
+    document.getElementById("cfgHint").textContent = `已保存：网关 ${j.providerBaseUrl || "(env 默认，已清除覆盖)"}（密钥${j.apiKeySet ? "已配置" : "未配置"}）。`;
+  } catch (e) {
+    alert("保存失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── 文案灵感「换一批」（结合铭星链产品线的项目化文案）──
+function rollCopyIdeas() {
+  // 未套模板时用「platform」通用场景；已套模板则轮换该模板下一条
+  applyCopyBatch(COPY.preset, COPY.batch + 1);
+}
+async function applyCopyBatch(preset, batch) {
+  try {
+    const j = await (await fetch(`/api/copyideas?preset=${encodeURIComponent(preset || "")}&batch=${Number(batch) || 0}`)).json();
+    COPY = { preset: j.preset, batch: j.batch, total: j.total };
+    document.getElementById("coreSellingPoint").value = j.sellingPoint;
+    document.getElementById("keyMessages").value = j.keyMessages.join("\n");
+    const note = document.getElementById("copyIdeaNote");
+    note.textContent = `第 ${j.batch + 1}/${j.total} 批 · ${j.scenario} —— 已回填卖点与核心信息点（可继续编辑）`;
+  } catch {}
+}
+// 套用模板后，自动带出该产品线的第一批项目化文案（batch 0）。
+function seedTemplateCopy(t) {
+  applyCopyBatch(t.id, 0);
 }
 
 // 模型下拉：首项「默认（当前: xxx）」值留空 = 用服务端 env 默认；其余为可选清单。

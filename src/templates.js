@@ -16,6 +16,7 @@ import { parseTemplate } from "./schemas.js";
 
 const DATA_DIR = process.env.PROMO_DATA_DIR || path.resolve(process.cwd(), "data");
 const TPL_FILE = path.join(DATA_DIR, "templates.json");
+const SEED_FILE = path.join(DATA_DIR, "templates.seed"); // 内容 = 当前 PRESET_SEED；用于识别旧版预置
 
 function persistEnabled() {
   return process.env.PROMO_PERSIST !== "0";
@@ -24,27 +25,48 @@ function persistEnabled() {
 /** @type {Map<string, any>} id -> BrandTemplate */
 const templates = new Map();
 
-// ≤5 个预置品牌模板（FR-1.3）。首次启动写入；用户可在前端另存自定义模板。
+// 预置品牌模板（FR-1.3）——按铭星链（MingStar）实际产品线定制，文案灵感与 src/copyideas.js 的 key 一一对应：
+//   主品牌 / 小程序 / Studio 分镜 / 音乐配乐 / 出海英文。
+// 每条模板携带 brandName/productName/coreSellingPoint，前端「套用」即可得到项目化 brief；
+// 想换一批卖点与核心信息点，前端「换一批」轮换 /api/copyideas（仍围绕本产品线特点）。
+// ≤5 个预置；首次启动写入；用户可在前端另存自定义模板。
+// PRESET_SEED：预置内容升级标记。磁盘旧 seed 的预置（isPreset）会被本版覆盖，用户自定义模板不受影响。
+const PRESET_SEED = "mingstar-v2-2026-09";
 const PRESETS = [
   {
-    id: "preset-tech", name: "科技品牌标准", defaultTone: "科技感", defaultLanguage: "zh-CN",
-    logoColor: "#0ea5e9", bannedWords: ["最", "第一", "绝对"], industry: "科技/数码", isPreset: true,
+    id: "preset-mingstar", name: "铭星链 · 平台主品牌", defaultTone: "科技感", defaultLanguage: "zh-CN",
+    logoColor: "#6366f1", bannedWords: ["最", "第一", "绝对"], industry: "AIGC 创作平台",
+    brandName: "铭星链", productName: "铭星链创作平台",
+    coreSellingPoint: "从灵感到成片，铭星链让每个人都做得起专业宣传片",
+    isPreset: true,
   },
   {
-    id: "preset-guochao", name: "国潮品牌标准", defaultTone: "国潮", defaultLanguage: "zh-CN",
-    logoColor: "#dc2626", bannedWords: ["最", "第一"], industry: "文创/服饰", isPreset: true,
+    id: "preset-miniapp", name: "铭星链小程序 · 拉新", defaultTone: "专业", defaultLanguage: "zh-CN",
+    logoColor: "#0ea5e9", bannedWords: ["最", "第一"], industry: "移动端创作社区",
+    brandName: "铭星链", productName: "铭星链小程序",
+    coreSellingPoint: "手机上的一站式 AI 创作台，通勤路上也能出片",
+    isPreset: true,
   },
   {
-    id: "preset-warm", name: "温情品牌标准", defaultTone: "温情", defaultLanguage: "zh-CN",
-    logoColor: "#f59e0b", bannedWords: [], industry: "母婴/生活", isPreset: true,
+    id: "preset-studio", name: "铭星链 Studio · 分镜大片", defaultTone: "高端", defaultLanguage: "zh-CN",
+    logoColor: "#111827", bannedWords: ["便宜", "特价"], industry: "专业视频创作",
+    brandName: "铭星链", productName: "铭星链 Studio",
+    coreSellingPoint: "像导演一样创作：铭星链 Studio 把想法拆成可执行的分镜",
+    isPreset: true,
   },
   {
-    id: "preset-luxury", name: "高端品牌标准", defaultTone: "高端", defaultLanguage: "zh-CN",
-    logoColor: "#111827", bannedWords: ["便宜", "特价"], industry: "奢侈品/腕表", isPreset: true,
+    id: "preset-music", name: "铭星链音乐 · 配乐创作", defaultTone: "专业", defaultLanguage: "zh-CN",
+    logoColor: "#7c3aed", bannedWords: [], industry: "AI 音乐创作",
+    brandName: "铭星链", productName: "铭星链音乐",
+    coreSellingPoint: "词曲唱、编曲配乐一站式生成，你的下一首歌交给铭星链",
+    isPreset: true,
   },
   {
-    id: "preset-global-en", name: "海外英文品牌", defaultTone: "专业", defaultLanguage: "en",
-    logoColor: "#1d4ed8", bannedWords: ["#1", "best", "cheapest"], industry: "跨境/出海", isPreset: true,
+    id: "preset-global-en", name: "铭星链出海版（EN）", defaultTone: "专业", defaultLanguage: "en",
+    logoColor: "#1d4ed8", bannedWords: ["#1", "best", "cheapest"], industry: "跨境/出海",
+    brandName: "MingStar", productName: "MingStar Creator",
+    coreSellingPoint: "From idea to promo video in one sentence — MingStar",
+    isPreset: true,
   },
 ];
 
@@ -62,10 +84,19 @@ function hydrate() {
   try {
     if (fs.existsSync(TPL_FILE)) {
       const arr = JSON.parse(fs.readFileSync(TPL_FILE, "utf8"));
-      // 磁盘数据覆盖内存（含用户对预设的合法改动）；异常条目跳过，不覆盖预置。
-      if (Array.isArray(arr)) for (const t of arr) if (t && t.id) templates.set(t.id, t);
+      const disk = Array.isArray(arr) ? arr : [];
+      const seedMatch = fs.existsSync(SEED_FILE) && fs.readFileSync(SEED_FILE, "utf8").trim() === PRESET_SEED;
+      // 磁盘预置与当前代码 seed 不一致（升级/首次加 seed）→ 丢弃磁盘上的旧版预置，保留用户自定义模板；
+      // seed 一致 → 磁盘数据整体覆盖内存（含用户对预设的合法 PUT 改动）。
+      const items = seedMatch
+        ? disk
+        : disk.filter((t) => !(t && isPresetTemplate(t)));
+      for (const t of items) if (t && t.id) templates.set(t.id, t);
+      persist();
+      fs.writeFileSync(SEED_FILE, PRESET_SEED, "utf8");
     } else {
       persist();
+      fs.writeFileSync(SEED_FILE, PRESET_SEED, "utf8");
     }
   } catch (e) {
     console.warn(`[templates] hydrate 失败，忽略磁盘数据：`, e?.message || e);

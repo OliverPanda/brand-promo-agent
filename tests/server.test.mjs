@@ -210,24 +210,29 @@ test("模板库端点（M4）：伪造 id / isPreset 被服务端拒绝（评审
   const server = app.listen(0);
   const port = server.address().port;
   try {
+    // 取当前首个预置（预置内容为铭星链产品线，id 可能演进——不硬编码具体 id）。
+    const list0 = await (await fetch(`${BASE(port)}/api/templates`)).json();
+    const preset0 = list0.find((x) => x.isPreset);
+    assert.ok(preset0, "应存在预置模板");
+
     // 修复前：saveTemplate(req.body) 使 id/isPreset 完全客户端可控 ——
-    // POST {id:"preset-tech", isPreset:false} 即可覆盖预设并将其删除（5 个预设永久丢失）。
+    // POST {id:preset0.id, isPreset:false} 即可覆盖预设并将其删除（预置永久丢失）。
     const r = await fetch(`${BASE(port)}/api/templates`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: "preset-tech", name: "越权覆盖", isPreset: false }),
+      body: JSON.stringify({ id: preset0.id, name: "越权覆盖", isPreset: false }),
     });
     assert.equal(r.status, 201);
     const created = await r.json();
-    assert.notEqual(created.id, "preset-tech", "服务端应忽略客户端传入的 id");
+    assert.notEqual(created.id, preset0.id, "服务端应忽略客户端传入的 id");
     assert.equal(created.isPreset, false, "isPreset 应被强制为 false（防僵尸模板）");
 
     const list = await (await fetch(`${BASE(port)}/api/templates`)).json();
-    const preset = list.find((x) => x.id === "preset-tech");
-    assert.ok(preset, "预设模板应仍然存在，未被覆盖或删除");
-    assert.equal(preset.isPreset, true, "预设的 isPreset 不应被降格");
+    const preset = list.find((x) => x.id === preset0.id);
+    assert.ok(preset, "预置模板应仍然存在，未被覆盖或删除");
+    assert.equal(preset.isPreset, true, "预置的 isPreset 不应被降格");
 
-    const del = await fetch(`${BASE(port)}/api/templates/preset-tech`, { method: "DELETE" });
-    assert.equal(del.status, 409, "预设模板不可删除");
+    const del = await fetch(`${BASE(port)}/api/templates/${preset0.id}`, { method: "DELETE" });
+    assert.equal(del.status, 409, "预置模板不可删除");
 
     await fetch(`${BASE(port)}/api/templates/${created.id}`, { method: "DELETE" });
   } finally {
@@ -293,6 +298,99 @@ test("/api/config 暴露模型清单（能选模型、知道用的什么模型�
     assert.ok(cfg.models.llm.choices.includes(cfg.models.llm.current), "current 应在清单内");
     assert.ok(Array.isArray(cfg.models.image.choices) && cfg.models.image.current, "image 应有清单与当前值");
     assert.ok(cfg.models.tts.current && cfg.models.music.current, "tts/music 应展示当前模型");
+    assert.equal(typeof cfg.providerBaseUrl, "string", "应暴露供应商地址字段（运行时覆盖 > env，可为空串）");
+    assert.equal(typeof cfg.apiKeySet, "boolean", "应暴露密钥是否配置（不回显密钥本身）");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /api/config 保存供应商地址：非法 URL 400、合法保存并回显（运行时覆盖，免重启）", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    // 非法：非 http(s)
+    let r = await fetch(`${BASE(port)}/api/config`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerBaseUrl: "ftp://nope" }),
+    });
+    assert.equal(r.status, 400);
+    assert.match((await r.json()).error, /http/);
+
+    // 合法：保存后 GET 立即回显（无需重启）
+    const url = "https://one-api.test.local/v1";
+    r = await fetch(`${BASE(port)}/api/config`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerBaseUrl: url }),
+    });
+    assert.equal(r.status, 200);
+    const saved = await r.json();
+    assert.equal(saved.providerBaseUrl, url);
+    const cfg = await (await fetch(`${BASE(port)}/api/config`)).json();
+    assert.equal(cfg.providerBaseUrl, url, "GET /api/config 应回显已保存的覆盖地址");
+
+    // 空串 = 清除覆盖（回落 env），避免污染同进程后续测试
+    r = await fetch(`${BASE(port)}/api/config`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerBaseUrl: "" }),
+    });
+    assert.equal(r.status, 200);
+    const cleared = await (await fetch(`${BASE(port)}/api/config`)).json();
+    assert.equal(cleared.providerBaseUrl, process.env.PROMO_ONEAPI_BASE_URL || "", "清空后应回落 env 默认");
+  } finally {
+    server.close();
+  }
+});
+
+test("/api/copyideas 文案灵感：结合铭星链产品线预置，3 批轮换 + 未知模板回落通用", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    // 预置模板命中：卖点应含铭星链相关字样（本项目特点）
+    const r0 = await (await fetch(`${BASE(port)}/api/copyideas?preset=preset-mingstar&batch=0`)).json();
+    assert.equal(r0.preset, "preset-mingstar");
+    assert.equal(r0.total, 3);
+    assert.equal(r0.batch, 0);
+    assert.ok(r0.sellingPoint.length <= 60, "卖点 ≤60 字");
+    assert.ok(r0.keyMessages.length >= 3, "每批至少 3 条核心信息点");
+    assert.match(r0.sellingPoint, /铭星链/, "主品牌文案应结合本项目特点");
+
+    // batch 越界自动环绕
+    const rw = await (await fetch(`${BASE(port)}/api/copyideas?preset=preset-mingstar&batch=3`)).json();
+    assert.equal(rw.batch, 0, "batch 3 → 环绕回 0");
+    const r2 = await (await fetch(`${BASE(port)}/api/copyideas?preset=preset-mingstar&batch=1`)).json();
+    assert.notEqual(r2.sellingPoint, r0.sellingPoint, "不同批次的文案应不同");
+
+    // 未知模板 → platform 通用场景（仍结合铭星链）
+    const rp = await (await fetch(`${BASE(port)}/api/copyideas?preset=whatever&batch=1`)).json();
+    assert.equal(rp.preset, "platform");
+    assert.match(rp.scenario, /铭星链/);
+
+    // 英文出海模板 → en 文案
+    const ren = await (await fetch(`${BASE(port)}/api/copyideas?preset=preset-global-en&batch=0`)).json();
+    assert.equal(ren.language, "en");
+    assert.match(ren.sellingPoint, /MingStar/);
+  } finally {
+    server.close();
+  }
+});
+
+test("/api/templates 预置已按铭星链产品线适配", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const list = await (await fetch(`${BASE(port)}/api/templates`)).json();
+    const presets = list.filter((t) => t.isPreset);
+    assert.ok(presets.length >= 5, "至少 5 个预置");
+    const names = presets.map((t) => t.name).join("|");
+    assert.match(names, /铭星链/, "预置应含铭星链产品线模板");
+    for (const t of presets) {
+      assert.ok(t.brandName && t.productName && t.coreSellingPoint, `${t.name} 应带 brandName/productName/coreSellingPoint（套用即可产出）`);
+      assert.ok(t.coreSellingPoint.length <= 60, `${t.name} 卖点 ≤60 字`);
+    }
   } finally {
     server.close();
   }

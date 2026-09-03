@@ -8,6 +8,7 @@
 
 import { encodeSVG } from "./svg.js";
 import { withGlobalLanguage } from "../i18n.js";
+import { getEffectiveOneApiBase } from "../runtime-config.js";
 
 // ───────────────────────── 模式判定 ─────────────────────────
 // 仅在显式 PROMO_PROVIDER_MODE=real 时启用真实 Provider；其余一律 DEMO（安全默认，零外部依赖）。
@@ -50,7 +51,8 @@ function paletteFor(tones = []) {
 
 // ───────────────────────── one-api HTTP 客户端（OpenAI 兼容） ─────────────────────────
 async function oneApiPost(path, body, { isBinary = false } = {}) {
-  const base = process.env.PROMO_ONEAPI_BASE_URL || process.env.MINGSTAR_LLM_BASE_URL;
+  // base = 运行时配置覆盖（前端「模型与服务」保存的供应商链接）> env 默认；每次调用现取，改完即生效。
+  const base = getEffectiveOneApiBase();
   const key = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY;
   if (!base || !key) throw new Error("one-api 未配置：请设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
   const url = base.replace(/\/$/, "") + path;

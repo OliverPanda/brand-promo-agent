@@ -73,14 +73,16 @@ test("模板库：PROMO_PERSIST=0 时预置仍注入内存（评审 F4）", () =
 
 test("模板库：isPreset 为系统标志位，调用方无法篡改（评审 F2/F3）", () => {
   // 数据层纵深防御：即便 HTTP 层遗漏，调用方也不能伪造 isPreset 或降格预设。
+  // 预置 id 会随产品线演进（如铭星链各业务线），故动态取首个预置而非硬编码。
   const out = runModule(`
-    import { saveTemplate, getTemplate, deleteTemplate } from ${TPL_URL};
+    import { listTemplates, saveTemplate, getTemplate, deleteTemplate } from ${TPL_URL};
+    const pid = listTemplates().find(t => t.isPreset).id;
     // 1) 伪造 isPreset=true 造僵尸模板：应被强制为 false
     const z = saveTemplate({ name: "伪造预设", isPreset: true });
     console.log("FORCED_FALSE=" + (z.isPreset === false) + " DELETABLE=" + deleteTemplate(z.id));
     // 2) 伪造 id 覆盖预设并降格 isPreset：预设标志应被沿用，不可变可删
-    saveTemplate({ id: "preset-tech", name: "越权改名", isPreset: false });
-    console.log("PRESET_STILL=" + (getTemplate("preset-tech").isPreset === true) + " DEL=" + deleteTemplate("preset-tech"));
+    saveTemplate({ id: pid, name: "越权改名", isPreset: false });
+    console.log("PRESET_STILL=" + (getTemplate(pid).isPreset === true) + " DEL=" + deleteTemplate(pid));
   `, "1");
   assert.match(out, /FORCED_FALSE=true/, "新建模板的 isPreset 应恒为 false");
   assert.match(out, /DELETABLE=true/, "自定义模板应可正常删除，不会变成僵尸");

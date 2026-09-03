@@ -9,6 +9,8 @@ import { getBudgetCap } from "./cost.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { parseBrief } from "./schemas.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
+import { listCopyIdeas } from "./copyideas.js";
+import { getEffectiveOneApiBase, setRuntimeConfig, validateProviderBaseUrl } from "./runtime-config.js";
 import {
   newRunId,
   createRun,
@@ -263,6 +265,9 @@ app.get("/api/config", (_req, res) => {
     budgetCap: getBudgetCap(),
     quotaCap: getQuotaCap(),
     provider: getProviderMode() === "real" ? "one-api" : "demo",
+    // 供应商网关（右侧「模型与服务」面板）：运行时覆盖值 > env 默认；只回显地址，绝不回显密钥。
+    providerBaseUrl: getEffectiveOneApiBase(),
+    apiKeySet: !!(process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY),
     // 模型清单（用户诉求：能选模型、知道用的什么模型）。
     // llm/image 可由 Brief.llmModel / Brief.imageModel 请求级覆盖；tts/music 仅展示当前值。
     models: {
@@ -280,6 +285,33 @@ app.get("/api/config", (_req, res) => {
       music: { label: "配乐", current: process.env.PROMO_MUSIC_MODEL || "mureka-v1" },
     },
   });
+});
+
+// ── POST /api/config：运行时配置（当前仅供应商网关地址，免重启生效）。不含密钥。 ──
+app.post("/api/config", (req, res) => {
+  const body = req.body || {};
+  if (body.providerBaseUrl === undefined && Object.keys(body).length === 0) {
+    return res.status(400).json({ error: "无可保存配置（支持字段：providerBaseUrl）" });
+  }
+  if (body.providerBaseUrl !== undefined) {
+    const chk = validateProviderBaseUrl(body.providerBaseUrl);
+    if (!chk.ok) return res.status(400).json({ error: chk.error });
+    setRuntimeConfig({ providerBaseUrl: chk.value });
+  }
+  res.json({
+    ok: true,
+    mode: getProviderMode(),
+    providerBaseUrl: getEffectiveOneApiBase(),
+    apiKeySet: !!(process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY),
+    note: "供应商地址已保存（覆盖 env 默认）；密钥仍从环境变量读取，重启后仍生效",
+  });
+});
+
+// ── GET /api/copyideas：项目化文案灵感「换一批」──
+// 结合铭星链产品线的预置文案（src/copyideas.js），按模板场景轮换；batch 越界自动环绕。
+app.get("/api/copyideas", (req, res) => {
+  const { preset, batch } = req.query || {};
+  res.json(listCopyIdeas(typeof preset === "string" ? preset : "", Number(batch) || 0));
 });
 
 // ── 模板库（M4 / FR-1.3）：品牌预设的保存 / 复用，保证调性统一 ──
