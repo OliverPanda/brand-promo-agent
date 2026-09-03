@@ -637,11 +637,14 @@ tests/
 
 ### 16.11.4 模板库契约（FR-1.3）
 - **实体**：`BrandTemplate { id?, name(必填), brandName?, productName?, coreSellingPoint?, logoColor?, bannedWords[], defaultTone(默认"专业"), defaultLanguage(enum LANGUAGES, 默认"zh-CN"), industry?, isPreset(默认false) }`（`BrandTemplateSchema` + `parseTemplate`，非法名抛「name: Required」类错误）。
-- **预置（≤5，不可删）**：`preset-tech`(科技,#0ea5e9) / `preset-guochao`(国潮,#dc2626) / `preset-warm`(温情,#f59e0b) / `preset-luxury`(高端,#111827) / `preset-global-en`(海外英文,en,#1d4ed8)。首启文件缺失时 `hydrate()` 自动写入。
-- **API**：`GET /api/templates`（列出含预置）→ `POST /api/templates`（201 新建，400 非法）→ `PUT /api/templates/:id`（更新）→ `DELETE /api/templates/:id`（404 不存在 / **409 预置不可删** / 200 ok）。
-- **套用**：前端 `applyTemplate(t)` 回填**全部**模板字段到 Brief 表单——品牌名 / 产品名 / 卖点 / 语言 / 默认调性 **+ 品牌主色 `logoColor`（含启用勾选）+ 禁用词 `bannedWords`**（顿号分隔展示，解析兼容中英文逗号与顿号）。`saveCurrentAsTemplate()` 将当前表单（含品牌约束）存为自定义模板。
+- **预置（≤5，不可删）——按铭星链产品线定制（2026-09 适配）**：
+  `preset-mingstar`(平台主品牌,#6366f1,科技感) / `preset-miniapp`(小程序拉新,#0ea5e9,专业) / `preset-studio`(Studio 分镜,#111827,高端) / `preset-music`(音乐配乐,#7c3aed,专业) / `preset-global-en`(出海 EN,#1d4ed8,专业,en)。
+  每条携带 `brandName`/`productName`/`coreSellingPoint`（套用即得项目化 brief，卖点 ≤60 字）。首启写入；**seed 迁移**：预置内容升级由 `PRESET_SEED`（data/templates.seed）识别，旧版预置自动替换、用户自定义模板保留。
+- **API**：`GET /api/templates`（列出含预置）→ `POST /api/templates`（201 新建，400 非法）→ `PUT /api/templates/:id`（更新）→ `DELETE /api/templates/:id`（404 不存在 / **409 预置不可删** / 200 ok）→ `GET /api/copyideas?preset&batch`（项目化文案灵感，3 批轮换、越界环绕、未知回落 platform）。
+- **套用**：前端 `applyTemplate(t)` 回填**全部**模板字段到 Brief 表单——品牌名 / 产品名 / 卖点 / 语言 / 默认调性 **+ 品牌主色 `logoColor`（含启用勾选）+ 禁用词 `bannedWords`**（顿号分隔展示，解析兼容中英文逗号与顿号），并自动带出该产品线**第 1 批文案灵感**（卖点 + 核心信息点）。表单「换一批」按钮轮换 `/api/copyideas` 的 2/3 批（仍围绕铭星链产品线真实能力）。`saveCurrentAsTemplate()` 将当前表单（含品牌约束）存为自定义模板。
   > 评审 F1 前车之鉴：初版 `applyTemplate` 只回填 5 个基础字段、漏掉 `logoColor`/`bannedWords`，导致模板库最有价值的品牌约束「存得进、套不出」。**套用必须覆盖全部字段，不可只覆盖基础字段。**
 - **主色格式**：`logoColor` 仅接受 `#RGB` / `#RRGGBB`（`LOGO_COLOR` schema，Brief 与 Template 共用）。评审 F6：原为任意 ≤20 字符串，会直接进入 DEMO 的 SVG 填充属性并破坏渲染。
+- **模型与服务配置（右侧面板，2026-09）**：布局改左主右栏（≤960px 回落单栏）。右侧「模型与服务」含供应商 API 地址（one-api 兼容）保存、脚本/分镜模型与场景图模型下拉（留空 = env 默认，清单来自 `GET /api/config.models`，`PROMO_LLM_CHOICES`/`PROMO_IMAGE_CHOICES` 扩展）、配音/配乐当前模型只读。供应商地址运行时覆盖由 `src/runtime-config.js` 持久化 `data/runtime-config.json`（写穿 + 原子替换，`PROMO_PERSIST=0` 仅内存），**免重启生效**：`providers.oneApiPost` 每次调用现取「运行时覆盖 > env」；`POST /api/config` 校验 http(s) 保存 / 空串清覆盖；`GET /api/config` 回显 `providerBaseUrl` + `apiKeySet`（**密钥只走 env，绝不下发/落盘**）。
 
 ### 16.11.5 全量上线部署清单（形态 B，checklist 文档化）
 > 本期（M4）仍以形态 A 单进程交付；以下为「全量上线」生产化的明确基线，待运维/部署阶段执行，不阻塞 M4 验收。
