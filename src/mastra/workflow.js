@@ -244,9 +244,16 @@ const voiceover = createStep({
     const rid = inputData.runId || runId;
     const { brief, script, storyboard } = inputData;
     return withStep(rid, STEP.VOICE, async () => {
-      const voice = await generateVoiceover(script, brief);
-      updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt });
-      return { brief, script, storyboard, voice, runId: rid, _usage: voice._usage };
+      // 配音渠道缺失/调用失败不阻断成片：置 voice=null 降级（合成可出静音片），把原因挂到 run.note。
+      try {
+        const voice = await generateVoiceover(script, brief);
+        updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt });
+        return { brief, script, storyboard, voice, runId: rid, _usage: voice._usage };
+      } catch (e) {
+        updateRun(rid, { note: `配音未生成（已降级静音）：${String(e?.message || e).slice(0, 160)}` });
+        console.warn(`[workflow] voiceover 降级: ${String(e?.message || e).slice(0, 200)}`);
+        return { brief, script, storyboard, voice: null, runId: rid };
+      }
     });
   },
 });
@@ -257,9 +264,15 @@ const music = createStep({
     const rid = inputData.runId || runId;
     const { brief, script, storyboard, voice } = inputData;
     return withStep(rid, STEP.MUSIC, async () => {
-      const music = await generateMusic(brief, storyboard);
-      updateRun(rid, { musicUrl: music.musicUrl });
-      return { brief, script, storyboard, voice, music, runId: rid, _usage: music._usage };
+      try {
+        const music = await generateMusic(brief, storyboard);
+        updateRun(rid, { musicUrl: music.musicUrl });
+        return { brief, script, storyboard, voice, music, runId: rid, _usage: music._usage };
+      } catch (e) {
+        updateRun(rid, { note: `配乐未生成（已降级）：${String(e?.message || e).slice(0, 160)}` });
+        console.warn(`[workflow] music 降级: ${String(e?.message || e).slice(0, 200)}`);
+        return { brief, script, storyboard, voice, music: null, runId: rid };
+      }
     });
   },
 });

@@ -303,7 +303,15 @@ export async function generateSceneMedia(scene, brief) {
   const model = brief.imageModel || process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
   let prompt = scene.visualPrompt;
   if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
-  const body = { model, prompt, n: 1, size: process.env.PROMO_IMAGE_SIZE || "1024x576" };
+  // 渠道适配：doubao/seedream 系渠道 size 词汇为 1K|2K|4K（像素写法会 400），
+  //   并接受 aspect_ratio 控制画幅（宣传片默认 16:9 横版）；其余渠道保持像素尺寸写法。
+  const isSeedream = /seedream|doubao/i.test(model);
+  let size = process.env.PROMO_IMAGE_SIZE || (isSeedream ? "1K" : "1024x576");
+  const body = { model, prompt, n: 1, size };
+  if (isSeedream) {
+    if (/^\d{3,4}x\d{3,4}$/.test(size)) body.size = "1K"; // 旧像素默认 → 词汇
+    body.aspect_ratio = process.env.PROMO_IMAGE_ASPECT || "16:9";
+  }
   // M3-D 真实参考图图生图（Seedream 参考图输入，M2 仅关键词透传）：
   //   styleReference 为 data:image 或 http(s) URL → 作为 image 字段走图生图（参考图输入免费，见 PRD §10）。
   //   纯关键词（非 URL）→ 追加到 prompt（M2 行为，向后兼容）。
@@ -545,8 +553,6 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
   for (let i = 0; i < n; i++) {
     const s = scenes[i];
     const img = path.join(tmp, `s${i}.img`);
-    const isSvg = s.mediaUrl?.startsWith("data:image/svg");
-    const file = path.join(tmp, `s${i}${isSvg ? ".svg" : ".png"}`);
     if (s.mediaUrl?.startsWith("data:image")) {
       const b64 = s.mediaUrl.split(",")[1];
       fs.writeFileSync(img, Buffer.from(b64, "base64"));
@@ -556,7 +562,13 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
     } else {
       throw new Error(`第 ${s.index} 镜场景图缺失，无法合成`);
     }
-    // ffmpeg 按内容探测格式，扩展名只影响部分 filter 判定；统一改名避免歧义。
+    // 按内容魔数选真实扩展名（JPEG 字节不可当 .png 喂 ffmpeg；seedream 等渠道返回 jpg/webp 常见）。
+    const head = fs.readFileSync(img).subarray(0, 12);
+    let ext = ".png";
+    if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) ext = ".jpg";
+    else if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e) ext = ".png";
+    else if (head.toString("latin1").startsWith("RIFF") && head.subarray(8, 12).toString("latin1") === "WEBP") ext = ".webp";
+    const file = path.join(tmp, `s${i}${ext}`);
     fs.renameSync(img, file);
     const dur = (s.durationSec || 5).toFixed(2);
     imgArgs.push("-loop", "1", "-t", dur, "-framerate", "25", "-i", file);
@@ -578,10 +590,15 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
     audioInputs.push("-i", m);
   }
   const out = path.join(tmp, "out.mp4");
-  // concat filter：图像输入逐个 [0:v][1:v]…concat=n=N:v=1:a=0；有双音频时追加 amix。
-  // 注意：-map 直接引用输入流须写 "2:a"（无方括号）；方括号仅用于 filter graph 的 label（如 [vout]/[aout]）。
-  const vLabels = scenes.map((_, i) => `[${i}:v]`).join("");
-  let fc = `${vLabels}concat=n=${n}:v=1:a=0[vout]`;
+  // 统一画布：seedream/doubao 等渠道对 aspect_ratio 是 best-effort，同一批场景图可能混出不同几何
+  //（实测 5 镜返回 1152×864 / 864×1152 竖图 / 1312×736×3）。concat filter 要求输入几何完全一致 →
+  // 每镜先 scale+pad 归一到 1280×720(16:9) 画布（黑边 letterbox、不裁剪），再 concat，杜绝尺寸不匹配。
+  const CW = 1280, CH = 720;
+  const norm = scenes
+    .map((_, i) => `[${i}:v]scale=${CW}:${CH}:force_original_aspect_ratio=decrease,pad=${CW}:${CH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v${i}]`)
+    .join(";");
+  const joined = scenes.map((_, i) => `[v${i}]`).join("");
+  let fc = `${norm};${joined}concat=n=${n}:v=1:a=0[vout]`;
   const maps = ["-map", "[vout]"];
   if (voiceIdx >= 0 && musicIdx >= 0) {
     fc += `;[${voiceIdx}:a][${musicIdx}:a]amix=inputs=2:duration=longest[aout]`;
@@ -594,7 +611,13 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
   // 以画面总时长为准（voice/music 短则尾部静音、长则被截）；-shortest 会把画面截到最短音轨，故不用。
   const totalSec = scenes.reduce((a, s) => a + (s.durationSec || 5), 0).toFixed(2);
   const args = ["-y", ...imgArgs, ...audioInputs, "-filter_complex", fc, ...maps, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", totalSec, "-y", out];
-  execFileSync(ffmpeg, args, { stdio: "pipe" });
+  try {
+    execFileSync(ffmpeg, args, { stdio: "pipe" });
+  } catch (e) {
+    const stderr = String(e?.stderr || "");
+    const detail = (stderr.split("\n").filter(Boolean).slice(-6).join("\n")).slice(0, 500);
+    throw new Error(`ffmpeg 合成失败：${String(e?.message || e).slice(0, 100)}${detail ? ` :: ${detail}` : ""}`);
+  }
   // 返回本地文件路径（生产应上传对象存储并返回直链）
   return `file://${out}`;
 }

@@ -1,6 +1,7 @@
 // Express 服务：静态前端 + 生成 API + SSE 实时进度 + HITL 审核门（对应 PRD §8 / §16.5）。
 // 进程内 PromoRun 状态由 store.js 维护；Mastra 两段式工作流由 workflow.js 装配（promoScript / promoVideo）。
 import express from "express";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mastra, publishDelivery, STEP } from "./mastra/workflow.js";
@@ -31,6 +32,30 @@ const PORT = Number(process.env.PORT || 3000);
 const app = express();
 app.use(express.json());
 app.use(express.static(PUBLIC_DIR));
+
+// ── 本机合成成片（file://）→ HTTP 可播放 ───────────────────────────
+// composite 产物落服务端临时目录，videoUrl 形如 file://C:\...\out.mp4，浏览器无法直接打开。
+// 统一映射为 /api/video/<runId>（sendFile 自带 Range，<video> 可拖动进度）；无本机视频则原样返回。
+function toPublicVideoUrl(runId, url) {
+  if (typeof url === "string" && url.startsWith("file://")) return `/api/video/${runId}`;
+  return url;
+}
+function toPublicRun(runId, run) {
+  if (!run || typeof run !== "object") return run;
+  return { ...run, videoUrl: toPublicVideoUrl(runId, run.videoUrl) };
+}
+
+// GET /api/video/:runId：以 HTTP 提供该 run 本机合成的 MP4（Range 支持，可直接 <video>/下载）。
+app.get("/api/video/:runId", (req, res) => {
+  const run = getRun(req.params.runId);
+  const url = run?.videoUrl;
+  if (!run || typeof url !== "string" || !url.startsWith("file://")) {
+    return res.status(404).json({ error: "该 run 没有本机合成视频" });
+  }
+  const file = url.slice(7);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: "视频文件已不存在（临时目录被清理？）" });
+  res.sendFile(file, { headers: { "Content-Type": "video/mp4", "Cache-Control": "private, max-age=300" } });
+});
 
 // 第二段：基于已批准脚本冷启动成片工作流（无 suspend，止于 composite）。
 // composite 完成后：若 finalGate 开启 → 置 awaiting_delivery 并推送 final-review 事件（成片门）；否则直接交付。
@@ -142,11 +167,14 @@ app.get("/api/generate/:runId/stream", (req, res) => {
   };
   const onFinalReview = (e) => {
     if (e.runId !== runId) return;
-    res.write(`event: final-review\ndata: ${JSON.stringify(e)}\n\n`); // 非终态，不关闭流
+    // file:// 成片 → HTTP 可预览
+    const p = e.preview && typeof e.preview === "object" ? { ...e.preview, videoUrl: toPublicVideoUrl(e.runId, e.preview.videoUrl) } : e.preview;
+    res.write(`event: final-review\ndata: ${JSON.stringify({ ...e, preview: p })}\n\n`); // 非终态，不关闭流
   };
   const finish = (type, e) => {
     if (e.runId !== runId) return;
-    res.write(`event: ${type}\ndata: ${JSON.stringify(e)}\n\n`);
+    const out = e.run ? { ...e, run: toPublicRun(e.runId, e.run) } : e;
+    res.write(`event: ${type}\ndata: ${JSON.stringify(out)}\n\n`);
     cleanup();
     res.end();
   };
@@ -220,11 +248,11 @@ app.post("/api/generate/:runId/approve", async (req, res) => {
 app.get("/api/runs/:runId", (req, res) => {
   const run = getRun(req.params.runId);
   if (!run) return res.status(404).json({ error: "run not found" });
-  res.json(run);
+  res.json(toPublicRun(req.params.runId, run));
 });
 
 // ── GET /api/runs：历史列表（持久化，重启不丢） ──
-app.get("/api/runs", (_req, res) => res.json(listRuns()));
+app.get("/api/runs", (_req, res) => res.json(listRuns().map((r) => toPublicRun(r.id || r.runId, r))));
 
 // ── GET /api/quota：账户级累计配额（FR-10.3 / M3 成本配额） ──
 app.get("/api/quota", (req, res) => {

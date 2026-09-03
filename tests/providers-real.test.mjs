@@ -139,7 +139,9 @@ test("generateSceneMedia 真实模式：POST /images/generations + 返回 url + 
   const media = await generateSceneMedia(scenes[0], baseBrief);
   assert.match(calls[calls.length - 1].url, /\/images\/generations$/);
   assert.equal(calls[calls.length - 1].body.model, "doubao-seedream-4-0-250828");
-  assert.equal(calls[calls.length - 1].body.size, "1024x576");
+  // 渠道适配：doubao/seedream 系 size 用词汇 1K|2K|4K（像素写法会 400）+ 16:9 画幅
+  assert.equal(calls[calls.length - 1].body.size, "1K");
+  assert.equal(calls[calls.length - 1].body.aspect_ratio, "16:9");
   assert.equal(media.mediaUrl, "https://cdn.example/scene.png");
   assert.equal(media._usage.images, 1);
 });
