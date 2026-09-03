@@ -531,11 +531,16 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
   const path = await import("node:path");
   const { execFileSync } = await import("node:child_process");
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "promo-"));
-  const list = path.join(tmp, "list.txt");
-  const lines = [];
-  for (let i = 0; i < scenes.length; i++) {
+  // 静态图幻灯路径：每张图以 -loop 1 -t <dur> 作为独立输入，concat filter 拼接。
+  // 不用 concat demuxer 的 duration 指令 —— 它对单帧图片的"最后一段时长"不可靠（末图只出 1 帧）。
+  const inputs = [];
+  const imgArgs = [];
+  const n = scenes.length;
+  for (let i = 0; i < n; i++) {
     const s = scenes[i];
-    const img = path.join(tmp, `s${i}.png`);
+    const img = path.join(tmp, `s${i}.img`);
+    const isSvg = s.mediaUrl?.startsWith("data:image/svg");
+    const file = path.join(tmp, `s${i}${isSvg ? ".svg" : ".png"}`);
     if (s.mediaUrl?.startsWith("data:image")) {
       const b64 = s.mediaUrl.split(",")[1];
       fs.writeFileSync(img, Buffer.from(b64, "base64"));
@@ -543,27 +548,46 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
       // 远程图需可访问；此处用 curl 拉取（生产建议预下载到对象存储）。
       execFileSync("curl", ["-sL", s.mediaUrl, "-o", img]);
     } else {
-      continue;
+      throw new Error(`第 ${s.index} 镜场景图缺失，无法合成`);
     }
+    // ffmpeg 按内容探测格式，扩展名只影响部分 filter 判定；统一改名避免歧义。
+    fs.renameSync(img, file);
     const dur = (s.durationSec || 5).toFixed(2);
-    lines.push(`file '${img.replace(/'/g, "'\\''")}'\nDuration:00:00:${dur}`);
+    imgArgs.push("-loop", "1", "-t", dur, "-framerate", "25", "-i", file);
   }
-  fs.writeFileSync(list, lines.join("\n"));
-  const out = path.join(tmp, "out.mp4");
-  const args = ["-f", "concat", "-safe", "0", "-i", list];
+  // 音频输入紧随图像之后：voice 为 n 号、music 为 n+1 号（audioInputs 存 ["-i",file] 对，须用 audioCount 计输入流数）
+  let voiceIdx = -1, musicIdx = -1;
+  const audioInputs = [];
+  let audioCount = 0;
   if (voice?.voiceUrl?.startsWith("data:audio")) {
     const a = path.join(tmp, "voice.mp3");
     fs.writeFileSync(a, Buffer.from(voice.voiceUrl.split(",")[1], "base64"));
-    args.push("-i", a);
-    if (music?.musicUrl?.startsWith("data:audio")) {
-      const m = path.join(tmp, "music.mp3");
-      fs.writeFileSync(m, Buffer.from(music.musicUrl.split(",")[1], "base64"));
-      args.push("-i", m, "-filter_complex", "[1:a][2:a]amix=inputs=2[a]", "-map", "0:v", "-map", "[a]");
-    } else {
-      args.push("-map", "0:v", "-map", "1:a");
-    }
+    voiceIdx = n + audioCount++;
+    audioInputs.push("-i", a);
   }
-  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", out);
+  if (music?.musicUrl?.startsWith("data:audio")) {
+    const m = path.join(tmp, "music.mp3");
+    fs.writeFileSync(m, Buffer.from(music.musicUrl.split(",")[1], "base64"));
+    musicIdx = n + audioCount++;
+    audioInputs.push("-i", m);
+  }
+  const out = path.join(tmp, "out.mp4");
+  // concat filter：图像输入逐个 [0:v][1:v]…concat=n=N:v=1:a=0；有双音频时追加 amix。
+  // 注意：-map 直接引用输入流须写 "2:a"（无方括号）；方括号仅用于 filter graph 的 label（如 [vout]/[aout]）。
+  const vLabels = scenes.map((_, i) => `[${i}:v]`).join("");
+  let fc = `${vLabels}concat=n=${n}:v=1:a=0[vout]`;
+  const maps = ["-map", "[vout]"];
+  if (voiceIdx >= 0 && musicIdx >= 0) {
+    fc += `;[${voiceIdx}:a][${musicIdx}:a]amix=inputs=2:duration=longest[aout]`;
+    maps.push("-map", "[aout]");
+  } else if (voiceIdx >= 0) {
+    maps.push("-map", `${voiceIdx}:a`);
+  } else if (musicIdx >= 0) {
+    maps.push("-map", `${musicIdx}:a`);
+  }
+  // 以画面总时长为准（voice/music 短则尾部静音、长则被截）；-shortest 会把画面截到最短音轨，故不用。
+  const totalSec = scenes.reduce((a, s) => a + (s.durationSec || 5), 0).toFixed(2);
+  const args = ["-y", ...imgArgs, ...audioInputs, "-filter_complex", fc, ...maps, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", totalSec, "-y", out];
   execFileSync(ffmpeg, args, { stdio: "pipe" });
   // 返回本地文件路径（生产应上传对象存储并返回直链）
   return `file://${out}`;
@@ -610,7 +634,9 @@ async function ffmpegAssembleVideo(ffmpeg, scenes, voice, music, brief) {
       args.push("-map", "0:v", "-map", "1:a");
     }
   }
-  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", out);
+  // 以画面总时长为准（真实配乐常长于画面，须截断；voice 不足尾部静音）
+  const totalSec = scenes.reduce((a, s) => a + (s.durationSec || 5), 0).toFixed(2);
+  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", totalSec, "-y", out);
   execFileSync(ffmpeg, args, { stdio: "pipe" });
   return `file://${out}`;
 }
