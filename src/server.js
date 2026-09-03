@@ -56,7 +56,7 @@ async function runVideoPhase(runId, brief, opts = {}) {
         updateRun(runId, { status: "awaiting_delivery" });
         emitFinalReview(runId, {
           videoUrl: r.videoUrl,
-          gallery: r.storyboardGallery,
+          gallery: r.storyboard || r.storyboardGallery, // 优先完整分镜（含 videoUrl，成片门可预览动态片段）
           poster: r.poster,
           note: r.note,
         });

@@ -651,6 +651,8 @@ tests/
   - **Brief 增 `videoModel`**（请求级覆盖，语义同 `llmModel`/`imageModel`）；`GET /api/config.models.video` 回显 `current`（env `PROMO_VIDEO_MODEL`，可空 = 不启用）。
   - **生成链路（仅 `real` + `brief.videoModel` 生效）**：`providers.generateSceneVideo` 走 OpenAI 兼容 `POST {base}/videos/generations`（`image` = 本镜场景图 URL → 图生视频，无图退化为文生；兼容同步返回与异步任务轮询 `GET /videos/{id}` / `/videos/generations/{id}`，`PROMO_VIDEO_TIMEOUT_MS` 默认 180s）。workflow `generateScenes` 每镜图后动态化，**单镜失败降级为静态图不阻断全片**（FR-4.3）；产出落 `scene.videoUrl`/`scene.videoModel`。合成：全部镜为动态片段 → FFmpeg concat 直拼 + 音频混流；否则走原静态图路径。交付页模型行显示「动态视频 xxx（静态降级）」如实标注。
   - **成本**：`generateScenes` 计费表增 `perVideo`（占位价，真实单价待网关渠道确认）。
+  - **交付预览**：交付页与成片门分镜画廊——有 `scene.videoUrl` 的镜渲染 `<video controls>`（可播放动态片段，带「⦿动态」徽标），否则静态图；成片门 preview 的 gallery 取完整 storyboard（含 videoUrl）。
+  - **调用骨架回归保障**：`tests/video-provider.test.mjs` 以本地 stub 网关锁定 7 条路径——同步返回 / 异步轮询至 succeeded（output 对象）/ GET 404 → 备选 `/videos/generations/{id}` / 任务失败 / 轮询超时（`PROMO_VIDEO_TIMEOUT_MS`）/ 未指定模型 / DEMO stub。`extractVideoUrl` 兼容 `{url|video_url}`、`data/output/results/videos` 数组、`output` 对象、`content` 对象/数组等形态。
   - **对拍工具**：`tools/probe-gateway.mjs` 在真实网关环境运行（只读 GET /models 零费用），输出分类与 raw type，用于精确适配渠道。⚠️ 真实调用端点/任务返回字段**以目标网关实现为准**——stub e2e 已验证 OpenAI 兼容骨架，若你的 new-api 渠道字段有出入，跑一次探测脚本把输出贴回即可微调。
 
 ### 16.11.5 全量上线部署清单（形态 B，checklist 文档化）

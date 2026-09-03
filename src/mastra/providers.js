@@ -380,18 +380,56 @@ export async function generateSceneVideo(scene, brief) {
   throw new Error(`视频任务 ${id} 轮询超时（>${Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 180000) / 1000}s）${lastErr ? `，最近错误：${String(lastErr?.message || lastErr)}` : ""}`);
 }
 
+// 从视频接口响应中提取首个可用 URL。兼容常见形态：
+//   顶层 { url | video_url }；data/output/results/videos 数组（元素为 string 或 {url|video_url|content.url}）；
+//   output 为对象 { url | video_url | content:{url} }；内容门控 {content:[{url}]} 等。
 function extractVideoUrl(data) {
   if (!data) return null;
-  if (typeof data.url === "string" && data.url) return data.url;
-  const arr = data.data || data.output || data.results || data.videos;
-  if (Array.isArray(arr)) {
-    for (const it of arr) {
-      if (it?.url) return it.url;
-      if (it?.video_url) return it.video_url;
-      if (it?.content?.url) return it.content.url;
+  const first = (list) => {
+    if (!Array.isArray(list)) return null;
+    for (const it of list) {
+      if (typeof it === "string" && it) return it;
+      if (!it) continue;
+      if (typeof it.url === "string" && it.url) return it.url;
+      if (typeof it.video_url === "string" && it.video_url) return it.video_url;
+      if (it.content) {
+        const c = it.content;
+        if (typeof c === "string" && c) return c;
+        if (typeof c.url === "string" && c.url) return c.url;
+        if (Array.isArray(c)) {
+          for (const ci of c) {
+            if (typeof ci?.url === "string" && ci.url) return ci.url;
+            if (typeof ci === "string" && ci) return ci;
+          }
+        }
+      }
+    }
+    return null;
+  };
+  for (const key of ["url", "video_url"]) {
+    if (typeof data[key] === "string" && data[key]) return data[key];
+  }
+  const hit = first(data.data || data.results || data.videos);
+  if (hit) return hit;
+  // output 可能为数组（多候选）或单个对象
+  if (Array.isArray(data.output)) return first(data.output);
+  if (data.output && typeof data.output === "object") {
+    const o = data.output;
+    for (const key of ["url", "video_url"]) {
+      if (typeof o[key] === "string" && o[key]) return o[key];
+    }
+    if (o.content) {
+      const c = o.content;
+      if (typeof c === "string" && c) return c;
+      if (typeof c.url === "string" && c.url) return c.url;
+      if (Array.isArray(c)) {
+        for (const ci of c) {
+          if (typeof ci?.url === "string" && ci.url) return ci.url;
+          if (typeof ci === "string" && ci) return ci;
+        }
+      }
     }
   }
-  if (typeof data.video_url === "string" && data.video_url) return data.video_url;
   return null;
 }
 

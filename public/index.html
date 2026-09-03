@@ -523,7 +523,7 @@ function onFinalReview(ev) {
   if (p.videoUrl) html += `<p><a class="dl" href="${p.videoUrl}" target="_blank">预览成片</a></p>`;
   const scenes = p.gallery || [];
   if (scenes.length) {
-    html += `<div class="gallery">` + scenes.map(s=>`<div class="scene">${s.mediaUrl?`<img src="${s.mediaUrl}"/>`:`<div style="padding:16px;color:var(--bad)">缺失</div>`}<div class="cap">#${s.index} ${esc(s.subtitle||"")}</div></div>`).join("") + `</div>`;
+    html += `<div class="gallery">` + scenes.map(sceneHtml).join("") + `</div>`;
   }
   if (p.note) html += `<div class="note">${p.note}</div>`;
   document.getElementById("finalPreview").innerHTML = html;
@@ -534,6 +534,21 @@ function approveFinal(approve) {
   fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
   document.getElementById("finalGateModal").classList.add("hidden");
   setStep("composite", approve ? "done" : "running", approve ? "验收通过，交付中…" : "重新生成中…");
+}
+// 单镜卡片：有动态片段（videoUrl）→ <video> 可播放；否则静态图；失败显示占位。
+function sceneHtml(s, opts) {
+  const fail = opts?.fail || s.status === "failed";
+  const cls = fail ? "scene failed" : "scene";
+  const cap = `#${s.index}${s.videoUrl ? " ⦿动态" : ""} ${esc(s.subtitle || s.visualPrompt || "")}`;
+  let media;
+  if (s.videoUrl) {
+    media = `<video src="${esc(s.videoUrl)}" poster="${s.mediaUrl ? esc(s.mediaUrl) : ""}" controls preload="metadata" style="width:100%;max-height:190px;background:#000;border-radius:6px;"></video>`;
+  } else if (s.mediaUrl) {
+    media = `<img src="${s.mediaUrl}"/>`;
+  } else {
+    media = `<div style="padding:20px;color:var(--bad)">素材生成失败</div>`;
+  }
+  return `<div class="${cls}">${media}<div class="cap">${cap}</div></div>`;
 }
 function esc(s){ return String(s).replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
 
@@ -565,11 +580,12 @@ function renderDelivery(run) {
     html += `</ul></div>`;
   }
   if (run.note) html += `<div class="note">${run.note}</div>`;
-  // 分镜画廊
-  const scenes = (run.storyboardGallery && run.storyboardGallery.length) ? run.storyboardGallery : (run.storyboard||[]).map(s=>({index:s.index, mediaUrl:s.mediaUrl, subtitle:s.subtitle||s.visualPrompt, status:s.status}));
+  // 分镜画廊（优先完整 storyboard —— 含 videoUrl，可播动态片段；回退摘要 gallery）
+  const scenes = (run.storyboard && run.storyboard.length) ? run.storyboard
+    : (run.storyboardGallery && run.storyboardGallery.length) ? run.storyboardGallery : [];
   if (scenes.length) {
-    html += `<h4>分镜画廊（${scenes.length} 镜）</h4><div class="gallery">`;
-    scenes.forEach(s=>{ const fail = s.status==="failed"?" failed":""; html += `<div class="scene${fail}">${s.mediaUrl?`<img src="${s.mediaUrl}"/>`:`<div style="padding:20px;color:var(--bad)">素材生成失败</div>`}<div class="cap">#${s.index} ${esc(s.subtitle||"")}</div></div>`; });
+    html += `<h4>分镜画廊（${scenes.length} 镜${(run.storyboard||[]).some(s=>s.videoUrl) ? " · 含动态镜头" : ""}）</h4><div class="gallery">`;
+    scenes.forEach(s=>{ html += sceneHtml(s, {fail: s.status==="failed"}); });
     html += `</div>`;
   }
   // 脚本全文

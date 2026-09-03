@@ -467,7 +467,8 @@ test("GET /api/models：real + 本地 stub 网关 → source=gateway，type 优�
     assert.ok(j.models.audio.includes("tiny-iceberg"), "tts 归 audio");
     assert.ok(j.models.llm.includes("deepseek-v4-flash") && j.models.llm.includes("plain-no-type"), "llm 分类");
   } finally {
-    process.env.PROMO_PROVIDER_MODE = prevMode;
+    if (prevMode === undefined) delete process.env.PROMO_PROVIDER_MODE;
+    else process.env.PROMO_PROVIDER_MODE = prevMode;
     if (hadKey) process.env.PROMO_ONEAPI_API_KEY = prevKey;
     else delete process.env.PROMO_ONEAPI_API_KEY;
     setRuntimeConfig({ providerBaseUrl: "" });
