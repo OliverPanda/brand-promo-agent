@@ -5,5 +5,7 @@ data/
 # 本机验证产物（截图/样例出片），不入库
 _ui_*.png
 _sample_*.mp4
+_real_*.mp4
 _diag*.mjs
 _sample*.mjs
+_real*.mjs
