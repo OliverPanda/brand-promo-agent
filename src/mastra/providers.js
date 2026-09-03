@@ -80,7 +80,9 @@ async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } =
   clearTimeout(timer);
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`one-api ${path} ${res.status}: ${txt.slice(0, 300)}`);
+    const err = new Error(`one-api ${path} ${res.status}: ${txt.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
   }
   if (isBinary) return Buffer.from(await res.arrayBuffer());
   return res.json();
@@ -338,15 +340,22 @@ function demoSceneMedia(scene, brief) {
   return { mediaUrl: encodeSVG(svg), kind: "image", model: brief.imageModel || "demo-seedream" };
 }
 
-// ───────────────────────── 3.5) 动态视频（图生/文生，OpenAI 兼容 /videos/generations） ─────────────────────────
+// ───────────────────────── 3.5) 动态视频（图生/文生，OpenAI 兼容 /videos/generations + new-api 单数回退） ─────────────────────────
 // 仅 real 模式且 Brief.videoModel 存在时由 workflow 调用；DEMO 一律走 demoSceneVideo（静态图声明路由）。
 // 请求级模型 = Brief.videoModel；场景图 URL（http(s)）作为 image 字段 → 图生视频（首帧驱动，风格连贯），
 // 无图（图生成失败）→ 退化为文生视频（仅 prompt）。
 // 响应兼容两种形态：
 //   a) 同步：{ data:[{url}] } 或 { url } —— 直接返回；
-//   b) 异步任务：{ id, status } / { data:[{id}] } —— 轮询 GET /videos/{id}（404 时备选 /videos/generations/{id}），
-//      status ∈ completed|succeeded|success|finished → 取 output.url / data[0].url / output[0]。
+//   b) 异步任务：{ id, status } / { data:[{id}] } —— 轮询任务端点。
+// 端点差异（真实对拍，2026-09）：OpenAI 规范为复数 /videos/generations，但 new-api v0.13.2 网关
+//   实测只注册**单数** /v1/video/generations（复数 404 "Invalid URL"）→ 提交 404 自动回退单数；
+//   轮询序列 /videos/{id} → /videos/generations/{id} → /video/generations/{id}。
+//   new-api 任务查询返回包装 {code:"success", data:{status:"SUCCESS"|"FAILURE", result_url, fail_reason}} →
+//   unwrapTask 解包 data 层。
 // 单镜失败由 workflow 捕获降级为静态图（不阻断全片，FR-4.3）；超时受 PROMO_VIDEO_TIMEOUT_MS 控制（默认 180s）。
+const VIDEO_SUBMIT_PATHS = ["/videos/generations", "/video/generations"];
+const VIDEO_POLL_PATHS = (id) => [`/videos/${id}`, `/videos/generations/${id}`, `/video/generations/${id}`];
+
 export async function generateSceneVideo(scene, brief) {
   if (getProviderMode() !== "real") return demoSceneVideo(scene, brief);
   const model = brief.videoModel || process.env.PROMO_VIDEO_MODEL;
@@ -356,7 +365,19 @@ export async function generateSceneVideo(scene, brief) {
   const body = { model, prompt, n: 1 };
   const ref = scene.mediaUrl;
   if (ref && /^https?:\/\//i.test(ref)) body.image = ref; // 图生视频：首帧用本镜场景图
-  const data = await oneApiPost("/videos/generations", body, { timeoutMs: Number(process.env.PROMO_VIDEO_SUBMIT_TIMEOUT_MS ?? 30000) });
+  const timeoutMs = Number(process.env.PROMO_VIDEO_SUBMIT_TIMEOUT_MS ?? 30000);
+  let data = null, submitErr = null;
+  for (const p of VIDEO_SUBMIT_PATHS) {
+    try {
+      data = await oneApiPost(p, body, { timeoutMs });
+      submitErr = null;
+      break;
+    } catch (e) {
+      submitErr = e;
+      if (e.status !== 404 && !/Invalid URL/i.test(String(e.message))) throw e; // 非路径问题直接抛
+    }
+  }
+  if (!data) throw submitErr || new Error("视频提交失败（所有端点均不可用）");
   const videoUrl = extractVideoUrl(data);
   if (videoUrl) return { videoUrl, kind: "video", model, _usage: { videos: 1 } };
   // 异步任务：轮询直至完成
@@ -367,31 +388,37 @@ export async function generateSceneVideo(scene, brief) {
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, Number(process.env.PROMO_VIDEO_POLL_MS ?? 3000)));
     let task = null;
-    try {
-      task = await oneApiGet(`/videos/${id}`);
-    } catch (e) {
-      if (e.status === 404) {
-        try {
-          task = await oneApiGet(`/videos/generations/${id}`);
-        } catch (e2) {
-          lastErr = e2;
-        }
-      } else {
+    for (const p of VIDEO_POLL_PATHS(id)) {
+      try {
+        task = await oneApiGet(p);
+        break;
+      } catch (e) {
         lastErr = e;
+        if (e.status !== 404 && !/Invalid URL/i.test(String(e.message))) break; // 非路径问题停止尝试该轮
       }
     }
     if (!task) continue;
-    const status = String(task?.status || task?.state || "").toLowerCase();
-    const url = extractVideoUrl(task);
+    const body2 = unwrapVideoTask(task);
+    const status = String(body2?.status || body2?.state || "").toLowerCase();
+    const url = body2?.result_url || extractVideoUrl(body2);
     if (url) return { videoUrl: url, kind: "video", model, _usage: { videos: 1 }, taskStatus: status };
-    if (["failed", "error", "cancelled", "canceled"].includes(status)) {
-      throw new Error(`视频任务 ${id} 失败：${task?.error || task?.message || status}`);
+    if (["failed", "failure", "error", "cancelled", "canceled"].includes(status)) {
+      throw new Error(`视频任务 ${id} 失败：${body2?.fail_reason || body2?.error || body2?.message || status}`);
     }
     if (["completed", "succeeded", "success", "finished"].includes(status) && !url) {
       throw new Error(`视频任务 ${id} 完成但未返回 URL：${JSON.stringify(task).slice(0, 200)}`);
     }
   }
   throw new Error(`视频任务 ${id} 轮询超时（>${Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 180000) / 1000}s）${lastErr ? `，最近错误：${String(lastErr?.message || lastErr)}` : ""}`);
+}
+
+// new-api 任务查询包装解包：{code:"success", data:{status, result_url, fail_reason}} → 返回 data 层。
+function unwrapVideoTask(raw) {
+  if (raw && raw.code && raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)) {
+    const d = raw.data;
+    if ("status" in d || "result_url" in d || "fail_reason" in d) return d;
+  }
+  return raw;
 }
 
 // 从视频接口响应中提取首个可用 URL。兼容常见形态：
@@ -420,7 +447,7 @@ function extractVideoUrl(data) {
     }
     return null;
   };
-  for (const key of ["url", "video_url"]) {
+  for (const key of ["url", "video_url", "result_url"]) {
     if (typeof data[key] === "string" && data[key]) return data[key];
   }
   const hit = first(data.data || data.results || data.videos);

@@ -193,6 +193,85 @@ test("generateSceneVideo：未指定视频模型 → 抛错", async () => {
   }
 });
 
+test("generateSceneVideo：复数端点 404 → 自动回退单数 /video/generations（new-api 实测）", async () => {
+  const hits = { plural: 0, single: 0 };
+  const stub = await listen(async (req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.method === "POST" && req.url === "/videos/generations") {
+      hits.plural++;
+      res.statusCode = 404;
+      res.end("Invalid URL"); // new-api v0.13.2 对复数路由的实际应答
+    } else if (req.method === "POST" && req.url === "/video/generations") {
+      hits.single++;
+      await readBody(req);
+      res.end(JSON.stringify({ id: "task-singular", status: "queued" }));
+    } else if (req.method === "GET" && req.url === "/video/generations/task-singular") {
+      res.end(JSON.stringify({ status: "succeeded", data: [{ url: "https://cdn.example.com/out-single.mp4" }] }));
+    } else {
+      res.statusCode = 404; res.end();
+    }
+  });
+  process.env.PROMO_VIDEO_POLL_MS = "30";
+  try {
+    const out = await withReal(stub, () =>
+      generateSceneVideo(scene, { ...brief, videoModel: "doubao-seedance-2-0-260128" }));
+    assert.equal(hits.plural, 1, "应先尝试复数端点");
+    assert.equal(hits.single, 1, "复数 404 后应回退单数端点提交");
+    assert.equal(out.videoUrl, "https://cdn.example.com/out-single.mp4", "单数端点产物应被解析");
+  } finally {
+    stub.close();
+    delete process.env.PROMO_VIDEO_POLL_MS;
+  }
+});
+
+test("generateSceneVideo：new-api 任务包装 {code,data:{status:SUCCESS,result_url}} 解包取 URL", async () => {
+  const stub = await listen(async (req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.method === "POST" && req.url === "/video/generations") {
+      await readBody(req);
+      res.end(JSON.stringify({ code: "success", data: { id: "task-napi", status: "queued" } }));
+    } else if (req.method === "GET" && req.url === "/video/generations/task-napi") {
+      res.end(JSON.stringify({ code: "success", data: { id: "task-napi", status: "SUCCESS", result_url: "https://cdn.example.com/out-napi.mp4" } }));
+    } else {
+      res.statusCode = 404; res.end();
+    }
+  });
+  process.env.PROMO_VIDEO_POLL_MS = "30";
+  try {
+    const out = await withReal(stub, () =>
+      generateSceneVideo(scene, { ...brief, videoModel: "doubao-seedance-2-0-260128" }));
+    assert.equal(out.videoUrl, "https://cdn.example.com/out-napi.mp4", "result_url 应被 unwrap 后提取");
+    assert.equal(out.model, "doubao-seedance-2-0-260128");
+  } finally {
+    stub.close();
+    delete process.env.PROMO_VIDEO_POLL_MS;
+  }
+});
+
+test("generateSceneVideo：new-api 任务 FAILURE → 抛错（带 fail_reason）", async () => {
+  const stub = await listen(async (req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.method === "POST" && req.url === "/video/generations") {
+      await readBody(req);
+      res.end(JSON.stringify({ code: "success", data: { id: "task-fail-napi" } }));
+    } else if (req.method === "GET" && req.url === "/video/generations/task-fail-napi") {
+      res.end(JSON.stringify({ code: "success", data: { id: "task-fail-napi", status: "FAILURE", fail_reason: "invalid image url" } }));
+    } else {
+      res.statusCode = 404; res.end();
+    }
+  });
+  process.env.PROMO_VIDEO_POLL_MS = "30";
+  try {
+    await assert.rejects(
+      withReal(stub, () => generateSceneVideo(scene, { ...brief, videoModel: "doubao-seedance-2-0-260128" })),
+      /invalid image url/
+    );
+  } finally {
+    stub.close();
+    delete process.env.PROMO_VIDEO_POLL_MS;
+  }
+});
+
 test("generateSceneVideo：DEMO 模式返回 stub（不产生网络调用）", async () => {
   // 不设 real —— 保持测试进程默认 demo
   const out = await generateSceneVideo(scene, { ...brief, videoModel: "kling-v1-6" });
