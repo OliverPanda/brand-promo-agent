@@ -507,6 +507,10 @@ generateSceneMedia(scene,brief)-> /images/generations (model=PROMO_IMAGE_MODEL) 
 generateVoiceover(script,brief)-> /audio/speech (isBinary)                        -> {voiceUrl:data:audio/mp3;base64, srt, _usage:{minutes}}
 generateMusic(brief,storyboard)-> /audio/music (model=PROMO_MUSIC_MODEL)          -> {musicUrl, mood, _usage:{tracks:1}}
 composite(scenes,voice,music,brief) -> ffmpegAssemble() (PROMO_FFMPEG_BIN)        -> {videoUrl:file://...mp4, ..., _usage:{videos:1}}
+// 合成实现（2026-09 真机修复后）：全镜有 videoUrl → ffmpegAssembleVideo（concat demuxer 直拼，保留编码）；
+//   否则静态图幻灯 ffmpegAssemble —— 每图 -loop 1 -t <dur> 独立输入 + concat filter 拼接（不用 concat demuxer 的 duration 行：
+//   其语法对单帧图片末段时长不可靠）。音频：voice 直 map（-map <idx>:a，无方括号）、voice+music 走 amix；输出 -t <画面总时长>
+//   （音短尾部静音、音长截断，不用 -shortest 防画面被截到音轨长）。ffmpeg 需支持读 PNG/解码场景图（无 librsvg 构建不可用 SVG 素材）。
 // 任一真实步无 _usage（如未配置 FFmpeg 的合成降级）则不计成本；DEMO 模式全程无 _usage 不计成本。
 ```
 > 模式判定：`getProviderMode()` 仅在 `PROMO_PROVIDER_MODE==="real"` 返回 `"real"`，否则 `"demo"`（安全默认，零外部依赖）。工作流代码不变，仅 env 切换。
