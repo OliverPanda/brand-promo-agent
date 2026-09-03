@@ -473,6 +473,7 @@ ingestBrief(Zod BrandBrief)
 #### 16.9.1 M2 范围锁定（相对 §16.1 的增量）
 - ✅ **真实 Provider 接入（one-api）**：脚本/分镜（LLM `/chat/completions`）、场景图（`/images/generations`，Seedream `doubao-seedream-4-0-250828`）、配音（`/audio/speech` TTS）、配乐（`/audio/music`，Mureka 桥），均经 `globalThis.fetch` 调 one-api，请求/响应严格按 OpenAI 兼容协议解析。
 - ✅ **真实 MP4 合成**：服务端 FFmpeg（`PROMO_FFMPEG_BIN`）将场景图 + 配音 + 配乐合流为 MP4；未配置 FFmpeg 或合成失败时优雅降级为分镜包（DEMO 同款），不阻断交付。
+- ✅ **真实链路全打通（2026-09 真机验证，new-api 网关 :3501 + 本机 ffmpeg 8.0）**：① seedream/doubao 渠道 `size` 用词汇 `1K|2K|4K` 并带 `aspect_ratio:"16:9"`（像素写法如 1024x576 该渠道拒绝，按 model 前缀自动归一）；② seedream 对 aspect 是 best-effort——同批 5 镜实测混出 1152×864 / 864×1152 竖图 / 1312×736，而 concat 要求同几何 → 合成层每镜 `scale+pad` 归一到 1280×720(16:9) 黑边画布再 concat，异源尺寸免疫；③ voiceover/music 渠道缺失（如 `tiny-iceberg` 无对应 TTS channel → 网关报 `No available channel`）时置 null **降级继续**，不再中断整链，成片仍产出（静音片）；④ 成片 `file://` 路径在 server API 边界统一映射为 `GET /api/video/:runId`（sendFile 带 Range 支持拖动），SSE（run-done/final-review）与 `GET /api/runs` 均经 `toPublicRun` 序列化，浏览器可播可下载。
 - ✅ **FR-10 成本配额与预算上限**：真实 Provider 回传 `_usage`（tokens / images / minutes / tracks / videos），经 `cost.js` 单价表预估 → 归集到 `PromoRun.cost` → `checkBudget` 对 `PROMO_BUDGET_CAP`（默认 ¥20）闸门，超限抛 `BudgetExceededError` 中止并提示。
 - ✅ **参考图图生图透传**：`brief.styleReference` 在真实图像生成时拼入 prompt（「参考风格：…」），DEMO 仅做 SVG 文案标注。
 - ✅ **成本可见性**：前端 `GET /api/config` 暴露 `mode`/`provider`/`budgetCap`；交付页渲染每步 ¥ 明细与总额/上限对比。
@@ -511,6 +512,9 @@ composite(scenes,voice,music,brief) -> ffmpegAssemble() (PROMO_FFMPEG_BIN)      
 //   否则静态图幻灯 ffmpegAssemble —— 每图 -loop 1 -t <dur> 独立输入 + concat filter 拼接（不用 concat demuxer 的 duration 行：
 //   其语法对单帧图片末段时长不可靠）。音频：voice 直 map（-map <idx>:a，无方括号）、voice+music 走 amix；输出 -t <画面总时长>
 //   （音短尾部静音、音长截断，不用 -shortest 防画面被截到音轨长）。ffmpeg 需支持读 PNG/解码场景图（无 librsvg 构建不可用 SVG 素材）。
+// 2026-09 真实网关适配追加：① 远程图按内容魔数嗅探真实扩展名落盘（png/jpg/webp——seedream 返回 JPEG 字节写 .png 必解码失败）；
+//   ② 每镜先 scale+pad 归一到 1280×720 黑边画布再 concat（seedream 对 aspect_ratio 是 best-effort，混尺寸直拼必炸）；
+//   ③ ffmpeg 失败抛错截 stderr 尾 400 字符（头部只有版本横幅）。④ videoUrl 在 providers 层仍为 file://，server API 边界 toPublicRun 映射为 /api/video/:runId。
 // 任一真实步无 _usage（如未配置 FFmpeg 的合成降级）则不计成本；DEMO 模式全程无 _usage 不计成本。
 ```
 > 模式判定：`getProviderMode()` 仅在 `PROMO_PROVIDER_MODE==="real"` 返回 `"real"`，否则 `"demo"`（安全默认，零外部依赖）。工作流代码不变，仅 env 切换。
