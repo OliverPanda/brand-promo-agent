@@ -21,6 +21,7 @@ import {
   generateScript,
   generateStoryboard,
   generateSceneMedia,
+  generateSceneVideo,
   generateVoiceover,
   generateMusic,
   composite,
@@ -203,8 +204,23 @@ const generateScenes = createStep({
           const media = await generateSceneMedia(scene, brief);
           // mediaModel 透传实际使用的图像模型（brief.imageModel 请求级覆盖 > env 默认），供交付页展示
           const done = { ...scene, mediaUrl: media.mediaUrl, mediaModel: media.model, status: "done" };
+          // 动态视频（图生/文生）：仅 real + brief.videoModel 时启用 —— 场景图 URL 作首帧生成动态镜头。
+          // 单镜失败降级为静态图（不阻断全片）；DEMO 模式 generateSceneVideo 返回 stub 不真调。
+          if (getProviderMode() === "real" && brief.videoModel) {
+            try {
+              const vid = await generateSceneVideo(done, brief);
+              if (vid?.videoUrl) {
+                done.videoUrl = vid.videoUrl;
+                done.videoModel = vid.model;
+              }
+              emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: vid?.videoUrl ? "video-done" : "video-stub" });
+            } catch (err) {
+              emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: `video-failed:${String(err?.message || err).slice(0, 80)}` });
+            }
+          } else {
+            emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: "done" });
+          }
           scenes.push(done);
-          emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: "done" });
         } catch (err) {
           // 单场景失败不阻断全片（PRD FR-4.3 / NFR 可靠性）
           const failed = { ...scene, mediaUrl: null, status: "failed", error: String(err?.message || err) };
@@ -214,7 +230,10 @@ const generateScenes = createStep({
       }
       updateRun(rid, { storyboard: scenes });
       const images = getProviderMode() === "real" ? scenes.length : 0;
-      return { brief, script, storyboard: scenes, runId: rid, _usage: images ? { images } : undefined };
+      const videos = getProviderMode() === "real" && brief.videoModel ? scenes.filter((s) => s.videoUrl).length : 0;
+      const usage = images ? { images } : undefined;
+      if (videos) usage.videos = videos;
+      return { brief, script, storyboard: scenes, runId: rid, _usage: usage };
     });
   },
 });

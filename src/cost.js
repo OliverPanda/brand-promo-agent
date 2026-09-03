@@ -16,7 +16,7 @@ function readBudgetCap() {
 export const PRICING = {
   writeScript: { per1kTokens: 0.004 },
   storyboard: { per1kTokens: 0.004 },
-  generateScenes: { perImage: 0.2 }, // 按场景数 × 单价
+  generateScenes: { perImage: 0.2, perVideo: 0.5 }, // 按场景数 × 单价；视频另按条占位价（真实单价待网关渠道确认后调整）
   voiceover: { perMinute: 0.1 },
   music: { perTrack: 0.5 },
   composite: { perVideo: 1.0 },

@@ -395,3 +395,83 @@ test("/api/templates 预置已按铭星链产品线适配", async () => {
     server.close();
   }
 });
+
+test("GET /api/models：DEMO 返回占位清单；Brief.videoModel 可提交且 demo 不真调视频", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const j = await (await fetch(`${BASE(port)}/api/models`)).json();
+    assert.equal(j.source, "fallback", "DEMO 下不应声称连上了网关");
+    assert.ok(Array.isArray(j.models.video) && j.models.video.length >= 1, "DEMO 视频给占位候选（声明路由演示）");
+    assert.ok(j.models.llm.includes("deepseek-v4-flash"), "fallback llm 保留内置清单");
+
+    // brief 带 videoModel：demo 下正常出片 success，且不产出真实视频片段（videoModel 仅 real 时生效）
+    const r = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, videoModel: "kling-v1-6", hitlEnabled: false, finalGateEnabled: false }),
+    });
+    assert.equal(r.status, 200);
+    const { runId } = await r.json();
+    const run = await waitStatus(port, runId, ["success", "failed"]);
+    assert.equal(run.status, "success");
+    assert.equal(run.brief.videoModel, "kling-v1-6", "videoModel 应随 brief 回显");
+    const anyVideo = (run.storyboard || []).some((s) => s.videoUrl);
+    assert.equal(anyVideo, false, "demo 不应真调视频接口、不产出动态片段");
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /api/models：real + 本地 stub 网关 → source=gateway，type 优先 + 关键词兜底分类", async () => {
+  const http = await import("node:http");
+  const stub = http.createServer((req, res) => {
+    if (req.url === "/models") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({
+        data: [
+          { id: "deepseek-v4-flash", type: "llm" },
+          { id: "doubao-seedream-4-0-250828", type: "image" },
+          { id: "kling-v1-6", type: "video" },
+          { id: "doubao-seedance-1-0", type: "videogeneration" },
+          { id: "tiny-iceberg", type: "tts" },
+          { id: "plain-no-type" }, // 无 type → 兜底 llm
+          { id: "hunyuan-video-pro" }, // 无 type → 关键词 video
+          { id: "midjourney-v6" }, // 无 type → 关键词 image
+        ],
+      }));
+    } else {
+      res.statusCode = 404;
+      res.end("nope");
+    }
+  });
+  await new Promise((r) => stub.listen(0, r));
+  const stubPort = stub.address().port;
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  const { setRuntimeConfig } = await import("../src/runtime-config.js");
+  const prevMode = process.env.PROMO_PROVIDER_MODE;
+  const hadKey = Object.prototype.hasOwnProperty.call(process.env, "PROMO_ONEAPI_API_KEY");
+  const prevKey = process.env.PROMO_ONEAPI_API_KEY;
+  try {
+    setRuntimeConfig({ providerBaseUrl: `http://127.0.0.1:${stubPort}` });
+    process.env.PROMO_PROVIDER_MODE = "real";
+    process.env.PROMO_ONEAPI_API_KEY = "sk-test";
+    const j = await (await fetch(`${BASE(port)}/api/models?refresh=1`)).json();
+    assert.equal(j.source, "gateway", "应成功从 stub 网关拉取");
+    assert.ok(j.models.video.includes("kling-v1-6"), "type=video 归 video");
+    assert.ok(j.models.video.includes("doubao-seedance-1-0"), "type=videogeneration 归 video");
+    assert.ok(j.models.video.includes("hunyuan-video-pro"), "无 type 按关键词归 video");
+    assert.ok(j.models.image.includes("doubao-seedream-4-0-250828") && j.models.image.includes("midjourney-v6"), "图像分类");
+    assert.ok(j.models.audio.includes("tiny-iceberg"), "tts 归 audio");
+    assert.ok(j.models.llm.includes("deepseek-v4-flash") && j.models.llm.includes("plain-no-type"), "llm 分类");
+  } finally {
+    process.env.PROMO_PROVIDER_MODE = prevMode;
+    if (hadKey) process.env.PROMO_ONEAPI_API_KEY = prevKey;
+    else delete process.env.PROMO_ONEAPI_API_KEY;
+    setRuntimeConfig({ providerBaseUrl: "" });
+    server.close();
+    stub.close();
+  }
+});

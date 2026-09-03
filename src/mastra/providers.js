@@ -1,7 +1,8 @@
-// Provider 抽象层：所有外部能力（LLM / 图像 / TTS / 音乐 / 合成）均经此适配。
+// Provider 抽象层：所有外部能力（LLM / 图像 / TTS / 音乐 / 动态视频 / 合成）均经此适配。
 // 默认 DEMO 模式：完全离线、确定性的占位生成，无需任何外部密钥即可端到端运行。
 // 生产模式（PROMO_PROVIDER_MODE=real）：经 one-api（OpenAI 兼容统一网关）调用真实能力，
-//   图像走 /v1/images/generations（Seedream 等），TTS 走 /v1/audio/speech，音乐走 Mureka 桥；
+//   图像走 /v1/images/generations（Seedream 等），TTS 走 /v1/audio/speech，音乐走 Mureka 桥，
+//   动态视频走 /v1/videos/generations（图生/文生，异步任务轮询，PROMO_VIDEO_TIMEOUT_MS 超时）；
 //   合成走服务端 FFmpeg（PROMO_FFMPEG_BIN）。每个真实能力回传 _usage 供成本归集。
 //
 // 切换只需设置环境变量，【工作流代码不变】。本文件不含网络调用时机之外的业务逻辑。
@@ -50,22 +51,57 @@ function paletteFor(tones = []) {
 }
 
 // ───────────────────────── one-api HTTP 客户端（OpenAI 兼容） ─────────────────────────
-async function oneApiPost(path, body, { isBinary = false } = {}) {
+async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } = {}) {
   // base = 运行时配置覆盖（前端「模型与服务」保存的供应商链接）> env 默认；每次调用现取，改完即生效。
   const base = getEffectiveOneApiBase();
   const key = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY;
   if (!base || !key) throw new Error("one-api 未配置：请设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
   const url = base.replace(/\/$/, "") + path;
-  const res = await (globalThis.fetch || fetch)(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify(body),
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
+  try {
+    res = await (globalThis.fetch || fetch)(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    throw new Error(`one-api ${path} 请求失败：${e?.message || e}`);
+  }
+  clearTimeout(timer);
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new Error(`one-api ${path} ${res.status}: ${txt.slice(0, 300)}`);
   }
   if (isBinary) return Buffer.from(await res.arrayBuffer());
+  return res.json();
+}
+
+// GET 辅助（视频异步任务轮询等只读查询复用同一 base/key 约定）。
+async function oneApiGet(path, { timeoutMs = 15000 } = {}) {
+  const base = getEffectiveOneApiBase();
+  const key = process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY;
+  if (!base || !key) throw new Error("one-api 未配置：请设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
+  const url = base.replace(/\/$/, "") + path;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(url, { headers: { Authorization: `Bearer ${key}` }, signal: ctrl.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    throw new Error(`one-api GET ${path} 失败：${e?.message || e}`);
+  }
+  clearTimeout(timer);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    const err = new Error(`one-api GET ${path} ${res.status}: ${txt.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
@@ -288,6 +324,82 @@ function demoSceneMedia(scene, brief) {
   return { mediaUrl: encodeSVG(svg), kind: "image", model: brief.imageModel || "demo-seedream" };
 }
 
+// ───────────────────────── 3.5) 动态视频（图生/文生，OpenAI 兼容 /videos/generations） ─────────────────────────
+// 仅 real 模式且 Brief.videoModel 存在时由 workflow 调用；DEMO 一律走 demoSceneVideo（静态图声明路由）。
+// 请求级模型 = Brief.videoModel；场景图 URL（http(s)）作为 image 字段 → 图生视频（首帧驱动，风格连贯），
+// 无图（图生成失败）→ 退化为文生视频（仅 prompt）。
+// 响应兼容两种形态：
+//   a) 同步：{ data:[{url}] } 或 { url } —— 直接返回；
+//   b) 异步任务：{ id, status } / { data:[{id}] } —— 轮询 GET /videos/{id}（404 时备选 /videos/generations/{id}），
+//      status ∈ completed|succeeded|success|finished → 取 output.url / data[0].url / output[0]。
+// 单镜失败由 workflow 捕获降级为静态图（不阻断全片，FR-4.3）；超时受 PROMO_VIDEO_TIMEOUT_MS 控制（默认 180s）。
+export async function generateSceneVideo(scene, brief) {
+  if (getProviderMode() !== "real") return demoSceneVideo(scene, brief);
+  const model = brief.videoModel || process.env.PROMO_VIDEO_MODEL;
+  if (!model) throw new Error("未指定视频模型（Brief.videoModel / env PROMO_VIDEO_MODEL）");
+  let prompt = scene.visualPrompt || scene.subtitle || "";
+  if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
+  const body = { model, prompt, n: 1 };
+  const ref = scene.mediaUrl;
+  if (ref && /^https?:\/\//i.test(ref)) body.image = ref; // 图生视频：首帧用本镜场景图
+  const data = await oneApiPost("/videos/generations", body, { timeoutMs: Number(process.env.PROMO_VIDEO_SUBMIT_TIMEOUT_MS ?? 30000) });
+  const videoUrl = extractVideoUrl(data);
+  if (videoUrl) return { videoUrl, kind: "video", model, _usage: { videos: 1 } };
+  // 异步任务：轮询直至完成
+  const id = data?.id || data?.data?.[0]?.id || data?.task_id || data?.request_id;
+  if (!id) throw new Error(`视频接口未返回 url 或任务 id：${JSON.stringify(data).slice(0, 200)}`);
+  const deadline = Date.now() + Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 180000);
+  let lastErr = null;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, Number(process.env.PROMO_VIDEO_POLL_MS ?? 3000)));
+    let task = null;
+    try {
+      task = await oneApiGet(`/videos/${id}`);
+    } catch (e) {
+      if (e.status === 404) {
+        try {
+          task = await oneApiGet(`/videos/generations/${id}`);
+        } catch (e2) {
+          lastErr = e2;
+        }
+      } else {
+        lastErr = e;
+      }
+    }
+    if (!task) continue;
+    const status = String(task?.status || task?.state || "").toLowerCase();
+    const url = extractVideoUrl(task);
+    if (url) return { videoUrl: url, kind: "video", model, _usage: { videos: 1 }, taskStatus: status };
+    if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+      throw new Error(`视频任务 ${id} 失败：${task?.error || task?.message || status}`);
+    }
+    if (["completed", "succeeded", "success", "finished"].includes(status) && !url) {
+      throw new Error(`视频任务 ${id} 完成但未返回 URL：${JSON.stringify(task).slice(0, 200)}`);
+    }
+  }
+  throw new Error(`视频任务 ${id} 轮询超时（>${Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 180000) / 1000}s）${lastErr ? `，最近错误：${String(lastErr?.message || lastErr)}` : ""}`);
+}
+
+function extractVideoUrl(data) {
+  if (!data) return null;
+  if (typeof data.url === "string" && data.url) return data.url;
+  const arr = data.data || data.output || data.results || data.videos;
+  if (Array.isArray(arr)) {
+    for (const it of arr) {
+      if (it?.url) return it.url;
+      if (it?.video_url) return it.video_url;
+      if (it?.content?.url) return it.content.url;
+    }
+  }
+  if (typeof data.video_url === "string" && data.video_url) return data.video_url;
+  return null;
+}
+
+// DEMO：不真调视频接口 —— 沿用静态场景图（动态镜头在 real 模式由网关视频渠道产出）。
+function demoSceneVideo(scene, brief) {
+  return { videoUrl: null, kind: "video-stub", model: brief.videoModel || "demo-video", note: "DEMO：未调用视频接口，出片仍为静态图合成" };
+}
+
 // ───────────────────────── 4) TTS 配音 ─────────────────────────
 export async function generateVoiceover(script, brief) {
   if (getProviderMode() !== "real") return demoVoiceover(script, brief);
@@ -368,8 +480,14 @@ function demoComposite(scenes, voice, music, brief) {
   return fallbackComposite(scenes, voice, music, brief, "未接入真实合成服务，以下为分镜故事板");
 }
 
-// 服务端 FFmpeg 组装：将场景图 + 配音 + 配乐合为 MP4。要求 ffmpeg 可用且素材可本地读取。
+// 服务端 FFmpeg 组装：将场景图/动态片段 + 配音 + 配乐合为 MP4。要求 ffmpeg 可用且素材可本地读取。
 async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
+  // 动态视频路径：全部镜均已产出动态片段（scene.videoUrl）→ concat demuxer 直拼 + 音频混流。
+  // 前提：同一渠道同设置产物编码/尺寸一致（concat demuxer 流复制不转码）；不一致或失败由外层 catch 降级。
+  const videoScenes = scenes.filter((s) => s.videoUrl);
+  if (videoScenes.length === scenes.length && videoScenes.length > 0) {
+    return ffmpegAssembleVideo(ffmpeg, scenes, voice, music, brief);
+  }
   const fs = await import("node:fs");
   const os = await import("node:os");
   const path = await import("node:path");
@@ -410,6 +528,52 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
   args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", out);
   execFileSync(ffmpeg, args, { stdio: "pipe" });
   // 返回本地文件路径（生产应上传对象存储并返回直链）
+  return `file://${out}`;
+}
+
+// 动态片段直拼：全部镜为 mp4 片段（本地 file:// 或可下载 http(s)）→ concat demuxer + 音频 amix。
+// 注意：真实渠道产物通常同编码同尺寸可直接流复制；若渠道混用导致失败，会落到 fallbackComposite 提示。
+async function ffmpegAssembleVideo(ffmpeg, scenes, voice, music, brief) {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "promo-vid-"));
+  const list = path.join(tmp, "list.txt");
+  const lines = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const s = scenes[i];
+    const vf = path.join(tmp, `v${i}.mp4`);
+    const url = s.videoUrl;
+    if (url?.startsWith("file://")) {
+      fs.copyFileSync(url.slice(7), vf);
+    } else if (url?.startsWith("http")) {
+      execFileSync("curl", ["-sL", url, "-o", vf]);
+    } else if (url?.startsWith("data:video")) {
+      fs.writeFileSync(vf, Buffer.from(url.split(",")[1], "base64"));
+    } else {
+      throw new Error(`第 ${s.index} 镜视频 URL 无法本地化：${String(url || "空").slice(0, 80)}`);
+    }
+    if (!fs.existsSync(vf) || fs.statSync(vf).size < 100) throw new Error(`第 ${s.index} 镜视频下载失败/为空`);
+    lines.push(`file '${vf.replace(/'/g, "'\\''")}'`);
+  }
+  fs.writeFileSync(list, lines.join("\n"));
+  const out = path.join(tmp, "out.mp4");
+  const args = ["-f", "concat", "-safe", "0", "-i", list];
+  if (voice?.voiceUrl?.startsWith("data:audio")) {
+    const a = path.join(tmp, "voice.mp3");
+    fs.writeFileSync(a, Buffer.from(voice.voiceUrl.split(",")[1], "base64"));
+    args.push("-i", a);
+    if (music?.musicUrl?.startsWith("data:audio")) {
+      const m = path.join(tmp, "music.mp3");
+      fs.writeFileSync(m, Buffer.from(music.musicUrl.split(",")[1], "base64"));
+      args.push("-i", m, "-filter_complex", "[1:a][2:a]amix=inputs=2[a]", "-map", "0:v", "-map", "[a]");
+    } else {
+      args.push("-map", "0:v", "-map", "1:a");
+    }
+  }
+  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-y", out);
+  execFileSync(ffmpeg, args, { stdio: "pipe" });
   return `file://${out}`;
 }
 

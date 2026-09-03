@@ -11,6 +11,7 @@ import { parseBrief } from "./schemas.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import { listCopyIdeas } from "./copyideas.js";
 import { getEffectiveOneApiBase, setRuntimeConfig, validateProviderBaseUrl } from "./runtime-config.js";
+import { fetchRemoteModels, demoVideoChoices } from "./models-gateway.js";
 import {
   newRunId,
   createRun,
@@ -283,6 +284,9 @@ app.get("/api/config", (_req, res) => {
       },
       tts: { label: "配音（TTS）", current: process.env.PROMO_TTS_MODEL || "tiny-iceberg" },
       music: { label: "配乐", current: process.env.PROMO_MUSIC_MODEL || "mureka-v1" },
+      // 视频（动态镜头）：choices 不在此静态下发 —— 由 GET /api/models 从网关实时拉取（含真实渠道）。
+      // 当前值支持 env PROMO_VIDEO_MODEL 预置；选择后存 Brief.videoModel（请求级覆盖，语义同 llmModel/imageModel）。
+      video: { label: "动态视频（图生/文生）", current: process.env.PROMO_VIDEO_MODEL || "" },
     },
   });
 });
@@ -305,6 +309,49 @@ app.post("/api/config", (req, res) => {
     apiKeySet: !!(process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY),
     note: "供应商地址已保存（覆盖 env 默认）；密钥仍从环境变量读取，重启后仍生效",
   });
+});
+
+// ── GET /api/models：从供应商网关实时拉取模型清单（含视频渠道），按 llm/image/audio/video 分类 ──
+// 语义：
+//   - real 模式 + 网关可达 → source=gateway，返回真实分类（byType + raw 摘要）；?refresh=1 强制刷新（TTL 60s）。
+//   - DEMO 模式（或未配密钥）→ source=fallback：llm/image 沿用 env+内置静态清单；video 给占位候选（仅声明路由演示，不真调）。
+//   - real 模式但网关拉取失败 → 503 + error（不返回占位，避免误导用户选到不存在的渠道 id）。
+app.get("/api/models", async (req, res) => {
+  const refresh = req.query.refresh === "1";
+  const mode = getProviderMode();
+  const llmCurrent = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
+  const imgCurrent = process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
+  const staticLlm = [...new Set([llmCurrent, ...(process.env.PROMO_LLM_CHOICES || "").split(",").map((s) => s.trim()).filter(Boolean), "deepseek-v4-flash", "deepseek-v4", "qwen3-max", "glm-5"])];
+  const staticImg = [...new Set([imgCurrent, ...(process.env.PROMO_IMAGE_CHOICES || "").split(",").map((s) => s.trim()).filter(Boolean), "doubao-seedream-4-0-250828", "doubao-seedream-3-0-t2i"])];
+  if (mode !== "real") {
+    return res.json({
+      source: "fallback",
+      mode,
+      note: "DEMO 离线模式：未连接网关。视频为占位候选（仅演示用），接入网关后自动列出真实渠道。",
+      models: { llm: staticLlm, image: staticImg, audio: [], video: demoVideoChoices() },
+    });
+  }
+  if (!getEffectiveOneApiBase() || !(process.env.PROMO_ONEAPI_API_KEY || process.env.OPENAI_API_KEY)) {
+    return res.json({
+      source: "fallback",
+      mode,
+      note: "真实模式但未配置网关/密钥：视频清单需连接网关后列出。",
+      models: { llm: staticLlm, image: staticImg, audio: [], video: [] },
+    });
+  }
+  try {
+    const remote = await fetchRemoteModels({ refresh });
+    return res.json({
+      source: "gateway",
+      mode,
+      fetchedAt: remote.fetchedAt,
+      note: "已从网关拉取真实模型清单（60s 缓存，?refresh=1 强刷）。",
+      models: remote.byType,
+      raw: remote.raw,
+    });
+  } catch (e) {
+    return res.status(503).json({ source: "error", mode, error: String(e?.message || e) });
+  }
 });
 
 // ── GET /api/copyideas：项目化文案灵感「换一批」──

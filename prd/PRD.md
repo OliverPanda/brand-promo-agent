@@ -645,6 +645,13 @@ tests/
   > 评审 F1 前车之鉴：初版 `applyTemplate` 只回填 5 个基础字段、漏掉 `logoColor`/`bannedWords`，导致模板库最有价值的品牌约束「存得进、套不出」。**套用必须覆盖全部字段，不可只覆盖基础字段。**
 - **主色格式**：`logoColor` 仅接受 `#RGB` / `#RRGGBB`（`LOGO_COLOR` schema，Brief 与 Template 共用）。评审 F6：原为任意 ≤20 字符串，会直接进入 DEMO 的 SVG 填充属性并破坏渲染。
 - **模型与服务配置（右侧面板，2026-09）**：布局改左主右栏（≤960px 回落单栏）。右侧「模型与服务」含供应商 API 地址（one-api 兼容）保存、脚本/分镜模型与场景图模型下拉（留空 = env 默认，清单来自 `GET /api/config.models`，`PROMO_LLM_CHOICES`/`PROMO_IMAGE_CHOICES` 扩展）、配音/配乐当前模型只读。供应商地址运行时覆盖由 `src/runtime-config.js` 持久化 `data/runtime-config.json`（写穿 + 原子替换，`PROMO_PERSIST=0` 仅内存），**免重启生效**：`providers.oneApiPost` 每次调用现取「运行时覆盖 > env」；`POST /api/config` 校验 http(s) 保存 / 空串清覆盖；`GET /api/config` 回显 `providerBaseUrl` + `apiKeySet`（**密钥只走 env，绝不下发/落盘**）。
+- **动态视频能力 + 网关模型清单实时拉取（2026-09）**：
+  - **模型清单动态化**：新增 `GET /api/models?refresh=1`（`src/models-gateway.js`）——从**当前生效供应商网关**拉 `GET {base}/models`（Bearer、5s 超时、60s TTL），按条目 `type` 字段优先、缺失按模型 id 关键词分类（`video > audio > image > llm`）。`real` 且网关可达 → `source=gateway` 返回真实清单；`real` 但网关失败 → 503（**不返回占位，避免误导**）；DEMO → `source=fallback`（llm/image 内置清单 + video 占位候选，仅声明路由演示）。
+  - **右侧面板增「动态视频模型」下拉**（首项「不启用」）：数据源 = `/api/models` 的 video 分类；页面加载与「保存供应商地址」后自动拉取（地址变了强刷 `refresh=1`），llm/image 下拉并入网关真实条目。「从网关刷新模型清单」按钮手动强刷。
+  - **Brief 增 `videoModel`**（请求级覆盖，语义同 `llmModel`/`imageModel`）；`GET /api/config.models.video` 回显 `current`（env `PROMO_VIDEO_MODEL`，可空 = 不启用）。
+  - **生成链路（仅 `real` + `brief.videoModel` 生效）**：`providers.generateSceneVideo` 走 OpenAI 兼容 `POST {base}/videos/generations`（`image` = 本镜场景图 URL → 图生视频，无图退化为文生；兼容同步返回与异步任务轮询 `GET /videos/{id}` / `/videos/generations/{id}`，`PROMO_VIDEO_TIMEOUT_MS` 默认 180s）。workflow `generateScenes` 每镜图后动态化，**单镜失败降级为静态图不阻断全片**（FR-4.3）；产出落 `scene.videoUrl`/`scene.videoModel`。合成：全部镜为动态片段 → FFmpeg concat 直拼 + 音频混流；否则走原静态图路径。交付页模型行显示「动态视频 xxx（静态降级）」如实标注。
+  - **成本**：`generateScenes` 计费表增 `perVideo`（占位价，真实单价待网关渠道确认）。
+  - **对拍工具**：`tools/probe-gateway.mjs` 在真实网关环境运行（只读 GET /models 零费用），输出分类与 raw type，用于精确适配渠道。⚠️ 真实调用端点/任务返回字段**以目标网关实现为准**——stub e2e 已验证 OpenAI 兼容骨架，若你的 new-api 渠道字段有出入，跑一次探测脚本把输出贴回即可微调。
 
 ### 16.11.5 全量上线部署清单（形态 B，checklist 文档化）
 > 本期（M4）仍以形态 A 单进程交付；以下为「全量上线」生产化的明确基线，待运维/部署阶段执行，不阻塞 M4 验收。
