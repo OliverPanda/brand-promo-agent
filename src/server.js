@@ -8,7 +8,7 @@ import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { parseBrief } from "./schemas.js";
-import { listTemplates, getTemplate, saveTemplate, deleteTemplate } from "./templates.js";
+import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import {
   newRunId,
   createRun,
@@ -259,18 +259,28 @@ app.get("/api/config", (_req, res) =>
 // ── 模板库（M4 / FR-1.3）：品牌预设的保存 / 复用，保证调性统一 ──
 app.get("/api/templates", (_req, res) => res.json(listTemplates()));
 
+// 新建：忽略客户端传入的 id 与 isPreset（评审 F2/F3）。
+//   - id 由服务端分配，避免伪造 id="preset-tech" 覆盖预设后将其删除（预设永久丢失）；
+//   - isPreset 恒 false，避免伪造 isPreset=true 造出永不可删的僵尸模板。
 app.post("/api/templates", (req, res) => {
   try {
-    const tpl = saveTemplate(req.body);
+    const { id: _ignoredId, isPreset: _ignoredPreset, ...body } = req.body || {};
+    const tpl = saveTemplate({ ...body, isPreset: false });
     res.status(201).json(tpl);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
+// 更新：要求目标已存在（否则 404）；merge 原值后再覆盖，避免部分更新静默丢字段（评审 F5）。
+// isPreset 沿用原值，调用方无法把预设降格为可删、也无法把自定义模板升格为不可删（评审 F2/F3）。
 app.put("/api/templates/:id", (req, res) => {
+  const id = req.params.id;
+  const prev = getTemplate(id);
+  if (!prev) return res.status(404).json({ error: "template not found" });
   try {
-    const tpl = saveTemplate({ ...req.body, id: req.params.id });
+    const { id: _ignoredId, isPreset: _ignoredPreset, ...body } = req.body || {};
+    const tpl = saveTemplate({ ...prev, ...body, id });
     res.json(tpl);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -278,10 +288,14 @@ app.put("/api/templates/:id", (req, res) => {
 });
 
 app.delete("/api/templates/:id", (req, res) => {
-  const t = getTemplate(req.params.id);
+  const id = req.params.id;
+  const t = getTemplate(id);
   if (!t) return res.status(404).json({ error: "template not found" });
-  if (t.isPreset) return res.status(409).json({ error: "预设模板不可删除" });
-  const ok = deleteTemplate(req.params.id);
+  // 预设判定：标志位 + id 前缀双保险（评审 F2/F3）——标志位被污染时前缀仍可兜底。
+  if (isPresetTemplate(t) || String(id).startsWith("preset-")) {
+    return res.status(409).json({ error: "预设模板不可删除" });
+  }
+  const ok = deleteTemplate(id);
   if (!ok) return res.status(404).json({ error: "template not found" });
   res.json({ ok: true });
 });

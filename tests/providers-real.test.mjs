@@ -212,6 +212,27 @@ test("generateScript 真实模式：bannedWords 注入 prompt（M4 模板库约�
   assert.equal(out.language, "zh-CN");
 });
 
+test("generateStoryboard / generateSceneMedia 真实模式：logoColor 注入品牌主色（M4 模板库约束）", async () => {
+  // F1 闭环的后端半环：前端表单或模板套用提交 logoColor 后，须真正注入分镜与图像 prompt。
+  // 修复前前端从不提交该字段，导致这两个分支恒不触发（品牌主色能力对终端用户不存在）。
+  const brief = { ...baseBrief, logoColor: "#0ea5e9" };
+
+  calls = [];
+  const script = await generateScript(brief);
+  const scenes = await generateStoryboard(brief, script);
+  const sb = calls.find(
+    (c) => c.url.endsWith("/chat/completions") && (c.body.messages?.[0]?.content || "").includes("分镜师")
+  );
+  assert.ok(sb, "应调用分镜 chat");
+  assert.match(sb.body.messages[1].content, /品牌主色 #0ea5e9/, "分镜 prompt 应含品牌主色");
+
+  calls = [];
+  await generateSceneMedia(scenes[0], brief);
+  const img = calls.find((c) => c.url.endsWith("/images/generations"));
+  assert.ok(img, "应调用图像生成");
+  assert.match(img.body.prompt, /主色 #0ea5e9/, "图像 prompt 应含品牌主色");
+});
+
 test("generateMusic 真实模式：POST /audio/music + 返回 url + _usage.tracks", async () => {
   calls = [];
   const script = await generateScript(baseBrief);

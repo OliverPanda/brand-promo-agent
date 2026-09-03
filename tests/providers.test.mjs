@@ -44,6 +44,15 @@ test("generateSceneMedia 返回 SVG data URI", async () => {
   assert.equal(media.kind, "image");
 });
 
+test("generateSceneMedia：logoColor 覆盖 DEMO 调色板主色（M4 模板库）", async () => {
+  // DEMO 是默认路径，品牌主色须直接体现在占位图配色上（评审 F1 的 DEMO 半环）。
+  const script = await generateScript(brief);
+  const scenes = await generateStoryboard(brief, script);
+  const media = await generateSceneMedia(scenes[0], { ...brief, logoColor: "#dc2626" });
+  const svg = decodeURIComponent(media.mediaUrl.replace(/^data:image\/svg\+xml,/, ""));
+  assert.match(svg, /#dc2626/i, "占位图应采用模板主色");
+});
+
 test("generateVoiceover 产出 SRT", async () => {
   const script = await generateScript(brief);
   const v = await generateVoiceover(script, brief);

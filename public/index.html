@@ -84,6 +84,20 @@
     <label>风格参考（关键词或图片 URL，可选）</label>
     <input id="styleReference" placeholder="例如：赛博朋克 / https://..." />
 
+    <div class="row" style="margin-top:12px;">
+      <div>
+        <label style="display:flex; gap:8px; align-items:center;">
+          <input type="checkbox" id="logoColorEnabled" style="width:auto;" />品牌主色（Logo 色，可选）
+        </label>
+        <input type="color" id="logoColor" value="#0ea5e9" style="width:80px; padding:2px; margin-top:6px;" />
+      </div>
+      <div>
+        <label>禁用词（逗号分隔，可选）</label>
+        <input id="bannedWords" placeholder="例如：最、第一、绝对" />
+      </div>
+    </div>
+    <div class="sub" style="font-size:12px;">主色与禁用词会约束脚本、分镜与画面配色；可从下方模板库一键套用（FR-1.3）。</div>
+
     <label style="margin-top:12px;"><input type="checkbox" id="hitlEnabled" checked style="width:auto;margin-right:8px;" />启用脚本人工审核门（生成素材前先确认脚本）</label>
     <label style="margin-top:8px;"><input type="checkbox" id="finalGateEnabled" checked style="width:auto;margin-right:8px;" />启用成片人工审核门（合成后验收成片再交付）</label>
 
@@ -196,10 +210,31 @@ function applyTemplate(t) {
       else el.classList.remove("on");
     });
   }
+  // M4 品牌约束（FR-1.3 的核心价值）：主色与禁用词。
+  // 评审 F1 修复：此前这两个字段存得进、套不出，导致 providers 的约束分支恒不触发。
+  const colorEn = document.getElementById("logoColorEnabled");
+  if (t.logoColor) {
+    document.getElementById("logoColor").value = t.logoColor;
+    colorEn.checked = true;
+  } else {
+    colorEn.checked = false;
+  }
+  document.getElementById("bannedWords").value = (t.bannedWords || []).join("、");
+}
+
+// 读取当前表单的品牌约束（主色 + 禁用词），供保存模板与提交生成共用。
+// 禁用词支持中英文逗号与顿号分隔；未勾选主色则不携带该字段（保持 M3 行为零回归）。
+function readBrandConstraints() {
+  const logoColor = document.getElementById("logoColorEnabled").checked
+    ? document.getElementById("logoColor").value
+    : undefined;
+  const bannedWords = v("bannedWords").split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+  return { logoColor, bannedWords };
 }
 async function saveCurrentAsTemplate() {
   const name = document.getElementById("tplName").value.trim();
   if (!name) { alert("请先填模板名"); return; }
+  const { logoColor, bannedWords } = readBrandConstraints();
   const tpl = {
     name,
     brandName: v("brandName") || undefined,
@@ -207,7 +242,8 @@ async function saveCurrentAsTemplate() {
     coreSellingPoint: v("coreSellingPoint") || undefined,
     defaultTone: [...toneSel][0] || "专业",
     defaultLanguage: v("language"),
-    bannedWords: [],
+    logoColor,
+    bannedWords,
     isPreset: false,
   };
   const r = await fetch("/api/templates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tpl) });
@@ -246,6 +282,7 @@ function setStep(id, status, meta) {
 }
 
 async function submitBrief() {
+  const { logoColor, bannedWords } = readBrandConstraints();
   const brief = {
     brandName: v("brandName"), productName: v("productName"), coreSellingPoint: v("coreSellingPoint"),
     durationSec: Number(v("durationSec")), language: v("language"), voiceTone: v("voiceTone"),
@@ -253,6 +290,9 @@ async function submitBrief() {
     keyMessages: v("keyMessages").split("\n").map(s=>s.trim()).filter(Boolean),
     styleReference: v("styleReference") || undefined, hitlEnabled: document.getElementById("hitlEnabled").checked,
     finalGateEnabled: document.getElementById("finalGateEnabled").checked,
+    // M4 品牌约束（FR-1.3）：评审 F1 修复前这两个字段从未随 brief 提交，
+    // 导致 providers 中 if (brief.logoColor) / if (brief.bannedWords?.length) 恒为假。
+    logoColor, bannedWords,
   };
   if (!brief.brandName || !brief.productName || !brief.coreSellingPoint) { alert("请填品牌名、产品名、核心卖点"); return; }
   document.getElementById("genBtn").disabled = true;

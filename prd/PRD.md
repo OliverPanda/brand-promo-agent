@@ -600,6 +600,7 @@ tests/
 
 ### 16.11.1 M4 范围锁定（相对 §16.10 的增量）
 - ✅ **FR-1.3 模板库（Brand Template）**：用户可保存品牌预设（Logo 主色 / 禁用词 / 默认调性 / 默认语言 / 行业），一键套用以保证调性统一。首次启动自动写入 ≤5 个预置模板（`isPreset=true`，不可删除）。新增 `BrandTemplateSchema` + `templates.js` 写穿持久化（`templates.json`）+ `GET/POST/PUT/DELETE /api/templates` + 前端「模板管理器」。
+  - **品牌约束必须全链路闭环**（评审 F1 教训）：`logoColor` / `bannedWords` 须在「表单采集 → 模板保存 → 模板套用 → Brief 提交 → Provider 注入」五环均接通，任一环漏接都会使 Provider 的 `if (brief.logoColor)` / `if (brief.bannedWords?.length)` 恒为假、能力对终端用户不存在。
 - ✅ **FR-12 多语言（全局语言提示词）**：复用 MingStar 全局语言提示词语义（`src/utils/language.ts`）——**zh-CN 为空、不污染确定性输出**；其余语言在「文本生成」步骤（脚本 / 分镜）prompt 末尾追加「输出语言」指令；TTS 通过 `language` 参数传递；图像 / 音乐为视觉 / 器乐输出，语言已由上游分镜文本承载，不再单独注入。新增 `i18n.js`（`languageInstruction` / `withGlobalLanguage`），并移除 `providers.js` 内旧的局部 `langInstruction` switch（统一收敛到一处）。
 - ✅ **全量上线部署清单（文档化，非本次部署）**：形态 B 的生产化路径在 §16.11.5 给出基线（队列解耦 / 存储升级 / 无状态部署），作为上线 checklist；本期仍以形态 A（单进程 Node + 静态前端）交付，部署清单不阻塞 M4 验收。
 - ⏸️ **本期不做：小程序并入**：按用户 2026-09-03 决策，M4 不含「并入 mingstar-miniapp」这一支柱。网页端仍是唯一交付界面；`src/utils/language.ts`（mingstar-miniapp 侧）的全局语言提示词接口与本品宣 Agent 的 `i18n.js` 保持语义一致、互不依赖。
@@ -609,7 +610,7 @@ tests/
 ```
 src/
 ├── i18n.js               # 【新增】全局语言提示词：languageInstruction / withGlobalLanguage；复用 MingStar 语义（zh-CN 不污染）
-├── templates.js          # 【新增】模板库：写穿持久化(templates.json) + 5 预置 + CRUD + 预置保护 + templateToBrief
+├── templates.js          # 【新增】模板库：写穿持久化(templates.json) + 5 预置 + CRUD + 预置保护(isPresetTemplate 双保险判定)
 ├── schemas.js            # 【修改】BrandBriefSchema 加 logoColor/bannedWords；新增 BrandTemplateSchema + parseTemplate
 ├── mastra/providers.js   # 【修改】移除局部 langInstruction switch，改 withGlobalLanguage 注入；TTS 加 language 参数；
 │                         #         logoColor 注入图像 prompt、bannedWords 注入脚本/分镜 prompt；DEMO 媒体套用 logoColor
@@ -638,7 +639,9 @@ tests/
 - **实体**：`BrandTemplate { id?, name(必填), brandName?, productName?, coreSellingPoint?, logoColor?, bannedWords[], defaultTone(默认"专业"), defaultLanguage(enum LANGUAGES, 默认"zh-CN"), industry?, isPreset(默认false) }`（`BrandTemplateSchema` + `parseTemplate`，非法名抛「name: Required」类错误）。
 - **预置（≤5，不可删）**：`preset-tech`(科技,#0ea5e9) / `preset-guochao`(国潮,#dc2626) / `preset-warm`(温情,#f59e0b) / `preset-luxury`(高端,#111827) / `preset-global-en`(海外英文,en,#1d4ed8)。首启文件缺失时 `hydrate()` 自动写入。
 - **API**：`GET /api/templates`（列出含预置）→ `POST /api/templates`（201 新建，400 非法）→ `PUT /api/templates/:id`（更新）→ `DELETE /api/templates/:id`（404 不存在 / **409 预置不可删** / 200 ok）。
-- **套用**：前端 `applyTemplate(t)` 回填 品牌名/产品名/卖点/语言/默认调性 到 Brief 表单；`templateToBrief(t)` 供后端复用。`saveCurrentAsTemplate()` 将当前表单存为自定义模板。
+- **套用**：前端 `applyTemplate(t)` 回填**全部**模板字段到 Brief 表单——品牌名 / 产品名 / 卖点 / 语言 / 默认调性 **+ 品牌主色 `logoColor`（含启用勾选）+ 禁用词 `bannedWords`**（顿号分隔展示，解析兼容中英文逗号与顿号）。`saveCurrentAsTemplate()` 将当前表单（含品牌约束）存为自定义模板。
+  > 评审 F1 前车之鉴：初版 `applyTemplate` 只回填 5 个基础字段、漏掉 `logoColor`/`bannedWords`，导致模板库最有价值的品牌约束「存得进、套不出」。**套用必须覆盖全部字段，不可只覆盖基础字段。**
+- **主色格式**：`logoColor` 仅接受 `#RGB` / `#RRGGBB`（`LOGO_COLOR` schema，Brief 与 Template 共用）。评审 F6：原为任意 ≤20 字符串，会直接进入 DEMO 的 SVG 填充属性并破坏渲染。
 
 ### 16.11.5 全量上线部署清单（形态 B，checklist 文档化）
 > 本期（M4）仍以形态 A 单进程交付；以下为「全量上线」生产化的明确基线，待运维/部署阶段执行，不阻塞 M4 验收。
@@ -651,11 +654,33 @@ tests/
 
 ### 16.11.6 M4 DoD（验收）
 - [x] 多语言：设 `brief.language="en"`，真实脚本/分镜 prompt 末尾含 `Output in English.`；`generateVoiceover` 真实 TTS body 携带 `language:"en"`；`zh-CN` 下 prompt 零污染（确定性输出不变）。
-- [x] 品牌安全：`brief.bannedWords` 注入脚本/分镜 prompt（真实用例验证「禁用词：最、第一」）；`logoColor` 注入图像 prompt 与 DEMO 占位图主色。
+- [x] 品牌安全：`brief.bannedWords` 注入脚本/分镜 prompt（真实用例验证「禁用词：最、第一」）；`logoColor` 注入分镜/图像 prompt 与 DEMO 占位图主色。
+- [x] **品牌约束全链路闭环（评审 F1）**：表单可采集主色/禁用词 → `applyTemplate` 全字段回填 → `submitBrief` 随 Brief 提交 → Provider 注入生效（真实 + DEMO 双路径均有用例覆盖）。
 - [x] 模板库：`GET /api/templates` 首启返回 5 预置；`POST` 新建自定义、`PUT` 更新、`DELETE` 自定义成功；**DELETE 预置返回 409**；非法模板名 `POST` 返回 400。
-- [x] 前端：模板管理器 UI（列表 + 套用 + 删除 + 保存当前为模板）可用；套用回填 Brief 表单；预置删除按钮禁用。
+- [x] **预设防篡改（评审 F2/F3）**：`POST` 忽略客户端 `id` 与 `isPreset`；`isPreset` 为系统标志位（新建恒 false、更新沿用原值）；预设判定「标志位 + `preset-` 前缀」双保险；伪造 id 覆盖后预设仍存在且不可删。
+- [x] **预置与持久化解耦（评审 F4）**：`PROMO_PERSIST=0` 下 `listTemplates()` 仍返回 5 预置。
+- [x] **PUT 部分更新（评审 F5）**：`PUT` 仅传 `name` 时，`logoColor`/`industry`/`defaultLanguage` 等未传字段保留原值。
+- [x] **主色格式校验（评审 F6）**：非法 `logoColor`（如 `red;background:url(x)`）返回 400。
+- [x] 前端：模板管理器 UI（列表 + 套用 + 删除 + 保存当前为模板）可用；套用回填 Brief 表单**含主色与禁用词**；预置删除按钮禁用。
 - [x] 持久化：模板跨进程写穿 + hydrate 验证通过（`templates.test.mjs` 子进程 round-trip）。
-- [x] 回归：DEMO 模式零密钥端到端仍跑通（分镜画廊 + SRT + 成片门/脚本门），全部 `node --test` 冒烟（M4 新增 10 例，合计 58 例）全绿。
+- [x] 回归：DEMO 模式零密钥端到端仍跑通（分镜画廊 + SRT + 成片门/脚本门），全部 `node --test` 冒烟（M4 合计 **65 例**）全绿；**新增用例经变异测试验证可捕获对应缺陷**（回退任一项修复均有对应用例转红）。
+
+### 16.11.7 关键工程修正（M4 评审，必读）
+
+> M4 首版提交（`475904c`）经深度评审发现 6 项缺陷（详见 [M4 评审报告](./M4-review-2026-09-03.md)），已全部修复并验证。**本节为后续迭代的红线。**
+
+1. **F1 品牌约束闭环断裂（P0）**：初版前端 `applyTemplate()` 只回填 5 个基础字段、漏掉 `logoColor`/`bannedWords`；`submitBrief()` 也不携带二者；`templateToBrief()` 为零调用死代码。后果：Provider 的 `if (brief.logoColor)` / `if (brief.bannedWords?.length)` **恒为假**——模板库最有价值的品牌约束对终端用户完全不存在。**修复**：表单增主色（color input + 启用勾选，默认关闭以保证 M3 零回归）与禁用词输入；采集/套用/提交三处全部接通；删除死代码。
+2. **F2 预设可覆盖删除（P1）**：`POST /api/templates` 直接 `saveTemplate(req.body)`，而 `id`/`isPreset` 均客户端可控 → `POST {id:"preset-tech", isPreset:false}` 即可覆盖并删除预设；删光后 `templates.json` 变 `[]`，重启因 `fs.existsSync` 为真不再重注 → **5 个预设永久丢失**。**修复**：服务端剥离 `id`/`isPreset`；数据层 `isPreset` 强制「新建 false / 更新沿用原值」；判定用「标志位 + `preset-` 前缀」双保险。
+3. **F3 僵尸模板（P1）**：`POST {isPreset:true}` 可造出永不可删模板。**修复**：同 F2，服务端强制 `isPreset:false`。
+4. **F4 预置被持久化开关劫持（P1）**：`hydrate()` 首行 `if (!persistEnabled()) return;` 吞掉预置注入 → `PROMO_PERSIST=0` 下预置数为 **0**（应为 5）。**修复**：预置注入前置且无条件，仅读盘/写盘受开关控制。
+5. **F5 PUT 全量替换（P2）**：`saveTemplate({...req.body, id})` 使部分更新静默丢字段（实测只传 `name` 后 `logoColor`/`industry` 变 undefined、语言退回默认 zh-CN）。**修复**：`PUT` 改为 `{...prev, ...body, id}` merge，且要求目标已存在（否则 404）。
+6. **F6 主色无格式校验（P2）**：任意 ≤20 字符串可进入 DEMO 的 SVG 填充属性破坏渲染。**修复**：加 `#RGB`/`#RRGGBB` 正则（`LOGO_COLOR`，Brief 与 Template 共用）。
+
+**方法论红线（本次评审最大教训）**：
+- **测试全绿 ≠ 行为正确**。F5 被既有用例「通过」掩盖——该用例只断言 `name`，对「全量替换」与「merge」两种语义都成立。新增用例必须能区分正确实现与错误实现。
+- **新能力须验「UI → 提交 → Provider 生效」全链路**，不能只验后端单元。F1 的后端用例全是绿的，但前端根本没接线。
+- **服务端必须剥离客户端可控的权限/标志位字段**（`id`、`isPreset`、`role` 一类），不可直接透传 `req.body`。
+- **交付前对新增用例做变异测试**：逐个回退修复，确认对应用例转红。本次 4 项变异（F2/F3、F4、F5、F6）全部被捕获。
 
 ---
 

@@ -91,4 +91,12 @@
 
 **全量上线部署清单（形态 B，文档化）**：本 M4 仍以形态 A（单进程 Node + 静态前端）交付；生产化路径已基线与 §16.11.5：BullMQ/SQS 队列解耦请求与执行、PostgreSQL/LibSQL 升级存储、`store.js`/`quota.js` 写穿抽象预留 `DATA_DIR` 迁移点、Vercel/Cloudflare 部署静态前端 + 无状态 API、密钥仅服务端 + 上线前接入四大阻断域计费。
 
-**验证**：`node --test tests/` 全绿（**58 例**，M4 新增 10 例：i18n zh-CN 不污染 / en·ja·ko·zh-TW 追加 / 未知语言不污染 3 例；templates 预置种子 + CRUD + 预置保护 + 跨进程写穿 2 例；providers TTS 携带 `language:"en"` / 分镜注入 `Output in English.` / 脚本注入禁用词 3 例；server 模板经 `/api/templates` CRUD + 非法名 400 2 例）；DEMO 与 real 两路径均端到端跑通，含多语言与模板库；无新增 Mastra v1.63 引擎陷阱（M3 Gotcha 4 仍成立）。
+**验证**：`node --test tests/` 全绿（**65 例**）；DEMO 与 real 两路径均端到端跑通，含多语言与模板库；无新增 Mastra v1.63 引擎陷阱（M3 Gotcha 4 仍成立）。
+
+**M4 评审与修复（同日深度评审发现 6 项缺陷，已全部修复；详见 PRD §16.11.7 与 [评审报告](./M4-review-2026-09-03.md)）**：
+- **P0 F1**：模板库的 `logoColor` / `bannedWords` **存得进、套不出、提不了**（前端采集/套用/提交三处漏接，`templateToBrief` 为零调用死代码），致 Provider 的约束分支恒不触发 —— 已接通「采集 → 保存 → 套用 → 提交 → 注入」全链路。
+- **P1 F2/F3**：`POST /api/templates` 直接透传 `req.body`，`id` / `isPreset` 客户端可控 → 可覆盖并**永久删除 5 个预设**（删光后重启不再重注），或伪造 `isPreset:true` 造出永不可删僵尸 —— 已改为服务端剥离标志位 + 数据层强制「新建 false / 更新沿用原值」+ 「标志位 + `preset-` 前缀」双保险判定。
+- **P1 F4**：预置注入被 `PROMO_PERSIST` 开关劫持（关闭时预置数为 0）—— 已解耦，预置无条件注入内存。
+- **P2 F5/F6**：`PUT` 全量替换静默丢字段 —— 已改 merge 语义；`logoColor` 无格式校验可破坏 DEMO SVG 渲染 —— 已加 `#RGB`/`#RRGGBB` 正则。
+
+**测试补强与有效性验证**：新增 7 例（品牌主色注入真实 + DEMO 双路径、`isPreset` 标志位防篡改、伪造 id/isPreset 被拒、`PROMO_PERSIST=0` 预置、PUT 字段保留、非法主色 400），合计 65 例。并做**变异测试**：逐个回退 F2/F3、F4、F5、F6 的修复，对应新增用例均转红（**4/4 捕获**），确认用例非「永远通过」——本次评审的最大教训正是「测试全绿 ≠ 行为正确」（F5 曾被既有用例掩盖）。

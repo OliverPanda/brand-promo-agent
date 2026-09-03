@@ -204,3 +204,80 @@ test("模板库端点（M4）：非法模板名返回 400", async () => {
     server.close();
   }
 });
+
+test("模板库端点（M4）：伪造 id / isPreset 被服务端拒绝（评审 F2/F3）", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    // 修复前：saveTemplate(req.body) 使 id/isPreset 完全客户端可控 ——
+    // POST {id:"preset-tech", isPreset:false} 即可覆盖预设并将其删除（5 个预设永久丢失）。
+    const r = await fetch(`${BASE(port)}/api/templates`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "preset-tech", name: "越权覆盖", isPreset: false }),
+    });
+    assert.equal(r.status, 201);
+    const created = await r.json();
+    assert.notEqual(created.id, "preset-tech", "服务端应忽略客户端传入的 id");
+    assert.equal(created.isPreset, false, "isPreset 应被强制为 false（防僵尸模板）");
+
+    const list = await (await fetch(`${BASE(port)}/api/templates`)).json();
+    const preset = list.find((x) => x.id === "preset-tech");
+    assert.ok(preset, "预设模板应仍然存在，未被覆盖或删除");
+    assert.equal(preset.isPreset, true, "预设的 isPreset 不应被降格");
+
+    const del = await fetch(`${BASE(port)}/api/templates/preset-tech`, { method: "DELETE" });
+    assert.equal(del.status, 409, "预设模板不可删除");
+
+    await fetch(`${BASE(port)}/api/templates/${created.id}`, { method: "DELETE" });
+  } finally {
+    server.close();
+  }
+});
+
+test("模板库端点（M4）：PUT 部分更新保留其余字段（评审 F5）", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const r0 = await fetch(`${BASE(port)}/api/templates`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "全量模板", logoColor: "#0ea5e9", industry: "科技", defaultLanguage: "en" }),
+    });
+    const t = await r0.json();
+
+    // 修复前：saveTemplate({...req.body, id}) 为全量替换，只传 name 会静默清空其余字段。
+    const r = await fetch(`${BASE(port)}/api/templates/${t.id}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "只改名" }),
+    });
+    assert.equal(r.status, 200);
+    const after = await r.json();
+    assert.equal(after.name, "只改名");
+    assert.equal(after.logoColor, "#0ea5e9", "未传字段应保留");
+    assert.equal(after.industry, "科技", "未传字段应保留");
+    assert.equal(after.defaultLanguage, "en", "未传字段不应退回默认值");
+
+    await fetch(`${BASE(port)}/api/templates/${t.id}`, { method: "DELETE" });
+  } finally {
+    server.close();
+  }
+});
+
+test("模板库端点（M4）：非法 logoColor 返回 400（评审 F6）", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    // 修复前仅校验 max(20)，任意字符串可进入 DEMO 的 SVG 填充属性并破坏图形渲染。
+    const r = await fetch(`${BASE(port)}/api/templates`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "坏主色", logoColor: "red;background:url(x)" }),
+    });
+    assert.equal(r.status, 400);
+    const j = await r.json();
+    assert.match(j.error, /主色/);
+  } finally {
+    server.close();
+  }
+});

@@ -3,9 +3,12 @@
 //
 // 设计要点（与 store.js 同构）：
 //  - 内存 Map 为读缓存；每次写操作同步写穿到磁盘 JSON（原子 temp→rename）。
-//  - PROMO_PERSIST=0 时关闭写穿与启动 hydrate（测试用，内存态）。
-//  - 首次启动（模板文件不存在）自动写入 ≤5 个预置模板（isPreset=true）。
-//  - 预设模板不可删除（deleteTemplate 对预设返回 false，由 server 转 409）。
+//  - PROMO_PERSIST=0 时关闭读盘与写穿（测试用，内存态）——但预置模板仍须注入（见 hydrate）。
+//  - 预置模板（isPreset=true / id 前缀 "preset-"）不可删除。
+//
+// 安全约束（M4 评审 F2/F3 修复）：
+//  - isPreset 是系统标志位，绝不由调用方设置：新建恒 false，更新沿用原值。
+//  - 预设判定用「标志位 + id 前缀」双保险，避免标志位被污染后保护失效。
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -45,15 +48,23 @@ const PRESETS = [
   },
 ];
 
+/** 预设模板判定：标志位 + id 前缀双保险（评审 F2/F3）。 */
+export function isPresetTemplate(t) {
+  return !!(t && (t.isPreset === true || String(t.id || "").startsWith("preset-")));
+}
+
 function hydrate() {
+  // FR-1.3：预置是产品行为，与持久化开关无关 —— 先无条件注入内存。
+  // 否则 PROMO_PERSIST=0 时 listTemplates() 返回空数组，模板库形同不存在（评审 F4）。
+  for (const p of PRESETS) templates.set(p.id, { ...p });
+
   if (!persistEnabled()) return;
   try {
     if (fs.existsSync(TPL_FILE)) {
       const arr = JSON.parse(fs.readFileSync(TPL_FILE, "utf8"));
+      // 磁盘数据覆盖内存（含用户对预设的合法改动）；异常条目跳过，不覆盖预置。
       if (Array.isArray(arr)) for (const t of arr) if (t && t.id) templates.set(t.id, t);
     } else {
-      // 首次：写入预置模板
-      for (const p of PRESETS) templates.set(p.id, p);
       persist();
     }
   } catch (e) {
@@ -84,10 +95,13 @@ export function getTemplate(id) {
 }
 
 // 创建或更新（按 id 存在判定）。校验经 BrandTemplateSchema。
+// 注意：isPreset 为系统标志位，新建恒 false、更新沿用原值，调用方无法篡改（评审 F2/F3）。
 export function saveTemplate(input) {
   const data = parseTemplate(input || {});
   const id = data.id || randomUUID();
-  const tpl = { ...data, id, isPreset: data.isPreset ?? false };
+  const prev = templates.get(id);
+  const isPreset = prev ? prev.isPreset === true : false;
+  const tpl = { ...data, id, isPreset };
   templates.set(id, tpl);
   persist();
   return tpl;
@@ -97,21 +111,8 @@ export function saveTemplate(input) {
 export function deleteTemplate(id) {
   const t = templates.get(id);
   if (!t) return false;
-  if (t.isPreset) return false;
+  if (isPresetTemplate(t)) return false;
   templates.delete(id);
   persist();
   return true;
-}
-
-// 将模板回灌为 Brief 字段（前端亦可直接读取模板字段合并；此函数供服务端/测试复用）。
-export function templateToBrief(tpl) {
-  return {
-    brandName: tpl.brandName || "",
-    productName: tpl.productName || "",
-    coreSellingPoint: tpl.coreSellingPoint || "",
-    tones: [tpl.defaultTone].filter(Boolean),
-    language: tpl.defaultLanguage || "zh-CN",
-    logoColor: tpl.logoColor,
-    bannedWords: tpl.bannedWords || [],
-  };
 }

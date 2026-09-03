@@ -5,6 +5,13 @@ import { z } from "zod";
 export const LANGUAGES = ["zh-CN", "zh-TW", "en", "ja", "ko"];
 export const DURATIONS = [15, 30, 60, 90];
 
+// 品牌主色：仅接受 #RGB / #RRGGBB。
+// M4 评审 F6：原为任意 ≤20 字符串，会直接进入 DEMO 的 SVG 填充属性，可破坏图形渲染。
+export const LOGO_COLOR = z
+  .string()
+  .regex(/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/, "主色须为 #RGB 或 #RRGGBB 格式")
+  .optional();
+
 export const BrandBriefSchema = z.object({
   brandName: z.string().min(1, "品牌名必填").max(60),
   productName: z.string().min(1, "产品名必填").max(60),
@@ -19,7 +26,7 @@ export const BrandBriefSchema = z.object({
   hitlEnabled: z.boolean().default(true),
   finalGateEnabled: z.boolean().default(true),
   // M4 模板库：Logo 主色 / 禁用词（从品牌模板回灌，用于约束生成与配色统一）
-  logoColor: z.string().max(20).optional(),
+  logoColor: LOGO_COLOR,
   bannedWords: z.array(z.string()).default([]),
 });
 
@@ -30,7 +37,7 @@ export const BrandTemplateSchema = z.object({
   brandName: z.string().max(60).optional(),
   productName: z.string().max(60).optional(),
   coreSellingPoint: z.string().max(60).optional(),
-  logoColor: z.string().max(20).optional(),
+  logoColor: LOGO_COLOR,
   bannedWords: z.array(z.string()).default([]),
   defaultTone: z.string().default("专业"),
   defaultLanguage: z.enum(LANGUAGES).default("zh-CN"),
