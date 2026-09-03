@@ -50,6 +50,35 @@ test("classifyRemoteModels：去重 + 保序 + 混合输入", () => {
   assert.deepEqual(byType.image, ["doubao-seedream-4-0-250828"]);
 });
 
+test("classifyModelId：视频子能力 API 回落真实归类（B 收紧，2026-09 实测清单）", () => {
+  // 同族但非视频生成本体的子接口：image/tts/effects/lip-sync/control/识别/角色/检测 → 不得归 video
+  const subApis = [
+    "kling-image", "kling-image-2-1", "kling-multi-image2image", "kling-kolors-virtual-try-on",
+    "kling-tts", "kling-text-to-audio", "kling-video-to-audio", "kling-voices-list",
+    "kling-presets-xxx", "kling-lip-sync", "kling-advanced-lip-sync", "kling-effects",
+    "kling-identify-face", "kling-meta-human", "kling-custom-train", "kling-video-motion-control",
+    "kling-video-multi-prompt", "kling-video-extend", "runway-act_one", "runway-act_two", "runway-aleph",
+    "wan2.2-animate-mix", "wan2.2-s2v-detect", "veo3.1-components", "veo3.1-fast-components",
+    "veo3.1-fast-components-4K", "sora_image", "sora-characters",
+    "pixverse-character",
+  ];
+  for (const id of subApis) {
+    const cat = classifyModelId(id);
+    assert.notEqual(cat, "video", `${id} 是子能力 API，不应归 video（实际 ${cat}）`);
+    assert.ok(["audio", "image", "llm"].includes(cat), `${id} 应回落到真实类（实际 ${cat}）`);
+  }
+  // 真正的生成本体不受影响，仍归 video
+  const coreApis = [
+    "kling-video-v1-6", "kling-v2-6", "kling-v3", "kling-o1", "doubao-seedance-2-0-260128",
+    "doubao-seedance-2-5-260628", "dreamina-seedance-2-0", "wan2.2-i2v-flash", "wan2.6-t2v",
+    "hunyuan-video-pro", "veo3.1", "runway-generate", "runway-video2video", "sora-2", "hailuo-02",
+    "pika-generate", "luma-video", "cogvideox-flash",
+  ];
+  for (const id of coreApis) {
+    assert.equal(classifyModelId(id), "video", `${id} 是真生成本体，应归 video`);
+  }
+});
+
 test("demoVideoChoices：非空占位（仅声明路由演示）", () => {
   const c = demoVideoChoices();
   assert.ok(Array.isArray(c) && c.length >= 1);

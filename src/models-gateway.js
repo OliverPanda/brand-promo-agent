@@ -34,10 +34,17 @@ const TYPE_MAP = {
 const VIDEO_RE = /kling|veo|seedance|runway|cogvideox|cogvideo|wan[0-9]|hunyuan[-_]?video|luma|pika|dreamina|pixverse|vividi|hailuo|mochi|sora|minimax[-_]?video|doubao[-_]?video|即梦|可灵|海螺/i;
 const AUDIO_RE = /\b(tts|speech|voice|audio|music)\b|mureka|suno|iceberg|elevenlabs|bark|dictvoice|minimax[-_]?audio|doubao[-_]?tts|chatts/i;
 const IMAGE_RE = /seedream|stable[-_]?diffusion|\bsd3\b|dall[-_]?e|dall|flux|midjourney|\bmj[-_]?|gpt[-_]?image|\bimage\b|wanx|tongyi[-_]?image|doubao[-_]?image|kolors|nano[-_]?banana|可图/i;
+// 视频「子能力」API 黑名单：与视频生成本体同家族的图像/语音/特效/口型/运动控制/元素编辑/检测/角色
+// 等子接口（new-api 聚合渠道按厂商全套展开，同名子 API 会被 VIDEO_RE 误收）。命中后回落
+// audio/image/llm 真实归类（或 llm 兜底），确保 video 类只保留「能直接出动态片」的生成本体。
+// 注：名单按实测网关清单维护（2026-09，new-api v0.13.2）；新增同族子 API 按形如
+// `kling-<image|tts|effects|lip-sync|...>` 的模式自增，不必穷举。
+const VIDEO_SUB_RE = /kling-(?:image|multi-image2image|kolors|tts|text-to-audio|video-to-audio|voices-list|presets-|lip-sync|advanced-lip-sync|effects|identify-face|meta-human|custom-|video-extend|video-motion-control|video-multi-)|runway-(?:act_|aleph)|sora[_-](?:image|characters)|wan[0-9]\.[0-9][_-](?:animate|s2v-detect)|veo[0-9a-z.-]*components|pixverse-character/i;
 
 function classifyByKeywords(id) {
   const s = String(id);
-  if (VIDEO_RE.test(s)) return "video";
+  // 视频关键词命中但属「子能力 API」→ 不判 video，落到 audio/image/llm 真实归类
+  if (VIDEO_RE.test(s) && !VIDEO_SUB_RE.test(s)) return "video";
   if (AUDIO_RE.test(s)) return "audio";
   if (IMAGE_RE.test(s)) return "image";
   return "llm"; // 兜底归文本模型
