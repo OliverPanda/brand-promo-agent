@@ -8,6 +8,7 @@ import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { parseBrief } from "./schemas.js";
+import { listTemplates, getTemplate, saveTemplate, deleteTemplate } from "./templates.js";
 import {
   newRunId,
   createRun,
@@ -254,6 +255,36 @@ app.get("/api/config", (_req, res) =>
     provider: getProviderMode() === "real" ? "one-api" : "demo",
   })
 );
+
+// ── 模板库（M4 / FR-1.3）：品牌预设的保存 / 复用，保证调性统一 ──
+app.get("/api/templates", (_req, res) => res.json(listTemplates()));
+
+app.post("/api/templates", (req, res) => {
+  try {
+    const tpl = saveTemplate(req.body);
+    res.status(201).json(tpl);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.put("/api/templates/:id", (req, res) => {
+  try {
+    const tpl = saveTemplate({ ...req.body, id: req.params.id });
+    res.json(tpl);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/templates/:id", (req, res) => {
+  const t = getTemplate(req.params.id);
+  if (!t) return res.status(404).json({ error: "template not found" });
+  if (t.isPreset) return res.status(409).json({ error: "预设模板不可删除" });
+  const ok = deleteTemplate(req.params.id);
+  if (!ok) return res.status(404).json({ error: "template not found" });
+  res.json({ ok: true });
+});
 
 function round4(n) {
   return Math.round((n + Number.EPSILON) * 10000) / 10000;

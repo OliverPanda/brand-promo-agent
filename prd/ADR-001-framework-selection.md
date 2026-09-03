@@ -74,3 +74,21 @@
 **成本双闸门**：`workflow.recordCost` 对真实 `_usage` 先 `checkBudget(单 run PROMO_BUDGET_CAP)` 再 `checkQuota(账户 PROMO_QUOTA_CAP)`，均超限即中止。新增 `GET /api/quota`、`GET /api/admin/costs`、`/api/config.quotaCap`。
 
 **验证**：`node --test tests/` 全绿（48 例，M3 新增 13 例：store-persist 子进程 round-trip、quota 配额/累计/QuotaExceededError、server 成片门 awaiting→approve / reject→重生成、/api/quota、providers 参考图 data:/URL/关键词 三用例、workflow 极小配额触发 QuotaExceededError）；DEMO 与 real 两路径均端到端跑通，含两段 HITL 门与历史持久化。
+
+## 7. M4 执行记录（v0.5 更新）
+
+**范围延展**：M4 按 §13 落地 **FR-1.3 模板库** 与 **FR-12 多语言全球化**，并补充「全量上线」部署清单（形态 B 生产化路径，文档化 checklist）。本期**小程序并入**按用户 2026-09-03 决策不做；网页端仍是唯一交付界面，与 mingstar-miniapp 的 `src/utils/language.ts` 全局语言提示词保持语义一致、互不依赖。
+
+**多语言（FR-12，复用 MingStar 语义）**：
+- 新增 `src/i18n.js`，以 `languageInstruction(lang)` + `withGlobalLanguage(prompt, lang)` 实现全局语言提示词；**zh-CN 故意为空、不向 prompt 注入任何指令**（与 MingStar「zh-CN instruction 为空不污染」规则一致），未知语言回落为空亦不污染。
+- `src/mastra/providers.js` 移除旧的局部 `langInstruction` switch，统一改为 `withGlobalLanguage` 注入点：脚本 / 分镜 文本生成步骤末尾追加「输出语言」指令；TTS 经 one-api `/audio/speech` 的 `language` 参数传递（非 prompt）；图像 / 音乐为视觉 / 器乐输出，仅承接上游已含语言信息的分镜文本，不单独注入语言指令。
+
+**模板库（FR-1.3）**：
+- 新增 `src/templates.js`（写穿持久化 `templates.json`，与 `store.js`/`quota.js` 同范式：`temp→rename` + `PROMO_PERSIST`/`PROMO_DATA_DIR` 门控 + 启动 hydrate）；首启自动写入 ≤5 个预置模板（`isPreset=true`，不可删除）。
+- 新增 `BrandTemplateSchema` + `parseTemplate`（`src/schemas.js`），`BrandBriefSchema` 增加 `logoColor`/`bannedWords`（品牌约束，经模板套用或表单直填）。
+- `src/server.js` 新增 `GET/POST/PUT/DELETE /api/templates`：预置模板 `DELETE` 返回 **409 不可删**；非法模板名 `POST` 返回 400。
+- `public/index.html` 新增「模板管理器」UI（列表 / 套用 / 删除 / 保存当前为模板），`applyTemplate` 回填 Brief 表单、`templateToBrief` 供后端复用。
+
+**全量上线部署清单（形态 B，文档化）**：本 M4 仍以形态 A（单进程 Node + 静态前端）交付；生产化路径已基线与 §16.11.5：BullMQ/SQS 队列解耦请求与执行、PostgreSQL/LibSQL 升级存储、`store.js`/`quota.js` 写穿抽象预留 `DATA_DIR` 迁移点、Vercel/Cloudflare 部署静态前端 + 无状态 API、密钥仅服务端 + 上线前接入四大阻断域计费。
+
+**验证**：`node --test tests/` 全绿（**58 例**，M4 新增 10 例：i18n zh-CN 不污染 / en·ja·ko·zh-TW 追加 / 未知语言不污染 3 例；templates 预置种子 + CRUD + 预置保护 + 跨进程写穿 2 例；providers TTS 携带 `language:"en"` / 分镜注入 `Output in English.` / 脚本注入禁用词 3 例；server 模板经 `/api/templates` CRUD + 非法名 400 2 例）；DEMO 与 real 两路径均端到端跑通，含多语言与模板库；无新增 Mastra v1.63 引擎陷阱（M3 Gotcha 4 仍成立）。

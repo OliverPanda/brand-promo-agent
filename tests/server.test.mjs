@@ -161,3 +161,46 @@ test("GET /api/quota：返回账户累计与剩余配额", async () => {
     server.close();
   }
 });
+
+test("模板库端点（M4）：创建/列出/删除自定义模板", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    let r = await fetch(`${BASE(port)}/api/templates`);
+    assert.equal(r.status, 200);
+    assert.ok(Array.isArray(await r.json()));
+
+    r = await fetch(`${BASE(port)}/api/templates`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "T1", defaultTone: "科技感", defaultLanguage: "en" }),
+    });
+    assert.equal(r.status, 201);
+    const t = await r.json();
+    assert.ok(t.id, "应分配 id");
+
+    const list1 = await (await fetch(`${BASE(port)}/api/templates`)).json();
+    assert.ok(list1.find((x) => x.id === t.id), "列表应包含新模板");
+
+    r = await fetch(`${BASE(port)}/api/templates/${t.id}`, { method: "DELETE" });
+    assert.equal(r.status, 200);
+    const list2 = await (await fetch(`${BASE(port)}/api/templates`)).json();
+    assert.ok(!list2.find((x) => x.id === t.id), "删除后不应在列表");
+  } finally {
+    server.close();
+  }
+});
+
+test("模板库端点（M4）：非法模板名返回 400", async () => {
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const r = await fetch(`${BASE(port)}/api/templates`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    server.close();
+  }
+});

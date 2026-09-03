@@ -18,7 +18,34 @@ export const BrandBriefSchema = z.object({
   voiceTone: z.string().default("男声"),
   hitlEnabled: z.boolean().default(true),
   finalGateEnabled: z.boolean().default(true),
+  // M4 模板库：Logo 主色 / 禁用词（从品牌模板回灌，用于约束生成与配色统一）
+  logoColor: z.string().max(20).optional(),
+  bannedWords: z.array(z.string()).default([]),
 });
+
+// 品牌模板（FR-1.3 / M4 模板库）：市场运营保存一套品牌预设，下次一键套用，保证调性统一。
+export const BrandTemplateSchema = z.object({
+  id: z.string().optional(),
+  name: z.string().min(1, "模板名必填").max(40),
+  brandName: z.string().max(60).optional(),
+  productName: z.string().max(60).optional(),
+  coreSellingPoint: z.string().max(60).optional(),
+  logoColor: z.string().max(20).optional(),
+  bannedWords: z.array(z.string()).default([]),
+  defaultTone: z.string().default("专业"),
+  defaultLanguage: z.enum(LANGUAGES).default("zh-CN"),
+  industry: z.string().max(40).optional(),
+  isPreset: z.boolean().default(false),
+});
+
+export function parseTemplate(input) {
+  const r = BrandTemplateSchema.safeParse(input || {});
+  if (!r.success) {
+    const msg = r.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ");
+    throw new Error(msg);
+  }
+  return r.data;
+}
 
 export function parseBrief(input) {
   const r = BrandBriefSchema.safeParse(input || {});

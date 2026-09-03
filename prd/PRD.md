@@ -2,12 +2,12 @@
 
 | 项 | 内容 |
 |----|------|
-| 文档版本 | v0.4（M1 + M2 + M3 执行基线） |
+| 文档版本 | v0.5（M1 + M2 + M3 + M4 执行基线） |
 | 日期 | 2026-09-03 |
 | 负责人 | 铭星链 MingStar 主理人 / 交付总监 |
 | 架构选型 | **Mastra（TypeScript）** —— 见 [ADR-001](./ADR-001-framework-selection.md) |
 | 交付形态 | 网页端（Web）单页应用 + 后端 Agent 工作流服务 |
-| 状态 | M1（DEMO）+ M2（真实 one-api Provider + 成本预算）+ M3（HITL 成片门 + 账户配额 + 历史持久化 + 参考图图生图）已完成；**可上线内测**。待 M4（模板库 + 多语言 + 小程序并入） |
+| 状态 | M1（DEMO）+ M2（真实 one-api Provider + 成本预算）+ M3（HITL 成片门 + 账户配额 + 历史持久化 + 参考图图生图）+ **M4（模板库 + 多语言）已完成**；**全量上线就绪（部署清单见 §16.11）**。本期**小程序并入** 按用户决策不做（详见 §16.11.1 范围锁定） |
 
 ---
 
@@ -359,7 +359,7 @@ interface PromoRun {
 | M1 | 选型 + PRD + 架构（本期） | 本文档 + ADR-001 + Web 原型（DEMO） |
 | M2 | 真实 Provider 接入（one-api/ai-core）+ FR-10 成本预算 | 产出真实 MP4 + 成本归集与预算闸门（详见 §16.9） |
 | M3 | HITL 完整化 + 成本配额 + 历史记录 | 可上线内测（已完成，见 §16.10） |
-| M4 | 模板库 + 多语言 + 小程序并入 | 全量上线 |
+| M4 | 模板库 + 多语言（**小程序并入按用户决策本期不做**） | 全量上线就绪（部署清单见 §16.11） |
 
 ---
 
@@ -591,6 +591,71 @@ tests/
 - [x] 参考图：`styleReference` 为 data:/URL 时真实分支携带 `image` 字段走图生图；纯关键词追加 prompt。
 - [x] DEMO 模式零密钥端到端仍跑通（分镜画廊 + SRT + 成片门/脚本门），且全部 `node --test` 冒烟（M3 新增 13 例，合计 48 例）全绿。
 - [x] 前端「成片验收门」UI（final-review 监听 + approve/reject）+ 成片门/配额勾选与展示。
+
+---
+
+## 16.11 M4 执行基线（v0.5 新增，模板库 + 多语言 + 全量上线就绪）
+
+> M4 按 §13 落地 **FR-1.3 模板库** 与 **FR-12 多语言全球化**，并补充「全量上线」部署清单（形态 B 的生产化路径）。**小程序并入按用户决策本期不做**（见 §16.11.1）。M4 沿用 M1~M3 的「env 门控真实代码 + DEMO 完整保留」范式，`PROMO_PROVIDER_MODE` 切换不影响任何确定性路径；全部 `node --test` 冒烟由 48 → **58 例**全绿。
+
+### 16.11.1 M4 范围锁定（相对 §16.10 的增量）
+- ✅ **FR-1.3 模板库（Brand Template）**：用户可保存品牌预设（Logo 主色 / 禁用词 / 默认调性 / 默认语言 / 行业），一键套用以保证调性统一。首次启动自动写入 ≤5 个预置模板（`isPreset=true`，不可删除）。新增 `BrandTemplateSchema` + `templates.js` 写穿持久化（`templates.json`）+ `GET/POST/PUT/DELETE /api/templates` + 前端「模板管理器」。
+- ✅ **FR-12 多语言（全局语言提示词）**：复用 MingStar 全局语言提示词语义（`src/utils/language.ts`）——**zh-CN 为空、不污染确定性输出**；其余语言在「文本生成」步骤（脚本 / 分镜）prompt 末尾追加「输出语言」指令；TTS 通过 `language` 参数传递；图像 / 音乐为视觉 / 器乐输出，语言已由上游分镜文本承载，不再单独注入。新增 `i18n.js`（`languageInstruction` / `withGlobalLanguage`），并移除 `providers.js` 内旧的局部 `langInstruction` switch（统一收敛到一处）。
+- ✅ **全量上线部署清单（文档化，非本次部署）**：形态 B 的生产化路径在 §16.11.5 给出基线（队列解耦 / 存储升级 / 无状态部署），作为上线 checklist；本期仍以形态 A（单进程 Node + 静态前端）交付，部署清单不阻塞 M4 验收。
+- ⏸️ **本期不做：小程序并入**：按用户 2026-09-03 决策，M4 不含「并入 mingstar-miniapp」这一支柱。网页端仍是唯一交付界面；`src/utils/language.ts`（mingstar-miniapp 侧）的全局语言提示词接口与本品宣 Agent 的 `i18n.js` 保持语义一致、互不依赖。
+- ⏸️ **仍推迟（与 §2.2 / §15 一致）**：真实支付 / 计费扣星钻、四大阻断域分润回写（仅预留 `PromoRun.cost` 结构与配额扣减，未接 ai-core 计费）；A/B 多概念并行探索（架构预留 `.parallel()`，本期无 UI）。
+
+### 16.11.2 M4 文件落地清单
+```
+src/
+├── i18n.js               # 【新增】全局语言提示词：languageInstruction / withGlobalLanguage；复用 MingStar 语义（zh-CN 不污染）
+├── templates.js          # 【新增】模板库：写穿持久化(templates.json) + 5 预置 + CRUD + 预置保护 + templateToBrief
+├── schemas.js            # 【修改】BrandBriefSchema 加 logoColor/bannedWords；新增 BrandTemplateSchema + parseTemplate
+├── mastra/providers.js   # 【修改】移除局部 langInstruction switch，改 withGlobalLanguage 注入；TTS 加 language 参数；
+│                         #         logoColor 注入图像 prompt、bannedWords 注入脚本/分镜 prompt；DEMO 媒体套用 logoColor
+├── server.js             # 【修改】新增 GET/POST/PUT/DELETE /api/templates（预置 DELETE 返回 409）
+└── mastra/svg.js         # 【不变】
+public/index.html          # 【修改】新增模板管理器 UI（#tplCard：列表/套用/删除/保存当前为模板）
+.env.example             # 【不变】（沿用 M3 的 PROMO_PERSIST/PROMO_DATA_DIR）
+tests/
+├── i18n.test.mjs          # 【新增】zh-CN 不污染 / en·ja·ko·zh-TW 追加 / 未知语言不污染（3 例）
+├── templates.test.mjs     # 【新增】预置种子 + CRUD + 预置保护 + 非法名抛错 + 跨进程写穿持久化（2 例）
+├── providers-real.test.mjs# 【修改】TTS 携带 language:"en" / 分镜注入 "Output in English." / 脚本注入禁用词（3 例）
+└── server.test.mjs        # 【修改】模板创建/列表/删除 经 /api/templates；非法模板名返回 400（2 例）
+```
+
+### 16.11.3 多语言注入点（FR-12 落地映射）
+| 步骤 | 注入方式 | 说明 |
+|------|----------|------|
+| 脚本生成 `generateScript` | `user = withGlobalLanguage(user, brief.language)` | 文本生成，末尾追加「输出语言」指令；`bannedWords` 一并发「禁用词：…」 |
+| 分镜生成 `generateStoryboard` | `user = withGlobalLanguage(user, brief.language)` | 文本生成，同上；`logoColor` 一并发「品牌主色 …」约束 |
+| 场景素材 `generateSceneMedia` | `prompt += '；主色 ' + brief.logoColor`（仅当设主色） | 视觉生成，仅注入品牌主色（弱语言学），不注入语言指令 |
+| 配音 `generateVoiceover` | TTS body `language: brief.language \|\| "zh-CN"` | 经 one-api `/audio/speech` 的 `language` 参数传递（非 prompt） |
+| DEMO 媒体 `demoSceneMedia` | `c1 = brief.logoColor \|\| paletteFor(...)` | 占位图主色套用品牌主色 |
+> 语义约定：**zh-CN 为空不污染**（与 MingStar 规则一致），故 `withGlobalLanguage("...", "zh-CN")` 原样返回；未知 `language` 回落为空指令，亦不污染。图像 / 音乐无语言学输出，仅承接上游文本已含的语言信息。
+
+### 16.11.4 模板库契约（FR-1.3）
+- **实体**：`BrandTemplate { id?, name(必填), brandName?, productName?, coreSellingPoint?, logoColor?, bannedWords[], defaultTone(默认"专业"), defaultLanguage(enum LANGUAGES, 默认"zh-CN"), industry?, isPreset(默认false) }`（`BrandTemplateSchema` + `parseTemplate`，非法名抛「name: Required」类错误）。
+- **预置（≤5，不可删）**：`preset-tech`(科技,#0ea5e9) / `preset-guochao`(国潮,#dc2626) / `preset-warm`(温情,#f59e0b) / `preset-luxury`(高端,#111827) / `preset-global-en`(海外英文,en,#1d4ed8)。首启文件缺失时 `hydrate()` 自动写入。
+- **API**：`GET /api/templates`（列出含预置）→ `POST /api/templates`（201 新建，400 非法）→ `PUT /api/templates/:id`（更新）→ `DELETE /api/templates/:id`（404 不存在 / **409 预置不可删** / 200 ok）。
+- **套用**：前端 `applyTemplate(t)` 回填 品牌名/产品名/卖点/语言/默认调性 到 Brief 表单；`templateToBrief(t)` 供后端复用。`saveCurrentAsTemplate()` 将当前表单存为自定义模板。
+
+### 16.11.5 全量上线部署清单（形态 B，checklist 文档化）
+> 本期（M4）仍以形态 A 单进程交付；以下为「全量上线」生产化的明确基线，待运维/部署阶段执行，不阻塞 M4 验收。
+
+1. **无状态化 + 队列解耦**：Mastra Workflow 服务与 Express 解耦为独立无状态进程；重负载在 Workflow 前加 **BullMQ（Redis）或 AWS SQS** 队列，把 `POST /api/generate` 请求与异步执行解耦（§11 NFR「可扩展」要求）。当前两段式 HITL（server 侧状态机 + `final-review` SSE）已天然适配异步重跑。
+2. **存储升级**：运行态从历史 `runs.json` 原子写穿升级为 **PostgreSQL / LibSQL** 持久化（`PromoRun` 全字段 + 配额表）；当前 `store.js`/`quota.js` 的写穿抽象已抽象出 `DATA_DIR`，迁移只需换底层 `read/write` 实现。
+3. **静态前端部署**：`public/index.html` 托管至 **Vercel / Cloudflare Pages** 或独立 CDN；API 服务部署至 Vercel Functions / Cloudflare Workers / Node 独立服务，经 CORS / 网关暴露 SSE 端点。
+4. **密钥与隔离**：`PROMO_PROVIDER_MODE=real` + one-api 凭据仅服务端环境变量；用户隔离由 `createdBy` → 账户配额（`PROMO_QUOTA_CAP`）承托；上线前接入四大阻断域计费（关闭 §16.11.1 推迟项）。
+5. **可观测**：OTel tracing + 成本/时延/错误率埋点接入 Langfuse/Datadog（§6 NFR「可观测」）；`GET /api/admin/costs` 已就绪。
+
+### 16.11.6 M4 DoD（验收）
+- [x] 多语言：设 `brief.language="en"`，真实脚本/分镜 prompt 末尾含 `Output in English.`；`generateVoiceover` 真实 TTS body 携带 `language:"en"`；`zh-CN` 下 prompt 零污染（确定性输出不变）。
+- [x] 品牌安全：`brief.bannedWords` 注入脚本/分镜 prompt（真实用例验证「禁用词：最、第一」）；`logoColor` 注入图像 prompt 与 DEMO 占位图主色。
+- [x] 模板库：`GET /api/templates` 首启返回 5 预置；`POST` 新建自定义、`PUT` 更新、`DELETE` 自定义成功；**DELETE 预置返回 409**；非法模板名 `POST` 返回 400。
+- [x] 前端：模板管理器 UI（列表 + 套用 + 删除 + 保存当前为模板）可用；套用回填 Brief 表单；预置删除按钮禁用。
+- [x] 持久化：模板跨进程写穿 + hydrate 验证通过（`templates.test.mjs` 子进程 round-trip）。
+- [x] 回归：DEMO 模式零密钥端到端仍跑通（分镜画廊 + SRT + 成片门/脚本门），全部 `node --test` 冒烟（M4 新增 10 例，合计 58 例）全绿。
 
 ---
 

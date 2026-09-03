@@ -185,6 +185,33 @@ test("generateVoiceover 真实模式：POST /audio/speech 二进制 + data URI +
   assert.ok(v._usage.minutes > 0);
 });
 
+test("generateVoiceover 真实模式：TTS 请求体携带 language（多语言 FR-12）", async () => {
+  calls = [];
+  const script = await generateScript({ ...baseBrief, language: "en" });
+  const v = await generateVoiceover(script, { ...baseBrief, language: "en" });
+  const last = calls[calls.length - 1];
+  assert.match(last.url, /\/audio\/speech$/);
+  assert.equal(last.body.language, "en");
+  assert.match(v.voiceUrl, /^data:audio\/mp3;base64,/);
+});
+
+test("generateStoryboard 真实模式：prompt 注入全局语言（en → Output in English）", async () => {
+  calls = [];
+  const script = await generateScript({ ...baseBrief, language: "en" });
+  await generateStoryboard({ ...baseBrief, language: "en" }, script);
+  const sb = calls.find((c) => c.url.endsWith("/chat/completions") && (c.body.messages?.[0]?.content || "").includes("分镜师"));
+  assert.ok(sb, "应调用分镜 chat");
+  assert.match(sb.body.messages[1].content, /Output in English\./);
+});
+
+test("generateScript 真实模式：bannedWords 注入 prompt（M4 模板库约束）", async () => {
+  calls = [];
+  const out = await generateScript({ ...baseBrief, bannedWords: ["最", "第一"] });
+  const user = calls[0].body.messages[1].content;
+  assert.match(user, /禁用词：最、第一/);
+  assert.equal(out.language, "zh-CN");
+});
+
 test("generateMusic 真实模式：POST /audio/music + 返回 url + _usage.tracks", async () => {
   calls = [];
   const script = await generateScript(baseBrief);

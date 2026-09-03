@@ -7,6 +7,7 @@
 // 切换只需设置环境变量，【工作流代码不变】。本文件不含网络调用时机之外的业务逻辑。
 
 import { encodeSVG } from "./svg.js";
+import { withGlobalLanguage } from "../i18n.js";
 
 // ───────────────────────── 模式判定 ─────────────────────────
 // 仅在显式 PROMO_PROVIDER_MODE=real 时启用真实 Provider；其余一律 DEMO（安全默认，零外部依赖）。
@@ -93,32 +94,19 @@ function mapVoiceTone(tone = "男声") {
   return "male";
 }
 
-function langInstruction(lang) {
-  switch (lang) {
-    case "zh-TW":
-      return "输出使用繁体中文。";
-    case "en":
-      return "Output in English.";
-    case "ja":
-      return "出力は日本語で。";
-    case "ko":
-      return "출력은 한국어로.";
-    default:
-      return "输出使用简体中文。";
-  }
-}
-
 // ───────────────────────── 1) LLM：脚本生成 ─────────────────────────
 export async function generateScript(brief) {
   if (getProviderMode() !== "real") return demoScript(brief);
   const model = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
   const sys = "你是资深品牌文案，依据品牌简报产出宣传片脚本，严格只输出 JSON（不含解释），结构：{title, voiceover:[{timecode,text}], structure:[], moodCurve:[]}。";
-  const user =
+  let user =
     `品牌：${brief.brandName}\n产品：${brief.productName}\n核心卖点：${brief.coreSellingPoint}\n` +
     `受众：${(brief.audience || []).join("、")}\n调性：${(brief.tones || []).join("、")}\n` +
     `核心信息：${(brief.keyMessages || []).join("；")}\n时长：${brief.durationSec}s\n` +
-    `配音音色：${brief.voiceTone}\n${langInstruction(brief.language)}\n` +
+    `配音音色：${brief.voiceTone}\n` +
     `voiceover 需按时长均分时间轴（timecode 格式 HH:MM:SS.mmm），结构含开场钩子/痛点/方案/卖点/CTA。`;
+  if (brief.bannedWords?.length) user += `\n禁用词：${brief.bannedWords.join("、")}，避免在旁白与字幕中出现。`;
+  user = withGlobalLanguage(user, brief.language);
   const data = await oneApiPost("/chat/completions", {
     model,
     messages: [
@@ -208,10 +196,13 @@ export async function generateStoryboard(brief, script) {
   const model = process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
   const sys = "你是资深分镜师，把脚本拆为若干 Scene，严格只输出 JSON 数组，结构：[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]。";
   const vo = (script?.voiceover || []).map((v) => `${v.timecode} ${v.text}`).join("\n");
-  const user =
+  let user =
     `品牌：${brief.brandName} 产品：${brief.productName}\n调性：${(brief.tones || []).join("、")}\n` +
-    `时长：${brief.durationSec}s\n旁白：\n${vo}\n${langInstruction(brief.language)}\n` +
+    `时长：${brief.durationSec}s\n旁白：\n${vo}\n` +
     `约每 5s 一个镜头；camera ∈ push/pull/pan/fixed；视觉风格全程统一。`;
+  if (brief.bannedWords?.length) user += `\n禁用词：${brief.bannedWords.join("、")}。`;
+  if (brief.logoColor) user += `\n品牌主色 ${brief.logoColor}，画面配色需呼应。`;
+  user = withGlobalLanguage(user, brief.language);
   const data = await oneApiPost("/chat/completions", {
     model,
     messages: [
@@ -264,7 +255,8 @@ function demoStoryboard(brief, script) {
 export async function generateSceneMedia(scene, brief) {
   if (getProviderMode() !== "real") return demoSceneMedia(scene, brief);
   const model = process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
-  const prompt = scene.visualPrompt;
+  let prompt = scene.visualPrompt;
+  if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
   const body = { model, prompt, n: 1, size: process.env.PROMO_IMAGE_SIZE || "1024x576" };
   // M3-D 真实参考图图生图（Seedream 参考图输入，M2 仅关键词透传）：
   //   styleReference 为 data:image 或 http(s) URL → 作为 image 字段走图生图（参考图输入免费，见 PRD §10）。
@@ -286,7 +278,8 @@ export async function generateSceneMedia(scene, brief) {
 }
 
 function demoSceneMedia(scene, brief) {
-  const [c1, c2] = paletteFor(brief.tones);
+  let [c1, c2] = paletteFor(brief.tones);
+  if (brief.logoColor) c1 = brief.logoColor; // M4 模板库：Logo 主色优先
   const svg = buildPosterSVG(scene, brief, c1, c2);
   return { mediaUrl: encodeSVG(svg), kind: "image", model: "demo-seedream" };
 }
@@ -298,7 +291,7 @@ export async function generateVoiceover(script, brief) {
   const text = (script?.voiceover || []).map((v) => v.text).join("\n");
   const audio = await oneApiPost(
     "/audio/speech",
-    { model, input: text, voice: mapVoiceTone(brief.voiceTone), response_format: "mp3" },
+    { model, input: text, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN", response_format: "mp3" },
     { isBinary: true }
   );
   const voiceUrl = `data:audio/mp3;base64,${audio.toString("base64")}`;

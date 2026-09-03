@@ -39,6 +39,9 @@
   pre { white-space:pre-wrap; background:#0e1426; border:1px solid var(--line); border-radius:9px; padding:12px; font-size:12px; max-height:240px; overflow:auto; }
   .vline { display:flex; gap:8px; margin:6px 0; align-items:flex-start; }
   .vline input { flex:1; }
+  .tpl-list { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+  .tpl-item { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--line); border-radius:10px; }
+  .tpl-meta { font-size:13px; }
   .hidden { display:none; }
   .note { color:var(--warn); font-size:12px; margin-top:10px; }
   a.dl { color:var(--accent); }
@@ -86,6 +89,15 @@
 
     <div style="margin-top:18px; display:flex; gap:10px;">
       <button id="genBtn" onclick="submitBrief()">生成宣传片</button>
+    </div>
+  </div>
+
+  <div class="card" id="tplCard">
+    <h3 style="margin-top:0;">品牌模板库 <span style="font-size:12px;color:var(--sub);font-weight:400;">（一键套用，保证调性统一 · M4）</span></h3>
+    <div id="tplList" class="tpl-list"></div>
+    <div class="row" style="margin-top:12px;">
+      <input id="tplName" placeholder="模板名，如：科技品牌标准" style="flex:1;" />
+      <button onclick="saveCurrentAsTemplate()">保存当前为模板</button>
     </div>
   </div>
 
@@ -143,6 +155,72 @@ function buildChips(containerId, items, sel) {
 buildChips("audienceChips", AUDIENCE, audienceSel);
 buildChips("toneChips", TONES, toneSel);
 fetchMode();
+loadTemplates();
+
+// ── 模板库（M4 / FR-1.3）──
+async function loadTemplates() {
+  try {
+    const list = await (await fetch("/api/templates")).json();
+    const el = document.getElementById("tplList");
+    el.innerHTML = "";
+    list.forEach((t) => {
+      const row = document.createElement("div");
+      row.className = "tpl-item";
+      const meta = document.createElement("div");
+      meta.className = "tpl-meta";
+      meta.innerHTML = `<b>${esc(t.name)}</b> <span style="color:var(--sub);font-size:12px;">${esc(t.defaultTone || "")} · ${esc(t.defaultLanguage || "")}${t.logoColor ? ` · <span style="color:${esc(t.logoColor)}">●</span>${esc(t.logoColor)}` : ""}${t.isPreset ? " · 预设" : ""}</span>`;
+      const actions = document.createElement("div");
+      actions.style.marginLeft = "auto";
+      const loadBtn = document.createElement("button");
+      loadBtn.textContent = "套用"; loadBtn.style.fontSize = "12px";
+      loadBtn.onclick = () => applyTemplate(t);
+      const delBtn = document.createElement("button");
+      delBtn.textContent = "删除"; delBtn.className = "ghost"; delBtn.style.fontSize = "12px"; delBtn.style.marginLeft = "6px";
+      if (t.isPreset) { delBtn.disabled = true; delBtn.title = "预设不可删"; delBtn.style.opacity = ".4"; }
+      else delBtn.onclick = () => deleteTemplate(t.id);
+      actions.appendChild(loadBtn); actions.appendChild(delBtn);
+      row.appendChild(meta); row.appendChild(actions);
+      el.appendChild(row);
+    });
+  } catch {}
+}
+function applyTemplate(t) {
+  if (t.brandName) document.getElementById("brandName").value = t.brandName;
+  if (t.productName) document.getElementById("productName").value = t.productName;
+  if (t.coreSellingPoint) document.getElementById("coreSellingPoint").value = t.coreSellingPoint;
+  if (t.defaultLanguage) document.getElementById("language").value = t.defaultLanguage;
+  if (t.defaultTone) {
+    toneSel.clear();
+    document.querySelectorAll("#toneChips .chip").forEach((el) => {
+      if (el.textContent === t.defaultTone) { toneSel.add(el.textContent); el.classList.add("on"); }
+      else el.classList.remove("on");
+    });
+  }
+}
+async function saveCurrentAsTemplate() {
+  const name = document.getElementById("tplName").value.trim();
+  if (!name) { alert("请先填模板名"); return; }
+  const tpl = {
+    name,
+    brandName: v("brandName") || undefined,
+    productName: v("productName") || undefined,
+    coreSellingPoint: v("coreSellingPoint") || undefined,
+    defaultTone: [...toneSel][0] || "专业",
+    defaultLanguage: v("language"),
+    bannedWords: [],
+    isPreset: false,
+  };
+  const r = await fetch("/api/templates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tpl) });
+  if (!r.ok) { alert("保存失败：" + ((await r.json()).error || r.status)); return; }
+  document.getElementById("tplName").value = "";
+  loadTemplates();
+}
+async function deleteTemplate(id) {
+  if (!confirm("确认删除该模板？")) return;
+  const r = await fetch("/api/templates/" + id, { method: "DELETE" });
+  if (r.status === 409) { alert("预设模板不可删除"); return; }
+  loadTemplates();
+}
 
 async function fetchMode() {
   try {
