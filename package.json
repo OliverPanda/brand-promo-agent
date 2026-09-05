@@ -7,6 +7,9 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
+    "start:real": "node --env-file=.env src/server.js",
+    "dev:real": "node --env-file=.env --watch src/server.js",
+    "probe:tikhub": "node --env-file=.env tools/probe-tikhub.mjs",
     "test": "node --import ./tests/setup.mjs --test-concurrency=1 --test \"tests/**/*.test.mjs\""
   },
   "dependencies": {

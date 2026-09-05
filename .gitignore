@@ -9,3 +9,6 @@ _real_*.mp4
 _diag*.mjs
 _sample*.mjs
 _real*.mjs
+
+# 本项目私密配置（密钥在此，绝不入库；此前靠父仓库规则忽略，拆库即泄漏）
+.env

@@ -24,6 +24,31 @@ import {
   updateRun,
 } from "./store.js";
 import { bus, emitFinalReview } from "./mastra/eventBus.js";
+import {
+  listSubscriptionGroups,
+  saveSubscriptionGroup,
+  deleteSubscriptionGroup,
+  RADAR_PLATFORMS,
+} from "./radar/subscriptions.js";
+import { collectRound, getRadarMode, PLATFORMS as RADAR_PLATFORM_ADAPTERS } from "./radar/tikhub.js";
+import { addMentions, listMentions, allMentions, mentionCount } from "./radar/mentions.js";
+import { computeHotwords } from "./radar/hotwords.js";
+import {
+  scorePendingMentions,
+  sentimentSummary,
+  getScore,
+  sentimentCount,
+  nlpConfig,
+} from "./radar/sentiment.js";
+import { getPersona, savePersona } from "./radar/persona.js";
+import {
+  generateTopics,
+  todayTopics,
+  topicConfig,
+  topicBrief,
+  recordDispatch,
+  dispatchedHistory,
+} from "./radar/topics.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, "../public");
@@ -254,9 +279,11 @@ app.get("/api/runs/:runId", (req, res) => {
 // ── GET /api/runs：历史列表（持久化，重启不丢） ──
 app.get("/api/runs", (_req, res) => res.json(listRuns().map((r) => toPublicRun(r.id || r.runId, r))));
 
-// ── GET /api/quota：账户级累计配额（FR-10.3 / M3 成本配额） ──
+// ── GET /api/quota：账户级累计配额（FR-10.3 / M3 成本配额）──
+// 账户 = 部署级固定值（PROMO_ACCOUNT，默认 local），与 workflow.recordCost 的限额键一致；
+// 不接受客户端任意传 account（否则换名即绕过配额）。
 app.get("/api/quota", (req, res) => {
-  const account = req.query.account || "anonymous";
+  const account = process.env.PROMO_ACCOUNT || "local";
   res.json({ account, ...checkQuota(account) });
 });
 
@@ -442,6 +469,172 @@ app.delete("/api/templates/:id", (req, res) => {
   const ok = deleteTemplate(id);
   if (!ok) return res.status(404).json({ error: "template not found" });
   res.json({ ok: true });
+});
+
+// ── 舆情雷达（PRD 舆情雷达 v0.2 / M1）：订阅 / 采集 / 热词 ───────────────
+// 订阅词组 CRUD（预置不可删，与模板库同范式）
+app.get("/api/radar/subscriptions", (_req, res) => res.json(listSubscriptionGroups()));
+
+app.post("/api/radar/subscriptions", (req, res) => {
+  try {
+    const { id: _ignoredId, isPreset: _ignoredPreset, ...body } = req.body || {};
+    res.status(201).json(saveSubscriptionGroup(body));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete("/api/radar/subscriptions/:id", (req, res) => {
+  const s = listSubscriptionGroups().find((x) => x.id === req.params.id);
+  if (!s) return res.status(404).json({ error: "subscription not found" });
+  if (s.isPreset || String(req.params.id).startsWith("preset-")) {
+    return res.status(409).json({ error: "预置订阅不可删除" });
+  }
+  const ok = deleteSubscriptionGroup(req.params.id);
+  if (!ok) return res.status(404).json({ error: "subscription not found" });
+  res.json({ ok: true });
+});
+
+// 采集轮：遍历订阅拉取（real=TikHub 计费/cache；demo=确定性种子）。单轮内 (平台,关键词) 去重。
+app.post("/api/radar/collect", async (_req, res) => {
+  const started = Date.now();
+  const mode = getRadarMode();
+  const collectedAt = new Date().toISOString();
+  try {
+    const groups = listSubscriptionGroups();
+    if (!groups.length) return res.json({ mode, collectedAt, added: 0, duplicates: 0, requests: 0, errors: [], note: "无订阅词组" });
+    const { mentions, requests, errors } = await collectRound(groups);
+    const { added, duplicates } = addMentions(mentions);
+    res.json({
+      mode,
+      collectedAt,
+      scanned: mentions.length,
+      added,
+      duplicates,
+      requests,
+      errors,
+      storeSize: mentionCount(),
+      durationMs: Date.now() - started,
+    });
+  } catch (e) {
+    res.status(502).json({ error: `采集失败：${String(e?.message || e).slice(0, 200)}`, mode, durationMs: Date.now() - started });
+  }
+});
+
+// 热词榜：range=day|week（环比 + 爆点标记，FR-2）
+app.get("/api/radar/hotwords", (req, res) => {
+  const mode = getRadarMode();
+  res.json({
+    ...computeHotwords(allMentions(), { range: req.query.range === "week" ? "week" : "day" }),
+    mode,
+    source: mode === "real" ? "tikhub" : "demo",
+  });
+});
+
+// Mention 列表（脱敏后输出：authorHash 已是脱敏 ID，绝不回传原始作者名以外的 PII）
+// 情绪字段随条下发（已打分的带 sentiment/sentimentScore/sentimentConfidence/sentimentSource）
+app.get("/api/radar/mentions", (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  const items = listMentions({
+    limit,
+    platform: req.query.platform || undefined,
+    keyword: req.query.keyword || undefined,
+    windowHours: req.query.windowHours ? Number(req.query.windowHours) : undefined,
+  }).map((m) => {
+    const s = getScore(m.id);
+    return s ? { ...m, sentiment: s.sentiment, sentimentScore: s.score, sentimentConfidence: s.confidence, sentimentSource: s.source } : m;
+  });
+  res.json({ total: mentionCount(), items });
+});
+
+// LLM 情绪打分（M2 收窄版：只打分，无告警/无站内信）。?limit= 限制本轮最多打分条数（分批 ≤ PROMO_NLP_BATCH_SIZE）。
+app.post("/api/radar/score", async (req, res) => {
+  const started = Date.now();
+  try {
+    const limit = Number(req.query.limit) || Number(req.body?.limit) || undefined;
+    const stats = await scorePendingMentions(allMentions(), { limit });
+    res.json({
+      ...stats,
+      scored: sentimentCount(),
+      nlp: nlpConfig(),
+      durationMs: Date.now() - started,
+    });
+  } catch (e) {
+    res.status(502).json({ error: `情绪打分失败：${String(e?.message || e).slice(0, 200)}`, durationMs: Date.now() - started });
+  }
+});
+
+// 情绪聚合摘要：?windowHours= 限定时间窗（如 24）。严格负面口径 = neg && confidence ≥ 0.6。
+app.get("/api/radar/sentiment", (req, res) => {
+  const windowHours = req.query.windowHours ? Number(req.query.windowHours) : undefined;
+  res.json({ ...sentimentSummary(allMentions(), { windowHours }), nlp: nlpConfig() });
+});
+
+// ── 选题会商（PRD FR-6/7/8/9.3，M3 收窄版：无会商工作台） ────────────────
+// 人设库（单例，预置铭星链）：GET 读取 / PUT 合并保存（字段级校验，非法 400）
+app.get("/api/radar/persona", (_req, res) => res.json({ ...getPersona(), config: topicConfig() }));
+
+app.put("/api/radar/persona", (req, res) => {
+  try {
+    res.json(savePersona(req.body || {}));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// 选题生成（每日 1 次 + 手动补跑覆盖当日）：热词 + 情绪摘要 + 人设注入；强制依据 + 禁用词过滤
+app.post("/api/radar/topics/generate", async (_req, res) => {
+  const started = Date.now();
+  try {
+    const sentiment = sentimentSummary(allMentions(), { windowHours: 24 * 7 });
+    const result = await generateTopics({ mentions: allMentions(), sentimentSummary: sentiment });
+    res.json({ ...result, config: topicConfig(), durationMs: Date.now() - started });
+  } catch (e) {
+    res.status(502).json({ error: `选题生成失败：${String(e?.message || e).slice(0, 200)}`, durationMs: Date.now() - started });
+  }
+});
+
+// 今日选题榜（无当日数据返回空 topics；附近 14 天下发历史）
+app.get("/api/radar/topics", (_req, res) => {
+  res.json({ ...todayTopics(), dispatched: dispatchedHistory(), config: topicConfig() });
+});
+
+// 一键下发（FR-9.3 直连版）：选题 → Brief（人设预填）→ 复用 POST /api/generate 流水线
+// hitl 默认开启 → 脚本确认门照常弹出，人类仍在回路（不因直连跳过审核）。
+app.post("/api/radar/topics/:id/dispatch", (req, res) => {
+  const { hitlEnabled = true, finalGateEnabled = true } = req.body || {};
+  const t = todayTopics().topics.find((x) => x.id === req.params.id);
+  if (!t) return res.status(404).json({ error: "选题不存在或已过期（请重新生成今日选题）" });
+  try {
+    const brief = parseBrief(topicBrief(t, { hitlEnabled, finalGateEnabled }));
+    const runId = newRunId();
+    createRun(runId, brief);
+    recordDispatch(t.id, runId);
+    // 不 await：与 /api/generate 一致，进度经 SSE 推送（前端复用 openStream(runId)）。
+    runScriptPhase(runId, brief).catch((err) => {
+      console.error(`[topic-dispatch] ${runId} unexpected:`, err?.message || err);
+      updateRun(runId, { status: "failed" });
+    });
+    res.json({ runId, topicId: t.id, title: t.title, brief });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// 雷达状态：模式 / 平台可用性 / 存储量
+app.get("/api/radar/status", (_req, res) => {
+  const mode = getRadarMode();
+  res.json({
+    mode,
+    storeSize: mentionCount(),
+    platforms: Object.entries(RADAR_PLATFORM_ADAPTERS).map(([id, a]) => ({
+      id,
+      label: a.label,
+      available: mode === "demo" ? true : !a.unsupported,
+      note: a.unsupported || "",
+    })),
+    supportedPlatforms: RADAR_PLATFORMS,
+  });
 });
 
 function round4(n) {

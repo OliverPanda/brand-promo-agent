@@ -146,7 +146,7 @@ test("成片门（FR-9.2）：reject 指定分镜 → 重新生成 → 再次 aw
   }
 });
 
-test("GET /api/quota：返回账户累计与剩余配额", async () => {
+test("GET /api/quota：账户为部署级固定值（不echo客户端 account，防换名绕过配额）", async () => {
   const { app } = await import("../src/server.js");
   const server = app.listen(0);
   const port = server.address().port;
@@ -154,7 +154,7 @@ test("GET /api/quota：返回账户累计与剩余配额", async () => {
     const r = await fetch(`${BASE(port)}/api/quota?account=acme`);
     assert.equal(r.status, 200);
     const q = await r.json();
-    assert.equal(q.account, "acme");
+    assert.equal(q.account, process.env.PROMO_ACCOUNT || "local");
     assert.equal(q.cap, 200);
     assert.ok(q.remaining <= q.cap);
   } finally {

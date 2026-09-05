@@ -1,211 +1,677 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<html lang="zh-CN" data-page-node-id="vPOjVQPCEPigbqxHyUBtoR">
+<head data-page-node-id="KBZbg67omTTgzw93yMjFa7">
+<meta charset="UTF-8" data-page-node-id="VYQQGwHbFgoX2AfNxBbYhJ" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="C31pYjvr6luWE3XTD5WkCG" />
 <title>铭星链 · 自动化品宣机器人</title>
 <style>
-  :root { --bg:#0b1020; --card:#151b30; --line:#26304d; --txt:#e8ecf6; --sub:#9aa6c4; --accent:#6366f1; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); }
-  .wrap { max-width:1120px; margin:0 auto; padding:24px 16px 64px; }
-  /* 左主右栏：表单/进度/交付在主列，模型与服务配置固定右侧（≥960px 时双栏，窄屏回落单栏） */
-  .layout { display:flex; gap:16px; align-items:flex-start; }
-  .main { flex:1; min-width:0; }
-  .side { width:300px; flex:none; position:sticky; top:16px; }
-  @media (max-width:960px) { .layout { flex-direction:column; } .side { width:100%; position:static; } }
+  /* ══════════════════════════════════════════════════════════════════
+     铭星链 · 自动化品宣机器人 —— 设计系统
+     风格依据（UI/UX Pro Max）：Bento 模块化卡片 + Data-Dense 仪表盘
+       · 模块卡片承载单一职责，层级靠「卡片标题 → 分区标题 → 正文」三级
+       · 单一强调色（天蓝），语义色仅用于状态（ok/warn/bad）
+       · 正文对比度 ≥4.5:1；次要文字不再用过浅灰
+     排版：14px 基准 / 1.55 行高 / tabular-nums（数据工具页）
+     ══════════════════════════════════════════════════════════════════ */
+  :root {
+    /* 表面与描边 */
+    --bg:#f4f6fa; --bg-soft:#edf1f7; --card:#fff; --card-inset:#f6f8fb;
+    --line:#e4e9f0; --line-strong:#ccd6e2;
+    /* 文字：--faint 由 #8b98a5 提到 #6b7a8a，白底对比度 3.1:1 → 4.6:1（WCAG AA） */
+    --txt:#1a2531; --sub:#54657a; --faint:#6b7a8a;
+    /* 强调与语义 */
+    --accent:#0ea5e9; --accent-strong:#0284c7; --accent-deep:#0369a1;
+    --accent-soft:rgba(14,165,233,.12);
+    --ok:#047857; --ok-soft:#e7f6f0;
+    --warn:#b45309; --warn-soft:#fdf3e3;
+    --bad:#c2261d; --bad-soft:#fdeceb;
+    /* 尺度 */
+    --r:12px; --r-sm:8px; --r-xs:6px;
+    --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:28px;
+    --shadow:0 1px 2px rgba(16,24,40,.05), 0 8px 24px -14px rgba(16,24,40,.16);
+    --shadow-lg:0 24px 64px -16px rgba(16,24,40,.28);
+    --tr:150ms cubic-bezier(.22,.61,.36,1);
+  }
+  * { box-sizing:border-box; }
+  html { color-scheme:light; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--txt); font-size:14px; line-height:1.55;
+         font-variant-numeric:tabular-nums; text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; }
+  ::selection { background:rgba(14,165,233,.22); color:var(--txt); }
+  ::placeholder { color:var(--faint); }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:#c3cdd9; border-radius:6px; border:2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background:#aab7c6; }
+  ::-webkit-scrollbar-track { background:transparent; }
+
+  /* 焦点可见性：键盘用户必须看清落点（UI/UX 准则 High） */
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:var(--r-xs); }
+
+  /* ── 骨架：三栏仪表盘，≥1360 三栏 / 1024–1360 两栏 / <1024 单栏 ──
+     高度锁定 100vh，各栏独立滚动互不牵连。 */
+  .wrap { max-width:1680px; margin:0 auto; padding:var(--sp-4) var(--sp-4) var(--sp-5); height:100vh; display:flex; flex-direction:column; }
+  .layout { flex:1; min-height:0; display:grid; gap:var(--sp-4); align-items:stretch;
+            grid-template-columns:380px minmax(0,1fr) 300px; grid-template-areas:"radar main side"; }
+  .col-radar { grid-area:radar; min-height:0; overflow-y:auto; padding-right:4px; display:flex; flex-direction:column; gap:var(--sp-3); }
+  /* 左栏只保留热词榜与最终选题 TOP10；订阅、情绪和人设属于后台能力，不占用创作界面。 */
+  .col-radar > .card:nth-child(1), .col-radar > .card:nth-child(3) { display:none; }
+  .col-radar > .card:nth-child(4) details { display:none; }
+  .main      { grid-area:main;  min-height:0; min-width:0; overflow-y:auto; padding-right:4px; }
+  .side      { grid-area:side;  min-height:0; overflow-y:auto; padding-right:4px; display:flex; flex-direction:column; gap:var(--sp-3); }
+  @media (max-width:1360px) {
+    .layout { grid-template-columns:minmax(0,1fr) 300px; grid-template-areas:"main side" "radar side"; grid-template-rows:auto 1fr; }
+    .col-radar { flex-direction:row; flex-wrap:wrap; align-content:flex-start; }
+    .col-radar > .card { flex:1 1 320px; }
+  }
+  @media (max-width:1024px) {
+    .wrap { height:auto; }
+    .layout { grid-template-columns:minmax(0,1fr); grid-template-areas:"main" "radar" "side"; grid-template-rows:auto; }
+    .col-radar, .side, .main { overflow:visible; padding-right:0; }
+    .col-radar { flex-direction:column; }
+  }
+
+  /* ══ 卡片 ══ */
+  .card { background:var(--card); border:1px solid var(--line); border-radius:var(--r); padding:var(--sp-5); box-shadow:var(--shadow); }
+  .main > .card + .card { margin-top:var(--sp-4); }
+  /* 卡片头：标题 + 可选右侧操作，与内容以细线分隔 */
+  .card-hd { display:flex; align-items:center; gap:var(--sp-2); flex-wrap:wrap; margin:0 0 var(--sp-3);
+             padding-bottom:var(--sp-3); border-bottom:1px solid var(--line); }
+  .card-hd h3 { font-size:14.5px; font-weight:650; letter-spacing:-.01em; margin:0; }
+  .card-hd .spacer { margin-left:auto; }
+  .card-hd .hd-note { font-size:12px; color:var(--faint); font-weight:400; }
+  /* 分区标题：卡片内的二级层级（替代原先的裸 <b>） */
+  .sect { display:flex; align-items:center; gap:var(--sp-2); flex-wrap:wrap;
+          font-size:13px; font-weight:650; color:var(--txt); margin:var(--sp-4) 0 var(--sp-2); }
+  .sect:first-child { margin-top:0; }
+  .sect::before { content:""; width:3px; height:13px; border-radius:2px; background:var(--accent); flex:none; }
+  .sect .spacer { margin-left:auto; }
+  .sect .hd-note { font-size:11.5px; color:var(--faint); font-weight:400; }
+
+  /* ══ 页头 ══ */
+  .pagehead { flex:none; display:flex; align-items:baseline; gap:var(--sp-3); flex-wrap:wrap;
+              border-bottom:1px solid var(--line); padding-bottom:var(--sp-3); margin-bottom:var(--sp-4); }
+  .pagehead h1 { position:relative; padding-left:12px; font-size:21px; font-weight:700; letter-spacing:-.02em; margin:0; }
+  .pagehead h1::before { content:""; position:absolute; left:0; top:50%; transform:translateY(-50%); width:4px; height:18px; border-radius:2px; background:var(--accent); }
+  .pagehead .sub { color:var(--sub); font-size:12.5px; line-height:1.6; }
+  .pagehead .spacer { margin-left:auto; }
+  #modeBadge { display:inline-flex; align-items:center; gap:5px; padding:2px 10px; border:1px solid var(--line-strong);
+               border-radius:999px; font-size:12px; color:var(--sub); background:var(--bg-soft); white-space:nowrap; }
+  #modeBadge::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--ok); }
+  #modeBadge.is-demo::before { background:var(--faint); }
+
+  /* ══ 表单 ══ */
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:var(--sp-3) var(--sp-3); }
+  .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:var(--sp-3); }
+  @media (max-width:640px) { .grid2, .grid3 { grid-template-columns:1fr; } }
+  .field { min-width:0; margin-bottom:var(--sp-3); }
+  .field:last-child { margin-bottom:0; }
+  label, .lbl { display:block; font-size:12.5px; font-weight:500; color:var(--sub); margin-bottom:5px; }
+  .lbl .req { color:var(--bad); margin-left:2px; }
+  .lbl .opt { color:var(--faint); font-weight:400; }
+  input, select, textarea { width:100%; background:var(--card-inset); border:1px solid var(--line); color:var(--txt);
+                            border-radius:var(--r-sm); padding:8px 11px; font-size:14px; font-family:inherit;
+                            transition:border-color var(--tr), box-shadow var(--tr), background var(--tr); }
+  input:hover, select:hover, textarea:hover { border-color:var(--line-strong); }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); background:#fff; box-shadow:0 0 0 3px var(--accent-soft); }
+  textarea { resize:vertical; min-height:66px; line-height:1.6; }
+  select { cursor:pointer; }
+  input[type="checkbox"] { accent-color:var(--accent-strong); width:auto; }
+  input[type="color"] { padding:2px; height:32px; cursor:pointer; }
+  input[type="password"] { letter-spacing:.05em; }
+  /* 校验态：内联错误（模糊时校验，非仅提交时） */
+  input.invalid, textarea.invalid { border-color:var(--bad); background:var(--bad-soft); }
+  input.invalid:focus, textarea.invalid:focus { box-shadow:0 0 0 3px rgba(194,38,29,.14); }
+  .err { display:none; margin-top:4px; font-size:12px; color:var(--bad); }
+  .err.show { display:block; }
+  /* 帮助文字 */
+  .hint { color:var(--faint); font-size:12px; line-height:1.6; }
+  .hint.ok { color:var(--ok); } .hint.bad { color:var(--bad); } .hint.warn { color:var(--warn); }
+  .counter { float:right; font-size:11.5px; color:var(--faint); font-weight:400; }
+  .counter.over { color:var(--bad); font-weight:600; }
   .copy-bar { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:8px; }
-  button.mini { padding:5px 12px; font-size:12px; border-radius:8px; }
-  hr.sep { border:0; border-top:1px solid var(--line); margin:14px 0; }
-  h1 { font-size:22px; margin:0 0 4px; }
-  .sub { color:var(--sub); font-size:13px; margin-bottom:20px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:16px; }
-  label { display:block; font-size:13px; color:var(--sub); margin:12px 0 6px; }
-  input, select, textarea { width:100%; background:#0e1426; border:1px solid var(--line); color:var(--txt); border-radius:9px; padding:10px 12px; font-size:14px; }
-  textarea { resize:vertical; min-height:64px; }
-  .row { display:flex; gap:12px; } .row > div { flex:1; }
-  .chips { display:flex; flex-wrap:wrap; gap:8px; }
-  .chip { border:1px solid var(--line); background:#0e1426; color:var(--sub); padding:6px 12px; border-radius:999px; cursor:pointer; font-size:13px; user-select:none; }
-  .chip.on { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:11px 18px; font-size:14px; cursor:pointer; }
-  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
-  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:var(--sp-3); flex-wrap:wrap; }
+  .row > div { flex:1; min-width:0; }
+  .row.tight { gap:var(--sp-2); }
+  hr.sep { border:0; border-top:1px solid var(--line); margin:var(--sp-4) 0; }
+  /* 分组：表单内的语义分区 */
+  fieldset.grp { border:0; padding:0; margin:0 0 var(--sp-4); }
+  fieldset.grp:last-of-type { margin-bottom:0; }
+  fieldset.grp > legend { font-size:12px; font-weight:650; color:var(--accent-deep); letter-spacing:.02em;
+                          padding:0; margin-bottom:var(--sp-2); text-transform:none; }
+  .check-row { display:flex; align-items:flex-start; gap:8px; padding:7px 10px; border:1px solid var(--line);
+               border-radius:var(--r-sm); background:var(--card-inset); cursor:pointer; transition:border-color var(--tr); }
+  .check-row:hover { border-color:var(--line-strong); }
+  .check-row input { margin:2px 0 0; }
+  .check-row .cr-txt { font-size:13px; color:var(--txt); }
+  .check-row .cr-sub { display:block; font-size:11.5px; color:var(--faint); margin-top:1px; }
+
+  /* ══ 按钮：主 / 次 / 危险 / 迷你 ══ */
+  button { background:var(--accent-strong); color:#fff; border:1px solid transparent; border-radius:9px;
+           padding:8px 16px; font-size:13.5px; font-weight:500; cursor:pointer; font-family:inherit;
+           white-space:nowrap; display:inline-flex; align-items:center; justify-content:center; gap:6px;
+           transition:filter var(--tr), transform var(--tr), border-color var(--tr), background var(--tr), color var(--tr); }
+  button:hover:not(:disabled) { filter:brightness(1.1); }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  /* 次级：描边幽灵 */
+  button.ghost { background:var(--card); border-color:var(--line-strong); color:var(--txt); }
+  button.ghost:hover:not(:disabled) { border-color:var(--accent); color:var(--accent-deep); background:var(--accent-soft); filter:none; }
+  /* 危险：删除/清除等不可逆操作，红色描边（+ 仍会二次确认） */
+  button.danger { background:var(--card); border-color:#e8b3ae; color:var(--bad); }
+  button.danger:hover:not(:disabled) { background:var(--bad); border-color:var(--bad); color:#fff; filter:none; }
+  button.mini { padding:4px 10px; font-size:12px; border-radius:7px; }
+  button.block { width:100%; }
+  button.lg { padding:11px 22px; font-size:14.5px; font-weight:600; }
+  /* 加载中：旋转指示器，避免「点了没反应」 */
+  button.loading { pointer-events:none; opacity:.75; }
+  button.loading::before { content:""; width:12px; height:12px; border-radius:50%;
+                           border:2px solid rgba(255,255,255,.4); border-top-color:#fff; animation:spin .7s linear infinite; }
+  button.ghost.loading::before, button.danger.loading::before { border-color:rgba(2,132,199,.25); border-top-color:var(--accent-strong); }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* ══ 选择 chips ══ */
+  .chips { display:flex; flex-wrap:wrap; gap:var(--sp-2); }
+  .chip { border:1px solid var(--line-strong); background:var(--card-inset); color:var(--sub); padding:4px 12px;
+          border-radius:999px; cursor:pointer; font-size:13px; user-select:none; transition:all var(--tr); }
+  .chip:hover { border-color:var(--accent); color:var(--txt); }
+  .chip.on { background:var(--accent-soft); border-color:var(--accent); color:var(--accent-deep); font-weight:600; }
+
+  /* ══ 列表条目（订阅 / 模板）══ */
+  .tpl-list { display:flex; flex-direction:column; gap:var(--sp-2); margin-top:var(--sp-2); }
+  .tpl-item { display:flex; align-items:center; gap:var(--sp-2); padding:8px 11px; border:1px solid var(--line);
+              border-radius:var(--r-sm); background:var(--card-inset); transition:border-color var(--tr), background var(--tr); }
+  .tpl-item:hover { border-color:var(--line-strong); background:#fff; }
+  .tpl-meta { font-size:13px; min-width:0; flex:1; }
+  .tpl-meta b { font-weight:600; }
+  .tpl-meta .m-sub { display:block; font-size:11.5px; color:var(--faint); margin-top:1px; }
+  .tpl-act { display:flex; gap:6px; flex:none; margin-left:auto; }
+  .swatch { display:inline-block; width:8px; height:8px; border-radius:2px; vertical-align:middle; margin-right:3px; }
+
+  /* 顶部模板：共享设计 Token，紧凑标签与折叠管理入口。 */
+  .template-strip { --color-primary:#1890ff; --color-primary-light:#e6f4ff; --text-primary:#1d2129; --text-secondary:#4e5969; --border-medium:#c9cdd4; --bg-card:#fff;
+    margin-bottom:var(--sp-3); padding:var(--sp-2) 0; }
+  .template-heading { display:flex; align-items:center; gap:var(--sp-2); margin-bottom:var(--sp-2); font-size:12px; color:var(--text-secondary); }
+  .template-heading strong { color:var(--text-primary); font-weight:600; }
+  .template-tags { display:flex; flex-wrap:wrap; gap:var(--sp-2); min-height:32px; }
+  button.template-tag { min-height:32px; max-width:100%; padding:var(--sp-1) var(--sp-3); border-radius:var(--r-sm); font-size:12px; white-space:normal; overflow-wrap:anywhere;
+    color:var(--text-secondary); background:var(--bg-card); border:1px solid var(--border-medium); }
+  button.template-tag:hover:not(:disabled), button.template-tag[aria-pressed="true"] { background:var(--color-primary-light); border-color:var(--color-primary); color:var(--text-primary); filter:none; }
+  button.template-tag[aria-pressed="true"] { font-weight:650; }
+  .template-manager { margin-top:var(--sp-2); font-size:12px; color:var(--text-secondary); }
+  .template-manager summary { cursor:pointer; min-height:32px; width:fit-content; padding:var(--sp-1) 0; }
+  .template-manager[open] { padding-bottom:var(--sp-2); }
+  .template-manager label { margin-top:var(--sp-2); }
+  .template-save { display:flex; gap:var(--sp-2); }
+  .template-save input { flex:1; min-width:0; }
+  .template-manager .tpl-meta { overflow-wrap:anywhere; }
+  @media (max-width:767px) {
+    button.template-tag, .template-manager summary, .template-manager button { min-height:44px; font-size:14px; }
+    .template-heading { font-size:14px; }
+  }
+
+  /* ══ 榜单行（热词 / 选题）：去掉虚线网格，改为悬停高亮 ══ */
+  .rank-list { display:flex; flex-direction:column; margin-top:var(--sp-2); }
+  .rank-item { display:flex; gap:var(--sp-2); align-items:flex-start; padding:6px 8px; border-radius:var(--r-xs);
+               font-size:13px; transition:background var(--tr); }
+  .rank-item + .rank-item { border-top:1px solid var(--line); border-radius:0; }
+  .rank-item:hover { background:var(--bg-soft); }
+  .rank-item .rk { flex:none; width:20px; color:var(--faint); font-size:12px; font-weight:650; text-align:right; padding-top:1px; }
+  .rank-item .rk.top { color:var(--accent-deep); }
+  .rank-item .rk-body { flex:1; min-width:0; }
+  .rank-item .rk-side { flex:none; text-align:right; font-size:11.5px; color:var(--faint); white-space:nowrap; padding-top:1px; }
+  .tag { display:inline-block; font-size:11px; line-height:1.5; padding:0 5px; border-radius:4px;
+         border:1px solid currentColor; vertical-align:1px; }
+  .tag.hot { color:var(--bad); background:var(--bad-soft); border-color:transparent; font-weight:600; }
+  .tag.new { color:var(--ok); background:var(--ok-soft); border-color:transparent; font-weight:600; }
+  .tag.brand { color:var(--faint); }
+  .src-note { color:var(--faint); font-size:11.5px; margin-top:6px; }
+
+  /* ══ 空状态：给得出「为什么空」+「下一步做什么」 ══ */
+  .empty { display:block; padding:var(--sp-5) var(--sp-4); text-align:center; border:1px dashed var(--line-strong);
+           border-radius:var(--r-sm); color:var(--sub); background:var(--bg-soft); font-size:12.5px; line-height:1.7; margin-top:var(--sp-2); }
+  .empty .e-title { font-weight:600; color:var(--txt); font-size:13px; }
+  .empty button { margin-top:var(--sp-2); }
+
+  /* ══ KPI 数字组 + 堆叠占比条（情绪分析）══ */
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(78px,1fr)); gap:var(--sp-2); margin-top:var(--sp-2); }
+  .kpi { padding:8px 10px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--card-inset); }
+  .kpi .k-val { font-size:17px; font-weight:650; letter-spacing:-.02em; line-height:1.25; }
+  .kpi .k-lbl { font-size:11.5px; color:var(--faint); margin-top:1px; }
+  .kpi.pos .k-val { color:var(--ok); } .kpi.neg .k-val { color:var(--bad); }
+  .kpi.idx .k-val { color:var(--accent-deep); }
+  .bar-stack { display:flex; height:8px; border-radius:4px; overflow:hidden; background:var(--bg-soft); margin-top:var(--sp-2); }
+  .bar-stack > i { display:block; height:100%; transition:width .3s var(--tr); }
+  .bar-legend { display:flex; gap:var(--sp-3); flex-wrap:wrap; font-size:11.5px; color:var(--faint); margin-top:5px; }
+  .bar-legend span::before { content:""; display:inline-block; width:7px; height:7px; border-radius:2px; margin-right:4px;
+                             vertical-align:1px; background:var(--dot,var(--line-strong)); }
+  .bar-legend span.no-dot::before { display:none; }
+
+  /* ══ 生成进度：时间线 + 第 x/y 步 ══ */
+  .steps-head { display:flex; align-items:center; gap:var(--sp-2); margin-bottom:var(--sp-2); font-size:12.5px; color:var(--sub); }
+  .steps-head .spacer { margin-left:auto; }
+  .prog-track { flex:1; height:6px; border-radius:3px; background:var(--bg-soft); overflow:hidden; min-width:80px; }
+  .prog-track > i { display:block; height:100%; width:0; background:var(--accent); border-radius:3px; transition:width .35s var(--tr); }
   .steps { list-style:none; margin:0; padding:0; }
-  .step { display:flex; align-items:center; gap:10px; padding:9px 0; border-bottom:1px solid var(--line); font-size:14px; }
-  .dot { width:10px; height:10px; border-radius:50%; background:var(--line); flex:none; }
-  .dot.running { background:var(--warn); animation:pulse 1s infinite; }
-  .dot.done { background:var(--ok); } .dot.failed { background:var(--bad); }
-  .step .meta { color:var(--sub); font-size:12px; margin-left:auto; }
-  @keyframes pulse { 50% { opacity:.3; } }
-  .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:12px; margin-top:12px; }
-  .scene { background:#0e1426; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
-  .scene img { width:100%; display:block; }
-  .scene .cap { padding:8px 10px; font-size:12px; color:var(--sub); }
-  .scene.failed { border-color:var(--bad); }
-  .modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; padding:16px; }
-  .modal .box { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; max-width:560px; width:100%; max-height:86vh; overflow:auto; }
-  pre { white-space:pre-wrap; background:#0e1426; border:1px solid var(--line); border-radius:9px; padding:12px; font-size:12px; max-height:240px; overflow:auto; }
-  .vline { display:flex; gap:8px; margin:6px 0; align-items:flex-start; }
+  .step { display:flex; align-items:center; gap:10px; padding:9px 8px; border-radius:var(--r-xs);
+          font-size:13.5px; transition:background var(--tr); }
+  .step:hover { background:var(--bg-soft); }
+  .step .dot { width:9px; height:9px; border-radius:50%; background:var(--line-strong); flex:none; transition:background var(--tr); }
+  .step .dot.running { background:var(--warn); animation:pulse 1.1s infinite; }
+  .step .dot.done { background:var(--ok); }
+  .step .dot.failed { background:var(--bad); }
+  .step .name { flex:none; }
+  .step .meta { color:var(--faint); font-size:11.5px; margin-left:auto; text-align:right; }
+  .step.done .name { color:var(--sub); }
+  @keyframes pulse { 50% { opacity:.25; } }
+
+  /* ══ 分镜画廊 / 交付 ══ */
+  .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:var(--sp-3); margin-top:var(--sp-3); }
+  .scene { background:var(--card-inset); border:1px solid var(--line); border-radius:var(--r-sm); overflow:hidden; transition:border-color var(--tr), box-shadow var(--tr); }
+  .scene:hover { border-color:var(--line-strong); box-shadow:var(--shadow); }
+  .scene img, .scene video { width:100%; display:block; background:var(--bg-soft); }
+  .scene .cap { padding:7px 10px; font-size:12px; color:var(--sub); line-height:1.5; }
+  .scene.failed { border-color:var(--bad); background:var(--bad-soft); }
+  h4 { font-size:13.5px; font-weight:650; margin:var(--sp-5) 0 0; padding-bottom:7px; border-bottom:1px solid var(--line); }
+  .note { color:var(--warn); font-size:12px; margin-top:var(--sp-2); padding:8px 10px; background:var(--warn-soft); border-radius:var(--r-xs); }
+  a.dl { color:var(--accent-deep); text-decoration:none; border-bottom:1px dashed var(--accent-deep); }
+  a.dl:hover { border-bottom-style:solid; }
+  .kv { display:flex; flex-wrap:wrap; gap:4px var(--sp-3); font-size:12.5px; color:var(--sub); margin-top:var(--sp-2); }
+  .kv b { color:var(--txt); font-weight:600; }
+  .cost-box { margin-top:var(--sp-3); padding:var(--sp-3); border:1px solid var(--line); border-radius:var(--r-sm); background:var(--card-inset); }
+  .cost-box ul { margin:var(--sp-2) 0 0; padding-left:18px; font-size:12.5px; color:var(--sub); }
+
+  /* ══ 弹层：ESC / 点遮罩 / 关闭按钮 三种退出路径 ══ */
+  .modal { position:fixed; inset:0; background:rgba(15,23,42,.45); display:flex; align-items:center; justify-content:center;
+           padding:var(--sp-4); z-index:50; animation:fade .15s ease-out; }
+  @keyframes fade { from { opacity:0; } }
+  .modal .box { background:var(--card); border:1px solid var(--line-strong); border-radius:14px; padding:var(--sp-5);
+                max-width:580px; width:100%; max-height:86vh; overflow:auto; box-shadow:var(--shadow-lg); }
+  .modal .box > .box-hd { display:flex; align-items:center; gap:var(--sp-2); margin:0 0 var(--sp-3); padding-bottom:var(--sp-3); border-bottom:1px solid var(--line); }
+  .modal .box > .box-hd h3 { font-size:15px; font-weight:650; margin:0; }
+  .modal .box > .box-hd .spacer { margin-left:auto; }
+  .modal .box > .box-ft { display:flex; gap:10px; justify-content:flex-end; margin-top:var(--sp-4);
+                          padding-top:var(--sp-3); border-top:1px solid var(--line); }
+  .icon-btn { background:transparent; border:0; color:var(--faint); font-size:18px; line-height:1; padding:4px 8px; border-radius:var(--r-xs); }
+  .icon-btn:hover { background:var(--bg-soft); color:var(--txt); filter:none; }
+  .vline { display:flex; gap:var(--sp-2); margin:6px 0; align-items:center; }
   .vline input { flex:1; }
-  .tpl-list { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
-  .tpl-item { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--line); border-radius:10px; }
-  .tpl-meta { font-size:13px; }
-  .hidden { display:none; }
-  .note { color:var(--warn); font-size:12px; margin-top:10px; }
-  a.dl { color:var(--accent); }
+  .vline .tc { flex:none; color:var(--faint); font-size:12px; font-variant-numeric:tabular-nums; }
+  pre { white-space:pre-wrap; background:var(--card-inset); border:1px solid var(--line); border-radius:var(--r-sm);
+        padding:var(--sp-3); font-size:12px; line-height:1.6; max-height:240px; overflow:auto; }
+
+  /* ══ 全局 Toast：替代原生 alert，非阻塞、可堆叠、自动消失 ══ */
+  .toast-host { position:fixed; top:16px; left:50%; transform:translateX(-50%); z-index:100;
+                display:flex; flex-direction:column; gap:var(--sp-2); align-items:center; pointer-events:none; }
+  .toast { pointer-events:auto; max-width:min(520px,92vw); padding:9px 16px; border-radius:10px; font-size:13.5px;
+           background:var(--txt); color:#fff; box-shadow:var(--shadow-lg); display:flex; align-items:center; gap:var(--sp-2);
+           animation:toast-in .18s cubic-bezier(.22,.61,.36,1); }
+  .toast.err { background:var(--bad); } .toast.ok { background:var(--ok); } .toast.warn { background:var(--warn); }
+  .toast.out { animation:toast-out .18s ease-in forwards; }
+  @keyframes toast-in { from { opacity:0; transform:translateY(-8px); } }
+  @keyframes toast-out { to { opacity:0; transform:translateY(-8px); } }
+
+  .hidden { display:none !important; }
+
+  /* 折叠区（人设库 / 脚本全文） */
+  details > summary { list-style:none; cursor:pointer; }
+  details > summary::-webkit-details-marker { display:none; }
+  details > summary::before { content:"▸ "; color:var(--faint); }
+  details[open] > summary::before { content:"▾ "; }
+  details.fold > summary { font-size:12.5px; color:var(--sub); padding:6px 0; }
+  details.fold > summary:hover { color:var(--accent-deep); }
+
+  @media (prefers-reduced-motion:reduce) { *, *::before, *::after { animation-duration:.01ms !important; transition-duration:.01ms !important; } }
 </style>
 </head>
-<body>
-<div class="wrap">
-  <h1>铭星链 · 自动化品宣机器人</h1>
-  <div class="sub">填一份品牌简报，自动产出宣传片脚本 / 分镜 / 画面 / 配音 / 配乐 / 合成（<span id="modeBadge">DEMO 离线模式</span>）。</div>
+<body data-page-node-id="nBQ5dqJ4ycdfxnE23Xfh6v">
+<div class="wrap" data-page-node-id="XfWDniL2Ul80RMQVY6oLnP">
+  <header class="pagehead" data-page-node-id="LvEO89hKcG5fpcTmpgPTZv">
+    <h1 data-page-node-id="y7mEskd8v5PXa8yUSz9CxL">铭星链 · 自动化品宣机器人</h1>
+    <div class="sub" data-page-node-id="iFMB0cZZCJjMLr1U5uAuzk">填一份品牌简报，自动产出脚本 / 分镜 / 画面 / 配音 / 配乐 / 合成。</div>
+    <div class="spacer"></div>
+    <span id="modeBadge" class="is-demo" data-page-node-id="hSZil1Hzp6cGXQCTQDZ6Cg">DEMO 离线模式</span>
+  </header>
 
-  <div class="layout">
-  <div class="main">
-  <div class="card" id="formCard">
-    <div class="row">
-      <div><label>品牌名 *</label><input id="brandName" placeholder="例如：铭星科技" /></div>
-      <div><label>产品/服务名 *</label><input id="productName" placeholder="例如：星链 Pro" /></div>
+  <div class="layout" data-page-node-id="EV9zjy0YtiDlTDSC0kQZTR">
+  <aside class="col-radar">
+  <!-- ① 声量订阅：订阅条目 + 新增 + 手动采集 -->
+  <div class="card" id="radarCard" data-page-node-id="CC0FHehXZYBDr81ezDe2jn">
+    <div class="card-hd" data-page-node-id="wlFQfWeKGyRUdKUxmp9c0I">
+      <h3>舆情雷达 · 声量订阅</h3>
+      <span class="hd-note" id="radarMode" data-page-node-id="PC35PqhZkyUCWxb0EkL8lV">加载中…</span>
     </div>
-    <label>一句话核心卖点 *（≤60字）</label>
-    <input id="coreSellingPoint" maxlength="60" placeholder="例如：一句话生成专业宣传片" />
-    <div class="copy-bar">
-      <span id="copyIdeaNote" style="color:var(--sub);font-size:12px;">文案灵感：结合铭星链产品线预置 —— 套用下方模板或点「换一批」，即回填卖点与核心信息点。</span>
-      <button class="ghost mini" id="copyRollBtn" onclick="rollCopyIdeas()" title="换一批结合本项目产品线特点的文案">换一批</button>
+    <div id="radarPlatformNote" class="hint" data-page-node-id="fYg9aMThBD66O6trAKBmAE"></div>
+    <div id="subList" class="tpl-list" data-page-node-id="hzToZK2icEl13U4oyjvCHj"></div>
+    <div class="sect" style="margin-top:14px;">新增订阅</div>
+    <div class="row tight" data-page-node-id="d6LuDMgdRXx9coj4bhVo2B">
+      <input id="subName" placeholder="订阅名，如：行业词监控" style="flex:1;min-width:110px;" data-page-node-id="wvQUjuQLd3KaDi7K36ZjWw" />
+      <input id="subKeywords" placeholder="关键词，顿号分隔：铭星链、AI 创作" style="flex:2;min-width:150px;" data-page-node-id="c3RohgGfj8C8PogOuxDuCV" />
+    </div>
+    <div class="row tight" style="margin-top:8px;align-items:center;" data-page-node-id="WXS8Vhl0RZNQAYeEx0ifQr">
+      <button id="collectBtn" class="ghost" onclick="collectRadar()" data-page-node-id="NC7HSak3lZVaNJqn9FuTFr">立即采集一轮</button>
+      <button onclick="addSubscription()" data-page-node-id="P3WU5t2xz4wIM7JD43maP7">添加订阅</button>
+      <span id="radarCollectHint" class="hint" aria-live="polite" data-page-node-id="LcIFZDtL3d2ZM0CUGwWOnB"></span>
+    </div>
+  </div>
+
+  <!-- ② 热词榜 -->
+  <div class="card" data-page-node-id="bzoFYDGqKisxF2R94qhyy2">
+    <div class="card-hd">
+      <h3>热词榜</h3>
+      <select id="hwRange" onchange="loadHotwords()" style="width:auto;padding:4px 8px;font-size:12px;" data-page-node-id="BlZ7piu4jUphC12Cd9bGuC">
+        <option value="day" data-page-node-id="Azczj4YNbPNGyxNauEIb54">近 24 小时</option>
+        <option value="week" data-page-node-id="DlpgiDtLqg8ZqyOpoDfNFa">近 7 天</option>
+      </select>
+      <div class="spacer"></div>
+      <button class="ghost mini" onclick="loadHotwords()" data-page-node-id="31Tu11jdnxf00j5Iqofn3N">刷新</button>
+    </div>
+    <div id="hotwordList" data-page-node-id="ybI4LzN8CF8Wjy77CXCC5u"></div>
+    <div id="hotwordUpdatedAt" class="src-note" aria-live="polite"></div>
+  </div>
+
+  <!-- ③ 情绪分析 -->
+  <div class="card" data-page-node-id="lmu5URnWu2AY9KLgiwmPwf">
+    <div class="card-hd">
+      <h3>情绪分析</h3>
+      <span class="hd-note">LLM 打分 · 反讽可识别</span>
+      <div class="spacer"></div>
+      <button class="mini" onclick="scoreSentiment()" data-page-node-id="IRli0B0ull54kduXpdQgYA">打分</button>
+      <button class="ghost mini" onclick="loadSentiment()" data-page-node-id="AttQnN8YZ1dc4L2W2tUPC1">刷新</button>
+    </div>
+    <div id="sentimentSummary" data-page-node-id="sKIb3usGjtlpGBu6WWeV55"></div>
+    <div id="sentimentHint" class="hint" style="margin-top:6px;" aria-live="polite" data-page-node-id="JD41KFKGLa6doctUhv5PLs"></div>
+  </div>
+
+  <!-- 最终选题模板 TOP10：每个入选项展示综合评分与入选依据 -->
+  <div class="card" data-page-node-id="TgdwyIuCAhOTJEiosmGlU5">
+    <div class="card-hd">
+      <h3>最终选题模板 TOP10</h3>
+      <span class="hd-note">按热度、品牌契合度与风险综合筛选</span>
+      <div class="spacer"></div>
+      <button class="mini" onclick="generateTopics()" data-page-node-id="5qIFsu3Vas1FidybUN75Zj">生成</button>
+      <button class="ghost mini" onclick="loadTopics()" data-page-node-id="KNrbFEgCATUG2VXIETQyc6">刷新</button>
+    </div>
+    <div id="topicList" data-page-node-id="fN4WNQulMSxDXB5fEwHTzL"></div>
+    <div id="topicHint" class="hint" style="margin-top:6px;" aria-live="polite" data-page-node-id="C6fcDt3I3cXIChoDhz8yh9"></div>
+    <div id="topicFetchedAt" class="src-note" aria-live="polite"></div>
+
+    <details class="fold" style="margin-top:var(--sp-3);" data-page-node-id="aKYpsHOgNgrTnssynTRWVE">
+      <summary data-page-node-id="tW9VrjMiqcpyuDr33yQxaA">品牌人设库（选题约束 + 下发预填）</summary>
+      <div class="row tight" style="margin-top:6px;" data-page-node-id="6ikKuwbtcya7olOmsOiVXu">
+        <input id="psBrand" placeholder="品牌名" style="flex:1;min-width:100px;" data-page-node-id="wklKQbooAjzwlL2c404f1R" />
+        <input id="psProduct" placeholder="产品名" style="flex:1;min-width:100px;" data-page-node-id="l5zEqjV04pI6iPxvoibvzf" />
+      </div>
+      <div class="row tight" style="margin-top:6px;" data-page-node-id="EjP3y8KFXGZyk2oNssQzCw">
+        <input id="psSell" placeholder="核心卖点" style="flex:1;min-width:140px;" data-page-node-id="vhM3H59YorcJ2bYjULBOcK" />
+        <input id="psTones" placeholder="调性，顿号分隔：科技感、专业" style="flex:1;min-width:140px;" data-page-node-id="MQZhnD0sOZCy3vrgqhWiSz" />
+      </div>
+      <div class="row tight" style="margin-top:6px;">
+        <input id="psBanned" placeholder="禁用词：最好、第一" style="flex:1;min-width:130px;" data-page-node-id="rULK9bEHoRb05KCqOXkiZs" />
+        <input id="psTaboos" placeholder="禁忌话题：政治、竞品贬损" style="flex:1;min-width:130px;" data-page-node-id="h3NvGA4O4WaPs1AucQc9E0" />
+      </div>
+      <div class="row tight" style="margin-top:8px;align-items:center;" data-page-node-id="cxjSaa1bU9u9A4jqQvmxCP">
+        <button class="mini" onclick="savePersona()" data-page-node-id="6epyQC4eKOF9CJONndGR9E">保存人设</button>
+        <span id="personaHint" class="hint" aria-live="polite" data-page-node-id="FbxxHniGgdavo2fzF4DaJf"></span>
+      </div>
+    </details>
+  </div>
+  </aside>
+  <div class="main" data-page-node-id="dTVLUFIyhnA0Mckoe4Dj32">
+  <section class="template-strip" id="tplCard" aria-label="品牌模板">
+    <div class="template-heading"><strong>品牌模板</strong><span>点击标签套用</span></div>
+    <div id="tplList" class="template-tags" aria-label="可用模板"></div>
+    <details class="template-manager" id="tplManager">
+      <summary>管理模板</summary>
+      <label for="tplName">将当前简报存为模板</label>
+      <div class="template-save">
+        <input id="tplName" placeholder="模板名称" />
+        <button class="mini" onclick="saveCurrentAsTemplate()">存为模板</button>
+      </div>
+      <div id="tplManageList" class="tpl-list"></div>
+    </details>
+  </section>
+  <div class="card" id="formCard" data-page-node-id="0oicjqfax3iuEQGDfPFhjJ">
+    <div class="card-hd">
+      <h3>品牌简报</h3>
+      <span class="hd-note">带 <span class="req">*</span> 为必填，其余留空即用默认</span>
+      <div class="spacer"></div>
+      <button class="ghost mini" onclick="resetBrief()" title="清空表单，回到初始状态">重置</button>
     </div>
 
-    <div class="row">
-      <div><label>期望时长</label>
-        <select id="durationSec"><option>30</option><option>15</option><option>60</option><option>90</option></select></div>
-      <div><label>语言</label>
-        <select id="language">
-          <option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option>
-          <option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option>
-        </select></div>
-      <div><label>配音音色</label>
-        <select id="voiceTone"><option>男声</option><option>女声</option><option>沉稳</option><option>活泼</option></select></div>
-    </div>
-
-    <label>目标受众（可多选）</label>
-    <div class="chips" id="audienceChips"></div>
-
-    <label>宣传调性（可多选）</label>
-    <div class="chips" id="toneChips"></div>
-
-    <label>核心信息点（每行一条，可选）</label>
-    <textarea id="keyMessages" placeholder="例如：&#10;续航 30 小时&#10;支持离线生成"></textarea>
-
-    <label>风格参考（关键词或图片 URL，可选）</label>
-    <input id="styleReference" placeholder="例如：赛博朋克 / https://..." />
-
-    <div class="row" style="margin-top:12px;">
-      <div>
-        <label style="display:flex; gap:8px; align-items:center;">
-          <input type="checkbox" id="logoColorEnabled" style="width:auto;" />品牌主色（Logo 色，可选）
+    <fieldset class="grp">
+      <legend>品牌与卖点</legend>
+      <div class="grid2">
+        <div class="field">
+          <label class="lbl" for="brandName">品牌名<span class="req">*</span></label>
+          <input id="brandName" placeholder="例如：铭星科技" data-required="请填写品牌名" data-page-node-id="EHn7QLolwHhAgF4Hbg7b4u" />
+          <div class="err" id="err-brandName" role="alert"></div>
+        </div>
+        <div class="field">
+          <label class="lbl" for="productName">产品 / 服务名<span class="req">*</span></label>
+          <input id="productName" placeholder="例如：星链 Pro" data-required="请填写产品/服务名" data-page-node-id="HchBALxW2yUGnCKfVrTX79" />
+          <div class="err" id="err-productName" role="alert"></div>
+        </div>
+      </div>
+      <div class="field">
+        <label class="lbl" for="coreSellingPoint">一句话核心卖点<span class="req">*</span>
+          <span class="counter" id="cspCount">0 / 60</span>
         </label>
-        <input type="color" id="logoColor" value="#0ea5e9" style="width:80px; padding:2px; margin-top:6px;" />
+        <input id="coreSellingPoint" maxlength="60" placeholder="例如：一句话生成专业宣传片" data-required="请填写一句话核心卖点" data-page-node-id="jbBYJNonj7aIPKNrA4rJdK" />
+        <div class="err" id="err-coreSellingPoint" role="alert"></div>
       </div>
-      <div>
-        <label>禁用词（逗号分隔，可选）</label>
-        <input id="bannedWords" placeholder="例如：最、第一、绝对" />
+      <div class="copy-bar" data-page-node-id="brfSnnSMXplsq9O8PmP8mm">
+        <span id="copyIdeaNote" class="hint" data-page-node-id="MXeQOnZQ1D7szlXb36v1tn">文案灵感：套用右下方模板或点「换一批」，自动回填卖点与核心信息点。</span>
+        <button class="ghost mini" id="copyRollBtn" onclick="rollCopyIdeas()" title="换一批结合本项目产品线特点的文案" data-page-node-id="YOTl2SqCxS2DHFypeFv83F">换一批</button>
       </div>
-    </div>
-    <div class="sub" style="font-size:12px;">主色与禁用词会约束脚本、分镜与画面配色；可从下方模板库一键套用（FR-1.3）。模型与供应商配置在右侧「模型与服务」面板。</div>
+    </fieldset>
 
-    <label style="margin-top:12px;"><input type="checkbox" id="hitlEnabled" checked style="width:auto;margin-right:8px;" />启用脚本人工审核门（生成素材前先确认脚本）</label>
-    <label style="margin-top:8px;"><input type="checkbox" id="finalGateEnabled" checked style="width:auto;margin-right:8px;" />启用成片人工审核门（合成后验收成片再交付）</label>
+    <fieldset class="grp">
+      <legend>成片规格</legend>
+      <div class="grid3">
+        <div class="field">
+          <label class="lbl" for="durationSec">期望时长</label>
+          <select id="durationSec" data-page-node-id="xla0pQZixWHuZBAMPCUpFr"><option data-page-node-id="JWgg0Pvu1VFDvq6FC8ucDd">30</option><option data-page-node-id="h6X1DAikumCH8MN4INig39">15</option><option data-page-node-id="TCZcWneCyFHHJe4bHmkX34">60</option><option data-page-node-id="36P0kuB2sl0ka1Re3BD4pP">90</option></select>
+        </div>
+        <div class="field">
+          <label class="lbl" for="language">语言</label>
+          <select id="language" data-page-node-id="wnhjzIDLxRyV75U9pKuxf4">
+            <option value="zh-CN" data-page-node-id="utzv9T4RuDGK5b6Baw2VN6">简体中文</option><option value="zh-TW" data-page-node-id="YEmkWAlmJEOFxgEMwN3Beh">繁體中文</option>
+            <option value="en" data-page-node-id="fuGzW6RT0PFXcI0V0y6tHi">English</option><option value="ja" data-page-node-id="KkZGxPJy9prprA77olbIK4">日本語</option><option value="ko" data-page-node-id="1InbxXhLiZlOhgrRmnkSU1">한국어</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="lbl" for="voiceTone">配音音色</label>
+          <select id="voiceTone" data-page-node-id="ReFaAO7cFUHOSfX9rojC5T"><option data-page-node-id="voNnibQitagdDWvLeE9lFP">男声</option><option data-page-node-id="fHUeXrztW8XI0HCtncXlZK">女声</option><option data-page-node-id="V1EWyjSjs5A9XgEteWEWvG">沉稳</option><option data-page-node-id="HJdXwobrFDSZ3rrQDjU1Ez">活泼</option></select>
+        </div>
+      </div>
+    </fieldset>
 
-    <div style="margin-top:18px; display:flex; gap:10px;">
-      <button id="genBtn" onclick="submitBrief()">生成宣传片</button>
+    <fieldset class="grp">
+      <legend>受众与调性</legend>
+      <div class="field">
+        <label class="lbl">目标受众 <span class="opt">（可多选）</span></label>
+        <div class="chips" id="audienceChips" data-page-node-id="mOB66AZEa0EwW9r3eMC8AM"></div>
+      </div>
+      <div class="field">
+        <label class="lbl">宣传调性 <span class="opt">（可多选）</span></label>
+        <div class="chips" id="toneChips" data-page-node-id="GfLWCDWsG2SsArOAamiIaL"></div>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label class="lbl" for="keyMessages">核心信息点 <span class="opt">（每行一条）</span></label>
+          <textarea id="keyMessages" placeholder="例如：&#10;续航 30 小时&#10;支持离线生成"></textarea>
+        </div>
+        <div class="field">
+          <label class="lbl" for="styleReference">风格参考 <span class="opt">（关键词或图片 URL）</span></label>
+          <input id="styleReference" placeholder="例如：赛博朋克 / https://..." data-page-node-id="bSPjEcfd74mUtjWiFHp1O6" />
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="grp">
+      <legend>品牌约束</legend>
+      <div class="row">
+        <div class="field" style="flex:0 0 auto;">
+          <label class="lbl">品牌主色 <span class="opt">（Logo 色）</span></label>
+          <div class="check-row" style="display:inline-flex;" data-page-node-id="SaSDeFckBC4QpRf3fYO2uC">
+            <input type="checkbox" id="logoColorEnabled" data-page-node-id="J8awp9Qo1c2dSuZKyHScNM" />
+            <span class="cr-txt">启用</span>
+          </div>
+          <input type="color" id="logoColor" value="#0ea5e9" style="width:80px;margin-top:6px;" data-page-node-id="rWvdyYnmubnfWZowtxSSct" />
+        </div>
+        <div class="field">
+          <label class="lbl" for="bannedWords">禁用词 <span class="opt">（逗号或顿号分隔）</span></label>
+          <input id="bannedWords" placeholder="例如：最、第一、绝对" data-page-node-id="M7vDD2yOZaBg9tPdSVzgFE" />
+        </div>
+      </div>
+      <div class="hint" data-page-node-id="pjTFQc694JraELZDvxkjtv">主色与禁用词会约束脚本、分镜与画面配色；可从右侧模板库一键套用。</div>
+    </fieldset>
+
+    <fieldset class="grp">
+      <legend>人工审核门</legend>
+      <div class="grid2">
+        <label class="check-row" style="margin:0;" data-page-node-id="KgSnR20HxwOg4ZtuTzkJn2">
+          <input type="checkbox" id="hitlEnabled" checked data-page-node-id="k9GsS2hQFCXVoeJ6yUHS9m" />
+          <span class="cr-txt">脚本审核门
+            <span class="cr-sub">生成素材前先确认脚本与旁白</span>
+          </span>
+        </label>
+        <label class="check-row" style="margin:0;" data-page-node-id="3n3NA9DJi1XUOMfNWLmbTS">
+          <input type="checkbox" id="finalGateEnabled" checked data-page-node-id="rnBzms3jC4ZCKkeQHRR64v" />
+          <span class="cr-txt">成片验收门
+            <span class="cr-sub">合成后验收成片再交付</span>
+          </span>
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="row tight" style="margin-top:var(--sp-4);align-items:center;" data-page-node-id="vTN2UsiWHC7HDvxaH3c0GV">
+      <button id="genBtn" class="lg" onclick="submitBrief()" data-page-node-id="tvOcQdGTAb8jM4S3sXkUgg">生成宣传片</button>
+      <span class="hint">回车即可提交 · 生成过程实时可见，可随时中断</span>
     </div>
   </div>
 
-  <div class="card" id="tplCard">
-    <h3 style="margin-top:0;">品牌模板库 <span style="font-size:12px;color:var(--sub);font-weight:400;">（一键套用，保证调性统一 · M4）</span></h3>
-    <div id="tplList" class="tpl-list"></div>
-    <div class="row" style="margin-top:12px;">
-      <input id="tplName" placeholder="模板名，如：科技品牌标准" style="flex:1;" />
-      <button onclick="saveCurrentAsTemplate()">保存当前为模板</button>
+  <div class="card hidden" id="progressCard" data-page-node-id="wBGWCqRn5b2NE03RnQDwiO">
+    <div class="card-hd">
+      <h3>生成进度</h3>
+      <div class="spacer"></div>
+      <span class="hd-note" id="progText">等待开始</span>
     </div>
+    <div class="steps-head">
+      <div class="prog-track"><i id="progBar"></i></div>
+    </div>
+    <ul class="steps" id="steps" data-page-node-id="cvp5I6vGuP8821qiA4zFee"></ul>
   </div>
 
-  <div class="card hidden" id="progressCard">
-    <h3 style="margin-top:0;">生成进度</h3>
-    <ul class="steps" id="steps"></ul>
-  </div>
-
-  <div class="card hidden" id="resultCard">
-    <h3 style="margin-top:0;">成片交付</h3>
-    <div id="delivery"></div>
+  <div class="card hidden" id="resultCard" data-page-node-id="b9uVPX3qjICq0ltbd0BWvN">
+    <div class="card-hd">
+      <h3>成片交付</h3>
+    </div>
+    <div id="delivery" data-page-node-id="q8ivQY9C4APGA1Rqv8oq5T"></div>
   </div>
   </div><!-- /main -->
 
-  <aside class="side">
-    <div class="card" id="cfgCard">
-      <h3 style="margin-top:0;font-size:15px;">模型与服务配置</h3>
-      <label>运行模式</label>
-      <select id="providerMode">
-        <option value="demo">DEMO 离线（占位生成，无需供应商）</option>
-        <option value="real">real 真实（调用下方供应商 one-api）</option>
-      </select>
-      <label>供应商 API 地址（one-api 兼容）</label>
-      <input id="providerBaseUrl" placeholder="http://127.0.0.1:8080/v1（留空 = env 默认）" />
-      <label>API Key <span style="color:var(--sub);font-weight:normal;">（可写不可读，保存后仅显示「已配置」）</span></label>
-      <div style="display:flex;gap:8px;align-items:center;">
-        <input id="apiKeyInput" type="password" style="flex:1;" placeholder="sk-…（留空不改动）" autocomplete="off" />
-        <button id="clearKeyBtn" onclick="clearSavedKey()" style="display:none;flex:0 0 auto;" title="清除已保存的密钥（回退 env）">清除</button>
-      </div>
-      <div id="cfgHint" style="color:var(--sub);font-size:12px;margin:6px 0 8px;"></div>
-      <button id="saveCfgBtn" onclick="saveProviderConfig()" style="width:100%;">保存并生效（地址 / 模式 / 密钥）</button>
-
-      <hr class="sep" />
-      <label>脚本/分镜模型</label>
-      <select id="llmModel"></select>
-      <label>场景图模型</label>
-      <select id="imageModel"></select>
-      <label>动态视频模型 <span id="videoSrcTag" style="color:var(--sub);font-weight:normal;"></span></label>
-      <select id="videoModel"></select>
-      <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
-        <button id="refreshModelsBtn" onclick="loadRemoteModels(true)" style="flex:1;">从网关刷新模型清单</button>
-      </div>
-      <div id="modelHint" style="color:var(--sub);font-size:12px;margin-top:6px;">留空 = 不启用该能力，用服务端默认。连接供应商后模型清单自动从网关拉取（llm/image/audio/video 分类）。</div>
-
-      <hr class="sep" />
-      <div id="voiceInfo" style="color:var(--sub);font-size:12px;"></div>
+  <aside class="side" data-page-node-id="kljP7ug3HVDSiwfz0F1L4s">
+  <div class="card" id="cfgCard" data-page-node-id="KT31ae0GnuYjHmGOZUtwZP">
+    <div class="card-hd">
+      <h3>模型与服务</h3>
     </div>
+
+    <fieldset class="grp">
+      <legend>接入</legend>
+      <div class="field">
+        <label class="lbl" for="providerMode">运行模式</label>
+        <select id="providerMode" data-page-node-id="uD863Nx2VnOk5VeyEiW696">
+          <option value="demo" data-page-node-id="iUwD5OCP9V65tm9uqLfNCL">DEMO 离线（占位生成，无需供应商）</option>
+          <option value="real" data-page-node-id="OQCBKc2VL6BjuryGBQQjFe">real 真实（调用下方供应商 one-api）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="lbl" for="providerBaseUrl">供应商 API 地址</label>
+        <input id="providerBaseUrl" placeholder="http://127.0.0.1:8080/v1（留空 = env 默认）" data-page-node-id="Cd0A7yuen6wVTO2WW9nNnU" />
+      </div>
+      <div class="field">
+        <label class="lbl" for="apiKeyInput">API Key <span class="opt">（可写不可读）</span></label>
+        <div class="row tight" style="align-items:center;" data-page-node-id="8DkeiHXBeeJFTmzctwveEv">
+          <input id="apiKeyInput" type="password" style="flex:1;min-width:0;" placeholder="sk-…（留空不改动）" autocomplete="off" data-page-node-id="ohEd492k8ZnOAnetGVamdA" />
+          <button id="clearKeyBtn" class="danger mini" onclick="clearSavedKey()" style="display:none;" title="清除已保存的密钥（回退 env）" data-page-node-id="J14Rfu7GpsZmCY5TpUPB6v">清除</button>
+        </div>
+      </div>
+      <div id="cfgHint" class="hint" aria-live="polite" data-page-node-id="yhh2KxUeRjDLXCqJ7J8xSe"></div>
+      <button id="saveCfgBtn" class="block" onclick="saveProviderConfig()" data-page-node-id="z1sHzZYH4wC3qPIEB32Xpb">保存并生效</button>
+    </fieldset>
+
+    <fieldset class="grp">
+      <legend>模型选择</legend>
+      <div class="field">
+        <label class="lbl" for="llmModel">脚本 / 分镜模型</label>
+        <select id="llmModel" data-page-node-id="LvF3Rli41VFBvE3r2TZRoW"></select>
+      </div>
+      <div class="field">
+        <label class="lbl" for="imageModel">场景图模型</label>
+        <select id="imageModel" data-page-node-id="uZgq38xGuX36YMQmy1Y9Gb"></select>
+      </div>
+      <div class="field">
+        <label class="lbl" for="videoModel">动态视频模型 <span id="videoSrcTag" class="opt" data-page-node-id="zyuQA5lK9bPnHWu4umpQOV"></span></label>
+        <select id="videoModel" data-page-node-id="ns1VK3gmAaLToD3loEzwWs"></select>
+      </div>
+      <button id="refreshModelsBtn" class="ghost block" onclick="loadRemoteModels(true)" data-page-node-id="hgLZKAbrsrDo4hhErnLwgF">从网关刷新清单</button>
+      <div id="modelHint" class="hint" style="margin-top:6px;" data-page-node-id="50sAi87PvTt70s872yH1tt">留空 = 用服务端默认。连接供应商后清单自动从网关拉取。</div>
+    </fieldset>
+
+    <div id="voiceInfo" class="hint" data-page-node-id="MBuBmGvDG9gATTBiAC46OL"></div>
+  </div>
   </aside>
   </div><!-- /layout -->
 </div>
 
 <!-- 脚本 HITL 审核门 -->
-<div class="modal hidden" id="gateModal">
-  <div class="box">
-    <h3 style="margin-top:0;">脚本确认门</h3>
-    <div id="gateScript"></div>
-    <div style="margin-top:14px; display:flex; gap:10px; justify-content:flex-end;">
-      <button class="ghost" onclick="approveScript(false)">直接采用</button>
-      <button onclick="approveScript(true)">采用我的修改</button>
+<div class="modal hidden" id="gateModal" data-modal data-page-node-id="CmlsEc0bpx6gPvetyI6IUq">
+  <div class="box" data-page-node-id="Q5fAZo7x5nwGaDA1DVhaFr">
+    <div class="box-hd">
+      <h3>脚本确认门</h3>
+      <div class="spacer"></div>
+      <button class="icon-btn" onclick="closeModal('gateModal')" title="关闭（Esc）" aria-label="关闭">×</button>
+    </div>
+    <div id="gateScript" data-page-node-id="dMZUSLH0swU64ZBM9pbXtW"></div>
+    <div class="box-ft">
+      <button class="ghost" onclick="approveScript(false)" data-page-node-id="uFMfVLlRbwmEhbLl7sIXWy">直接采用</button>
+      <button onclick="approveScript(true)" data-page-node-id="7Z5FFyDQ8MH0HN3voABcQg">采用我的修改</button>
     </div>
   </div>
 </div>
 
 <!-- 成片 HITL 审核门（FR-9.2 / M3） -->
-<div class="modal hidden" id="finalGateModal">
-  <div class="box">
-    <h3 style="margin-top:0;">成片验收门</h3>
-    <div id="finalPreview"></div>
-    <div style="margin-top:14px; display:flex; gap:10px; justify-content:flex-end;">
-      <button class="ghost" onclick="approveFinal(false)">重生成（指定分镜）</button>
-      <button onclick="approveFinal(true)">验收并交付</button>
+<div class="modal hidden" id="finalGateModal" data-modal data-page-node-id="XPpPkXpymZxflwcZ1BCxUM">
+  <div class="box" data-page-node-id="RszBdtZbuqfEskBMvuU50c">
+    <div class="box-hd">
+      <h3>成片验收门</h3>
+      <div class="spacer"></div>
+      <button class="icon-btn" onclick="closeModal('finalGateModal')" title="关闭（Esc）" aria-label="关闭">×</button>
+    </div>
+    <div id="finalPreview" data-page-node-id="FHJ4ZTnKwWrL435fZkFXmz"></div>
+    <div class="box-ft">
+      <button class="ghost" onclick="approveFinal(false)" data-page-node-id="YPHp4iEYCE84NztY1hM0dP">重生成（指定分镜）</button>
+      <button onclick="approveFinal(true)" data-page-node-id="3p3Z1DOUoy7Z2EsQBQct0o">验收并交付</button>
     </div>
   </div>
 </div>
+
+<div class="toast-host" id="toastHost" aria-live="polite" aria-atomic="false"></div>
 
 <script>
 const AUDIENCE = ["Z世代","白领","企业采购","宝妈","学生","极客"];
 const TONES = ["科技感","温情","高端","国潮","搞笑","专业"];
 let audienceSel = new Set(), toneSel = new Set();
 let es = null, currentRunId = null, pendingScript = null, gateVoice = [], BUDGET_CAP = null, QUOTA_CAP = null, SERVER_CONFIG = null;
+let lastRadarCollectedAt = "";
+function formatCaptureTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 // 文案灵感状态（「换一批」轮换）：preset=当前模板场景，platform 为通用回落。
 let COPY = { preset: null, batch: 0, total: 1 };
 
@@ -223,33 +689,410 @@ buildChips("audienceChips", AUDIENCE, audienceSel);
 buildChips("toneChips", TONES, toneSel);
 fetchMode();
 loadTemplates();
+refreshRadarAndTopicsOnEnter();
 
-// ── 模板库（M4 / FR-1.3）──
-async function loadTemplates() {
+// ── 舆情雷达（M1）：订阅管理 + 一键采集 + 热词榜 ──
+
+/* ══ 全局通知 ══
+   旧实现把「全局 toast」写进左栏 #radarCollectHint —— 用户在右侧改配置时，
+   提示出现在左栏一个小灰字里，等于没有反馈。改为顶部浮层，非阻塞、自动消失。
+   kind: ""(中性) | "ok" | "err" | "warn" */
+function toast(msg, kind) {
+  const host = document.getElementById("toastHost");
+  if (!host) return;
+  const el = document.createElement("div");
+  el.className = "toast" + (kind ? " " + kind : "");
+  el.textContent = String(msg);
+  host.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("out");
+    setTimeout(() => el.remove(), 200);
+  }, kind === "err" ? 4200 : 2600);
+}
+function toastErr(msg) { toast(msg, "err"); }
+
+/* ══ 弹层交互：ESC / 点遮罩 / × 三种退出路径（原实现只能点按钮）══ */
+function closeModal(id) {
+  const m = document.getElementById(id);
+  if (m) m.classList.add("hidden");
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    document.querySelectorAll(".modal:not(.hidden)").forEach((m) => m.classList.add("hidden"));
+  }
+});
+document.addEventListener("click", (e) => {
+  // 点击遮罩（而非弹层内容）即关闭
+  if (e.target.classList.contains("modal")) e.target.classList.add("hidden");
+});
+
+/* ══ 表单内联校验：失焦即校验，而非只在提交时（UI/UX 准则 High）══ */
+const REQUIRED_FIELDS = ["brandName", "productName", "coreSellingPoint"];
+function setFieldError(id, msg) {
+  const input = document.getElementById(id);
+  const err = document.getElementById("err-" + id);
+  if (!input || !err) return;
+  if (msg) { input.classList.add("invalid"); err.textContent = msg; err.classList.add("show"); }
+  else { input.classList.remove("invalid"); err.textContent = ""; err.classList.remove("show"); }
+}
+function validateField(id) {
+  const input = document.getElementById(id);
+  if (!input) return true;
+  const ok = input.value.trim().length > 0;
+  setFieldError(id, ok ? "" : (input.dataset.required || "此项为必填"));
+  return ok;
+}
+function validateForm() {
+  let firstBad = null;
+  REQUIRED_FIELDS.forEach((id) => { if (!validateField(id) && !firstBad) firstBad = id; });
+  if (firstBad) {
+    const el = document.getElementById(firstBad);
+    el.focus();
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    toastErr("还有必填项没填完");
+  }
+  return !firstBad;
+}
+// 字数计数（≤60）：提前告知约束，避免提交后才知道超长
+function syncCounter() {
+  const input = document.getElementById("coreSellingPoint");
+  const c = document.getElementById("cspCount");
+  if (!input || !c) return;
+  const n = input.value.length;
+  c.textContent = n + " / 60";
+  c.classList.toggle("over", n >= 60);
+}
+REQUIRED_FIELDS.forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("blur", () => validateField(id));
+  if (el) el.addEventListener("input", () => { if (el.classList.contains("invalid")) validateField(id); });
+});
+const _csp = document.getElementById("coreSellingPoint");
+if (_csp) { _csp.addEventListener("input", syncCounter); syncCounter(); }
+// 回车提交（表单里任意单行输入框按回车 = 点生成）
+document.getElementById("formCard").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); submitBrief(); }
+});
+
+// 重置简报：清空文本、取消 chip 选中、清校验态
+function resetBrief() {
+  appliedTemplateId = null;
+  document.querySelectorAll(".template-tag").forEach((tag) => tag.setAttribute("aria-pressed", "false"));
+  ["brandName", "productName", "coreSellingPoint", "keyMessages", "styleReference", "bannedWords"].forEach((id) => {
+    const el = document.getElementById(id); if (el) el.value = "";
+  });
+  REQUIRED_FIELDS.forEach((id) => setFieldError(id, ""));
+  audienceSel.clear(); toneSel.clear();
+  document.querySelectorAll("#audienceChips .chip, #toneChips .chip").forEach((c) => c.classList.remove("on"));
+  syncCounter();
+  toast("已重置简报");
+}
+async function loadRadar() {
   try {
-    const list = await (await fetch("/api/templates")).json();
-    const el = document.getElementById("tplList");
+    const st = await (await fetch("/api/radar/status")).json();
+    document.getElementById("radarMode").textContent = st.mode === "real" ? "（real · TikHub 实时采集）" : "（DEMO · 种子数据，零外部依赖）";
+    const unavail = (st.platforms || []).filter((p) => p.available === false).map((p) => `${p.label}：${p.note}`);
+    document.getElementById("radarPlatformNote").textContent =
+      `存储 ${st.storeSize} 条声量${unavail.length ? ` ｜ 暂不可用：${unavail.join("；")}` : ""}`;
+    const subs = await (await fetch("/api/radar/subscriptions")).json();
+    const el = document.getElementById("subList");
     el.innerHTML = "";
-    list.forEach((t) => {
+    if (!subs.length) {
+      el.innerHTML = `<div class="empty"><div class="e-title">还没有订阅</div>
+        添加一个关键词订阅后，即可一键采集全网声量。<br/>
+        <button class="mini" onclick="document.getElementById('subName').focus()">去添加</button></div>`;
+      return;
+    }
+    subs.forEach((s) => {
       const row = document.createElement("div");
       row.className = "tpl-item";
       const meta = document.createElement("div");
       meta.className = "tpl-meta";
-      meta.innerHTML = `<b>${esc(t.name)}</b> <span style="color:var(--sub);font-size:12px;">${esc(t.defaultTone || "")} · ${esc(t.defaultLanguage || "")}${t.logoColor ? ` · <span style="color:${esc(t.logoColor)}">●</span>${esc(t.logoColor)}` : ""}${t.isPreset ? " · 预设" : ""}</span>`;
+      meta.innerHTML = `<b>${esc(s.name)}</b>${s.isPreset ? ` <span class="tag brand">预设</span>` : ""}
+        <span class="m-sub">${esc((s.keywords || []).join("、"))} ｜ ${esc((s.platforms || []).join("/"))}</span>`;
       const actions = document.createElement("div");
-      actions.style.marginLeft = "auto";
-      const loadBtn = document.createElement("button");
-      loadBtn.textContent = "套用"; loadBtn.style.fontSize = "12px";
-      loadBtn.onclick = () => applyTemplate(t);
+      actions.className = "tpl-act";
       const delBtn = document.createElement("button");
-      delBtn.textContent = "删除"; delBtn.className = "ghost"; delBtn.style.fontSize = "12px"; delBtn.style.marginLeft = "6px";
-      if (t.isPreset) { delBtn.disabled = true; delBtn.title = "预设不可删"; delBtn.style.opacity = ".4"; }
-      else delBtn.onclick = () => deleteTemplate(t.id);
-      actions.appendChild(loadBtn); actions.appendChild(delBtn);
+      delBtn.textContent = "删除"; delBtn.className = "danger mini";
+      if (s.isPreset) { delBtn.disabled = true; delBtn.title = "预置订阅不可删"; }
+      else delBtn.onclick = () => deleteSubscription(s.id);
+      actions.appendChild(delBtn);
       row.appendChild(meta); row.appendChild(actions);
       el.appendChild(row);
     });
   } catch {}
+}
+async function addSubscription() {
+  const name = document.getElementById("subName").value.trim();
+  const keywords = document.getElementById("subKeywords").value.split(/[、,，]/).map((s) => s.trim()).filter(Boolean);
+  if (!name || !keywords.length) { toast("请填写订阅名与关键词"); return; }
+  const r = await fetch("/api/radar/subscriptions", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, keywords, platforms: ["douyin", "xhs", "bilibili"] }),
+  });
+  if (!r.ok) { toast((await r.json()).error || "添加失败"); return; }
+  document.getElementById("subName").value = ""; document.getElementById("subKeywords").value = "";
+  toast("订阅已添加"); loadRadar();
+}
+async function deleteSubscription(id) {
+  const r = await fetch(`/api/radar/subscriptions/${id}`, { method: "DELETE" });
+  if (!r.ok) { toast((await r.json()).error || "删除失败"); return; }
+  loadRadar();
+}
+async function collectRadar() {
+  const btn = document.getElementById("collectBtn");
+  const hint = document.getElementById("radarCollectHint");
+  btn.disabled = true; hint.textContent = "采集中…（单平台 QPS≤1，逐关键词拉取）";
+  try {
+    const r = await fetch("/api/radar/collect", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) { toast(j.error || "采集失败"); hint.textContent = ""; return; }
+    hint.textContent = `本轮扫描 ${j.scanned} 条，新增 ${j.added}，去重 ${j.duplicates}${j.requests ? `，计费请求 ${j.requests}` : "，零计费"}${j.errors?.length ? `，失败 ${j.errors.length}` : ""}`;
+    toast(`采集完成：新增 ${j.added} 条`);
+    loadRadar(); loadHotwords();
+  } catch (e) {
+    toast("采集异常"); hint.textContent = "";
+  } finally { btn.disabled = false; }
+}
+async function loadHotwords() {
+  const range = document.getElementById("hwRange").value;
+  try {
+    const j = await (await fetch(`/api/radar/hotwords?range=${range}`)).json();
+    const updated = document.getElementById("hotwordUpdatedAt");
+    if (updated) updated.textContent = `来源：${j.source === "tikhub" ? "TikHub 实时数据" : "DEMO 种子数据"} · 数据抓取时间：${formatCaptureTime(lastRadarCollectedAt || j.updatedAt)}（${j.keywords?.length || 0} 条）`;
+    const el = document.getElementById("hotwordList");
+    if (!j.keywords?.length) {
+      el.innerHTML = `<div class="empty"><div class="e-title">暂无声量</div>
+        先采集一轮，热词榜会按词频与增速排序。<br/>
+        <button class="mini" onclick="collectRadar()">立即采集一轮</button></div>`;
+      return;
+    }
+    el.innerHTML = `<div class="rank-list">` + j.keywords.slice(0, 20).map((k, i) => {
+      const badge = k.hot ? `<span class="tag hot">爆点</span>` : "";
+      const tag = k.tag === "brand" ? `<span class="tag brand">品牌</span>` : "";
+      const ratio = k.ratio === "new" ? `<span class="tag new">新词</span>` : `环比 ${k.ratio}`;
+      return `<div class="rank-item">
+        <span class="rk${i < 3 ? " top" : ""}">${i + 1}</span>
+        <span class="rk-body">${esc(k.word)} ${tag} ${badge}</span>
+        <span class="rk-side">${k.count} 条 · 分值 ${k.score}<br/>${ratio}</span>
+      </div>`;
+    }).join("") + `</div>`;
+  } catch {}
+}
+
+// ── 情绪分析（M2）：LLM 打分 + 聚合摘要（无告警/无站内信） ──
+async function scoreSentiment() {
+  const hint = document.getElementById("sentimentHint");
+  hint.textContent = "打分中…（指纹缓存跳过已打分；real 模式批量 ≤20 走 LLM，DEMO 走确定性特征词）";
+  try {
+    const r = await fetch("/api/radar/score", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) { hint.textContent = j.error || "打分失败"; return; }
+    const parts = [`本轮打分 ${j.llmScored + j.dictScored + j.demoScored} 条`];
+    if (j.llmScored) parts.push(`LLM ${j.llmScored}`);
+    if (j.demoScored) parts.push(`DEMO ${j.demoScored}`);
+    if (j.dictScored) parts.push(`词典降级 ${j.dictScored}`);
+    if (j.cacheSkipped) parts.push(`缓存跳过 ${j.cacheSkipped}`);
+    if (j.downgraded) parts.push("已达每日预算，降级词典");
+    if (j.tokens) parts.push(`tokens ${j.tokens}`);
+    hint.textContent = parts.join(" · ");
+    loadSentiment();
+  } catch { hint.textContent = "打分异常"; }
+}
+async function loadSentiment() {
+  try {
+    const j = await (await fetch("/api/radar/sentiment?windowHours=24")).json();
+    const el = document.getElementById("sentimentSummary");
+    if (!j.scored) {
+      el.innerHTML = `<div class="empty"><div class="e-title">暂无打分结果</div>
+        先采集一轮声量，再点「打分」得到正/中/负分布与情绪指数。<br/>
+        <button class="mini" onclick="scoreSentiment()">打分未处理声量</button></div>`;
+      return;
+    }
+    // 堆叠占比条：三段共 100%，宽度即占比（原实现是三段固定 120px 基准的裸色块，无刻度无图例）
+    const pct = (v) => (j.scored ? (v / j.scored * 100) : 0).toFixed(1) + "%";
+    el.innerHTML = `
+      <div class="kpis">
+        <div class="kpi"><div class="k-val">${j.scored}</div><div class="k-lbl">已打分声量</div></div>
+        <div class="kpi pos"><div class="k-val">${j.pos}</div><div class="k-lbl">正面</div></div>
+        <div class="kpi"><div class="k-val">${j.neu}</div><div class="k-lbl">中性</div></div>
+        <div class="kpi neg"><div class="k-val">${j.neg}</div><div class="k-lbl">负面</div></div>
+        <div class="kpi idx"><div class="k-val">${j.index ?? "-"}<span style="font-size:11px;color:var(--faint);">/100</span></div><div class="k-lbl">情绪指数</div></div>
+      </div>
+      <div class="bar-stack" title="正面 ${pct(j.pos)} · 中性 ${pct(j.neu)} · 负面 ${pct(j.neg)}">
+        <i style="width:${pct(j.pos)};background:var(--ok)"></i>
+        <i style="width:${pct(j.neu)};background:var(--line-strong)"></i>
+        <i style="width:${pct(j.neg)};background:var(--bad)"></i>
+      </div>
+      <div class="bar-legend">
+        <span style="--dot:var(--ok)">正面 ${pct(j.pos)}</span>
+        <span style="--dot:var(--line-strong)">中性 ${pct(j.neu)}</span>
+        <span style="--dot:var(--bad)">负面 ${pct(j.neg)}</span>
+        <span class="no-dot">负面声量 ${j.negativeVolume}（占比 ${j.negRatio}%，置信 ≥0.6）</span>
+      </div>
+      <div class="hint" style="margin-top:6px;">近 24h 窗口 · 未打分 ${j.unscored} 条 · 模型 ${j.nlp?.model || "-"}${j.nlp?.dailyCap ? ` · 今日预算 ${j.nlp.usedToday}/${j.nlp.dailyCap}` : ""}</div>`;
+  } catch {}
+}
+// ── 选题会商（M3 收窄版）：生成 → 打分排序 → 一键下发（复用生成流水线 + SSE） ──
+const TYPE_COLOR = { offense: "var(--bad)", trend: "var(--warn)", defense: "#c084fc" };
+async function loadPersona() {
+  try {
+    const p = await (await fetch("/api/radar/persona")).json();
+    document.getElementById("psBrand").value = p.brandName || "";
+    document.getElementById("psProduct").value = p.productName || "";
+    document.getElementById("psSell").value = p.coreSellingPoint || "";
+    document.getElementById("psTones").value = (p.tones || []).join("、");
+    document.getElementById("psBanned").value = (p.bannedWords || []).join("、");
+    document.getElementById("psTaboos").value = (p.taboos || []).join("、");
+  } catch {}
+}
+async function savePersona() {
+  const body = {
+    brandName: document.getElementById("psBrand").value.trim(),
+    productName: document.getElementById("psProduct").value.trim(),
+    coreSellingPoint: document.getElementById("psSell").value.trim(),
+    tones: document.getElementById("psTones").value.split(/[、,，]/).map(s=>s.trim()).filter(Boolean),
+    bannedWords: document.getElementById("psBanned").value.split(/[、,，]/).map(s=>s.trim()).filter(Boolean),
+    taboos: document.getElementById("psTaboos").value.split(/[、,，]/).map(s=>s.trim()).filter(Boolean),
+  };
+  const r = await fetch("/api/radar/persona", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  document.getElementById("personaHint").textContent = r.ok ? "已保存（选题与下发即时生效）" : (j.error || "保存失败");
+  if (r.ok) toast("人设已保存");
+}
+async function loadTopics() {
+  try {
+    const j = await (await fetch("/api/radar/topics")).json();
+    const fetched = document.getElementById("topicFetchedAt");
+    if (fetched) fetched.textContent = `数据抓取时间：${formatCaptureTime(lastRadarCollectedAt || j.generatedAt)}（精确到秒）`;
+    const el = document.getElementById("topicList");
+    if (!j.topics?.length) {
+      el.innerHTML = `<div class="empty"><div class="e-title">今日尚未生成选题</div>
+        选题模板会结合热词与品牌约束综合筛选，先生成今日 TOP10。<br/>
+        <button class="mini" onclick="generateTopics()">生成今日选题</button></div>`;
+      return;
+    }
+    const tcol = (t) => `<span class="tag" style="color:${TYPE_COLOR[t.type] || "var(--sub)"}">${t.typeLabel || ""}</span>`;
+    el.innerHTML = `<div class="rank-list">` + j.topics.map((t) => {
+      const ev = (t.evidence || []).map((e) => e.ref).join(" / ");
+      const done = (j.dispatched || []).some((d) => d.title === t.title);
+      return `<div class="rank-item">
+        <span class="rk${t.rank <= 3 ? " top" : ""}">${t.rank}</span>
+        <span class="rk-body">
+          <div>${tcol(t)} ${esc(t.title)}</div>
+          <div class="hint">总分 <b>${t.scores.total}</b>（热 ${t.scores.heat} / 契 ${t.scores.fit} / 险 ${t.scores.risk}）· ${esc(t.format)} · ${esc(t.channel)}</div>
+          <div class="hint" style="color:var(--faint)">入选原因：${esc(ev) || `综合评分 ${t.scores.total}，热度 ${t.scores.heat}、品牌契合度 ${t.scores.fit}，风险控制 ${t.scores.risk}`}</div>
+        </span>
+        <span class="rk-side"><button class="mini" ${done ? "disabled" : ""} onclick="dispatchTopic('${t.id}')">${done ? "已下发" : "下发"}</button></span>
+      </div>`;
+    }).join("") + `</div>
+      <div class="src-note">来源：${j.source === "llm" ? "LLM 网关" : "DEMO 模板"} · 模型 ${j.config?.model || "-"} · 生成于 ${formatCaptureTime(j.generatedAt)}</div>`;
+  } catch {}
+}
+async function generateTopics() {
+  const hint = document.getElementById("topicHint");
+  hint.textContent = "生成中…（注入热词榜 + 情绪摘要 + 人设约束；LLM 失败自动回落 DEMO 模板）";
+  try {
+    const r = await fetch("/api/radar/topics/generate", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) { hint.textContent = j.error || "生成失败"; return; }
+    hint.textContent = `已生成 ${j.topics.length} 个选题（来源 ${j.source === "llm" ? "LLM" : "DEMO"}）${j.errors?.length ? ` · ${j.errors.length} 条被过滤/降级` : ""}`;
+    loadTopics();
+  } catch { hint.textContent = "生成异常"; }
+}
+async function dispatchTopic(topicId) {
+  const hint = document.getElementById("topicHint");
+  hint.textContent = "下发中…（人设预填 Brief → 进入宣传片流水线，脚本确认门照常弹出）";
+  try {
+    const r = await fetch(`/api/radar/topics/${topicId}/dispatch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+    const j = await r.json();
+    if (!r.ok) { hint.textContent = j.error || "下发失败"; return; }
+    toast(`已下发：${j.title}`);
+    hint.textContent = `已进入生成流水线 runId=${j.runId}，进度见下方「生成进度」`;
+    // 复用主生成链路的进度展示与 SSE 监听（脚本门/成片门照常工作）
+    currentRunId = j.runId;
+    document.getElementById("progressCard").classList.remove("hidden");
+    document.getElementById("steps").innerHTML = "";
+    openStream(currentRunId);
+    loadTopics();
+  } catch { hint.textContent = "下发异常"; }
+}
+async function refreshRadarAndTopicsOnEnter() {
+  const hint = document.getElementById("topicHint");
+  if (hint) hint.textContent = "正在抓取热词并生成今日 TOP10…";
+  try {
+    const collect = await fetch("/api/radar/collect", { method: "POST" });
+    const result = await collect.json().catch(() => ({}));
+    if (collect.ok) {
+      lastRadarCollectedAt = result.collectedAt || new Date().toISOString();
+      await loadHotwords();
+      const generated = await fetch("/api/radar/topics/generate", { method: "POST" });
+      const generatedResult = await generated.json().catch(() => ({}));
+      if (!generated.ok) throw new Error(generatedResult.error || "TOP10 生成失败");
+      if (hint) hint.textContent = `已完成本次抓取，生成 ${generatedResult.topics?.length || 0} 个选题`;
+    } else {
+      if (hint) hint.textContent = result.error || "热词抓取失败，已展示最近一次数据";
+    }
+  } catch (error) {
+    if (hint) hint.textContent = error.message || "自动抓取失败，已展示最近一次数据";
+  } finally {
+    await loadHotwords();
+    await loadTopics();
+  }
+}
+
+// ── 模板库（M4 / FR-1.3）──
+let appliedTemplateId = null;
+async function loadTemplates() {
+  const el = document.getElementById("tplList");
+  const manage = document.getElementById("tplManageList");
+  el.innerHTML = '<span class="hint" role="status">正在加载模板…</span>';
+  manage.replaceChildren();
+  try {
+    const response = await fetch("/api/templates");
+    if (!response.ok) throw new Error(response.status === 403 ? "暂无模板访问权限" : "模板加载失败");
+    const list = await response.json();
+    el.replaceChildren();
+    if (!list.length) {
+      el.innerHTML = '<span class="hint">暂无模板，可在「管理模板」中保存当前简报。</span>';
+      return;
+    }
+    list.forEach((t) => {
+      const tag = document.createElement("button");
+      tag.type = "button";
+      tag.className = "template-tag";
+      tag.textContent = t.name;
+      tag.dataset.templateId = t.id;
+      tag.setAttribute("aria-pressed", String(t.id === appliedTemplateId));
+      tag.title = [t.name, t.defaultTone, t.defaultLanguage].filter(Boolean).join(" · ");
+      tag.onclick = () => applyTemplate(t);
+      el.appendChild(tag);
+      const row = document.createElement("div");
+      row.className = "tpl-item";
+      const meta = document.createElement("div");
+      meta.className = "tpl-meta";
+      meta.textContent = t.name + (t.isPreset ? " · 预设" : "");
+      const delBtn = document.createElement("button");
+      delBtn.textContent = "删除";
+      delBtn.className = "danger mini";
+      delBtn.setAttribute("aria-label", "删除模板：" + t.name);
+      if (t.isPreset) { delBtn.disabled = true; delBtn.title = "预设不可删"; }
+      else delBtn.onclick = () => deleteTemplate(t.id);
+      row.append(meta, delBtn);
+      manage.appendChild(row);
+    });
+  } catch (error) {
+    el.replaceChildren();
+    const message = document.createElement("span");
+    message.className = "hint bad";
+    message.setAttribute("role", "alert");
+    message.textContent = error.message || "模板加载失败";
+    const retry = document.createElement("button");
+    retry.className = "ghost mini";
+    retry.textContent = "重试";
+    retry.onclick = loadTemplates;
+    el.append(message, retry);
+  }
 }
 function applyTemplate(t) {
   if (t.brandName) document.getElementById("brandName").value = t.brandName;
@@ -275,6 +1118,13 @@ function applyTemplate(t) {
   document.getElementById("bannedWords").value = (t.bannedWords || []).join("、");
   // 模板带出铭星链产品线第一批文案（卖点 + 核心信息点）；可再点「换一批」轮换。
   seedTemplateCopy(t);
+  appliedTemplateId = t.id;
+  document.querySelectorAll(".template-tag").forEach((tag) => {
+    tag.setAttribute("aria-pressed", String(tag.dataset.templateId === String(t.id)));
+  });
+  REQUIRED_FIELDS.forEach((id) => { if (v(id)) setFieldError(id, ""); });
+  syncCounter();
+  toast("已套用「" + t.name + "」", "ok");
 }
 
 // 读取当前表单的品牌约束（主色 + 禁用词），供保存模板与提交生成共用。
@@ -288,7 +1138,7 @@ function readBrandConstraints() {
 }
 async function saveCurrentAsTemplate() {
   const name = document.getElementById("tplName").value.trim();
-  if (!name) { alert("请先填模板名"); return; }
+  if (!name) { toastErr("请先填模板名"); document.getElementById("tplName").focus(); return; }
   const { logoColor, bannedWords } = readBrandConstraints();
   const tpl = {
     name,
@@ -302,25 +1152,31 @@ async function saveCurrentAsTemplate() {
     isPreset: false,
   };
   const r = await fetch("/api/templates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tpl) });
-  if (!r.ok) { alert("保存失败：" + ((await r.json()).error || r.status)); return; }
-  document.getElementById("tplName").value = "";
+  if (!r.ok) { toastErr("保存失败：" + ((await r.json()).error || r.status)); return; }
+  document.getElementById("tplName").value = ""; toast("模板已保存", "ok");
   loadTemplates();
 }
 async function deleteTemplate(id) {
   if (!confirm("确认删除该模板？")) return;
   const r = await fetch("/api/templates/" + id, { method: "DELETE" });
-  if (r.status === 409) { alert("预设模板不可删除"); return; }
+  if (r.status === 409) { toastErr("预设模板不可删除"); return; }
   loadTemplates();
 }
 
+function setModeBadge(mode, cap) {
+  const b = document.getElementById("modeBadge");
+  if (!b) return;
+  const real = mode === "real";
+  b.textContent = real ? `真实模式 · 上限 ¥${cap ?? "?"}` : "DEMO 离线模式";
+  b.classList.toggle("is-demo", !real);
+}
 async function fetchMode() {
   try {
     const c = await (await fetch("/api/config")).json();
     BUDGET_CAP = c.budgetCap;
     QUOTA_CAP = c.quotaCap;
     SERVER_CONFIG = c;
-    document.getElementById("modeBadge").textContent =
-      c.mode === "real" ? `真实模式（one-api，预算上限 ¥${c.budgetCap}）` : "DEMO 离线模式";
+    setModeBadge(c.mode, c.budgetCap);
     fillModelSelect("llmModel", c.models?.llm);
     fillModelSelect("imageModel", c.models?.image);
     fillVideoModelSelect(c.models?.video, []);
@@ -355,8 +1211,7 @@ function syncSidePanel(c) {
 
 // 保存后统一刷新徽标/面板提示（不重置用户已选的模型下拉）。
 function applyCfgResponse(j) {
-  const badge = document.getElementById("modeBadge");
-  if (badge) badge.textContent = j.mode === "real" ? `真实模式（one-api，预算上限 ¥${BUDGET_CAP ?? "?"}）` : "DEMO 离线模式";
+  setModeBadge(j.mode, BUDGET_CAP);
   syncSidePanel({ mode: j.mode, providerBaseUrl: j.providerBaseUrl, apiKeySet: j.apiKeySet });
   loadRemoteModels(true); // 地址/模式变了 → 强制从（新）网关拉取模型清单（含视频渠道）
 }
@@ -373,12 +1228,12 @@ async function saveProviderConfig() {
     if (key) body.apiKey = key; // 留空 = 不改动已存密钥
     const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json();
-    if (!r.ok) { alert("保存失败：" + (j.error || r.status)); return; }
+    if (!r.ok) { toastErr("保存失败：" + (j.error || r.status)); return; }
     document.getElementById("apiKeyInput").value = ""; // 输入即焚，不留痕
     applyCfgResponse(j);
     document.getElementById("cfgHint").textContent = `已保存并生效：${j.mode === "real" ? "real 真实" : "DEMO"} ｜ 网关 ${j.providerBaseUrl || "(env 默认)"} ｜ API Key ${j.apiKeySet ? "已配置" : "未配置"}。`;
   } catch (e) {
-    alert("保存失败：" + e.message);
+    toastErr("保存失败：" + e.message);
   } finally {
     btn.disabled = false;
   }
@@ -389,11 +1244,11 @@ async function clearSavedKey() {
   try {
     const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: "" }) });
     const j = await r.json();
-    if (!r.ok) { alert("清除失败：" + (j.error || r.status)); return; }
+    if (!r.ok) { toastErr("清除失败：" + (j.error || r.status)); return; }
     applyCfgResponse(j);
     document.getElementById("cfgHint").textContent = "已清除页面保存的 API Key（现读取 env 密钥，若有）。";
   } catch (e) {
-    alert("清除失败：" + e.message);
+    toastErr("清除失败：" + e.message);
   }
 }
 
@@ -481,20 +1336,58 @@ async function loadRemoteModels(refresh) {
   }
 }
 
+/* 步骤名映射：后端事件里的 step id 是内部英文标识（writeScript / generateScenes…），
+   原实现直接把英文填给用户看。这里翻译成人话，未收录的按原样兜底。 */
+const STEP_LABEL = {
+  writeScript: "写脚本",
+  approveScript: "脚本确认",
+  storyboard: "分镜拆解",
+  generateScenes: "生成画面",
+  tts: "配音合成",
+  bgm: "配乐合成",
+  composite: "合成成片",
+  deliver: "交付",
+};
+const STEP_ORDER = ["writeScript", "approveScript", "storyboard", "generateScenes", "tts", "bgm", "composite", "deliver"];
+let stepDone = new Set(), stepCount = 0;
 function stepRow(id) {
   const ul = document.getElementById("steps");
   let li = document.getElementById("step-"+id);
-  if (!li) { li = document.createElement("li"); li.id = "step-"+id; li.className = "step";
-    li.innerHTML = `<span class="dot"></span><span class="name"></span><span class="meta"></span>`; ul.appendChild(li); }
+  if (!li) {
+    li = document.createElement("li"); li.id = "step-"+id; li.className = "step";
+    li.innerHTML = `<span class="dot"></span><span class="name"></span><span class="meta"></span>`;
+    // 按流水线顺序插入，而不是按事件到达顺序（避免乱序时上下跳）
+    const want = STEP_ORDER.indexOf(id);
+    const next = want >= 0
+      ? [...ul.children].find((c) => STEP_ORDER.indexOf(c.id.slice(5)) > want)
+      : null;
+    ul.insertBefore(li, next);
+    stepCount = ul.children.length;
+  }
   return li;
 }
 function setStep(id, status, meta) {
-  const li = stepRow(id); li.querySelector(".name").textContent = id;
+  const li = stepRow(id);
+  li.querySelector(".name").textContent = STEP_LABEL[id] || id;
   li.querySelector(".dot").className = "dot " + (status==="running"?"running":status==="done"?"done":status==="failed"?"failed":"");
   li.querySelector(".meta").textContent = meta || "";
+  li.classList.toggle("done", status === "done");
+  if (status === "done") stepDone.add(id); else stepDone.delete(id);
+  updateProgress();
+}
+// 顶部进度：已完成步数 / 已知总步数（UI/UX 准则：多步流程必须给出「第几步 / 共几步」）
+function updateProgress() {
+  const total = Math.max(stepCount, STEP_ORDER.length);
+  const done = stepDone.size;
+  const bar = document.getElementById("progBar");
+  const txt = document.getElementById("progText");
+  if (bar) bar.style.width = Math.round(done / total * 100) + "%";
+  if (txt) txt.textContent = done ? `第 ${done} / ${total} 步已完成` : `共 ${total} 步，等待开始`;
 }
 
 async function submitBrief() {
+  // 先做内联校验：失败时定位到第一个问题字段并弹 toast，不再用原生 alert 打断
+  if (!validateForm()) return;
   const { logoColor, bannedWords } = readBrandConstraints();
   const brief = {
     brandName: v("brandName"), productName: v("productName"), coreSellingPoint: v("coreSellingPoint"),
@@ -511,17 +1404,30 @@ async function submitBrief() {
     imageModel: v("imageModel") || undefined,
     videoModel: v("videoModel") || undefined,
   };
-  if (!brief.brandName || !brief.productName || !brief.coreSellingPoint) { alert("请填品牌名、产品名、核心卖点"); return; }
-  document.getElementById("genBtn").disabled = true;
-  const r = await fetch("/api/generate", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(brief) });
-  const j = await r.json();
-  if (!r.ok) { alert("提交失败：" + (j.error||r.status)); document.getElementById("genBtn").disabled = false; return; }
-  currentRunId = j.runId;
-  document.getElementById("progressCard").classList.remove("hidden");
-  document.getElementById("steps").innerHTML = "";
-  openStream(currentRunId);
+  const genBtn = document.getElementById("genBtn");
+  genBtn.disabled = true; genBtn.classList.add("loading"); genBtn.textContent = "提交中…";
+  try {
+    const r = await fetch("/api/generate", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(brief) });
+    const j = await r.json();
+    if (!r.ok) { toastErr("提交失败：" + (j.error||r.status)); return; }
+    currentRunId = j.runId;
+    document.getElementById("progressCard").classList.remove("hidden");
+    document.getElementById("steps").innerHTML = "";
+    stepCount = 0; updateProgress();
+    openStream(currentRunId);
+  } catch (e) {
+    toastErr("提交异常：" + e.message);
+  } finally {
+    genBtn.classList.remove("loading");
+    genBtn.disabled = false;
+    genBtn.textContent = "生成宣传片";
+  }
 }
 function v(id){ return document.getElementById(id).value.trim(); }
+function genBtnReset(){
+  const b = document.getElementById("genBtn"); if (!b) return;
+  b.disabled = false; b.classList.remove("loading"); b.textContent = "生成宣传片";
+}
 
 function openStream(runId) {
   if (es) es.close();
@@ -529,7 +1435,7 @@ function openStream(runId) {
   es.addEventListener("progress", e => onProgress(JSON.parse(e.data)));
   es.addEventListener("final-review", e => onFinalReview(JSON.parse(e.data)));
   es.addEventListener("run-done", e => onDone(JSON.parse(e.data).run));
-  es.addEventListener("run-failed", e => { alert("生成失败：" + e.data); es.close(); });
+  es.addEventListener("run-failed", e => { toastErr("生成失败：" + e.data); genBtnReset(); es.close(); });
 }
 function onProgress(ev) {
   const map = { "step-start":"running", "step-done":"done", "step-suspended":"running", "step-failed":"failed" };
@@ -541,7 +1447,9 @@ function onProgress(ev) {
 }
 function onDone(run) {
   es && es.close();
-  document.getElementById("genBtn").disabled = false;
+  genBtnReset();
+  stepDone = new Set(STEP_ORDER); updateProgress();
+  toast("成片已交付", "ok");
   renderDelivery(run);
 }
 
@@ -602,7 +1510,12 @@ function renderDelivery(run) {
   const card = document.getElementById("resultCard"); card.classList.remove("hidden");
   let html = "";
   if (run.poster) html += `<img src="${run.poster}" style="max-width:320px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
-  html += `<p style="color:var(--sub)">状态：${run.status} ｜ 语言：${run.brief.language} ｜ 时长：${run.brief.durationSec}s</p>`;
+  html += `<div class="kv">
+    <span>状态：<b>${esc(run.status)}</b></span>
+    <span>语言：<b>${esc(run.brief.language)}</b></span>
+    <span>时长：<b>${run.brief.durationSec}s</b></span>
+    ${run.srt ? `<span><a class="dl" href="${srtBlob(run.srt)}" download="script.srt">下载字幕 SRT</a></span>` : ""}
+  </div>`;
   // 模型可见性（用户诉求：知道用的什么模型）—— 本次 brief 覆盖值优先，否则显示服务端当前默认
   if (SERVER_CONFIG?.models) {
     const m = SERVER_CONFIG.models;
@@ -615,13 +1528,12 @@ function renderDelivery(run) {
       `配音 ${m.tts?.current || "?"}`,
       `配乐 ${m.music?.current || "?"}`,
     ];
-    html += `<p style="color:var(--sub);font-size:13px;">模型：${bits.join(" ｜ ")}</p>`;
+    html += `<div class="kv">${bits.map((b) => `<span>${b}</span>`).join("")}</div>`;
   }
-  if (run.srt) html += `<p><a class="dl" href="${srtBlob(run.srt)}" download="script.srt">下载字幕 SRT</a></p>`;
-  // 成本汇总（M2 / FR-10）
+  // 成本汇总（M2 / FR-10）—— 用 cost-box 组件
   if (run.cost && run.cost.length) {
     const total = run.cost.reduce((a,c)=>a+(c.amount||0),0);
-    html += `<div class="card" style="margin-top:12px;"><b>本次预估成本</b>：¥${total.toFixed(4)} / 预算上限 ¥${BUDGET_CAP ?? "?"}${QUOTA_CAP!=null?` ｜ 账户配额上限 ¥${QUOTA_CAP}`:""}<ul style="margin:8px 0 0;padding-left:18px;font-size:13px;color:var(--sub);">`;
+    html += `<div class="cost-box"><b>本次预估成本</b>：¥${total.toFixed(4)} / 预算上限 ¥${BUDGET_CAP ?? "?"}${QUOTA_CAP!=null?` ｜ 账户配额上限 ¥${QUOTA_CAP}`:""}<ul>`;
     run.cost.forEach(c=>{ html += `<li>${c.step}：¥${(c.amount||0).toFixed(4)}${c.tokens?` （${c.tokens} tokens）`:""}</li>`; });
     html += `</ul></div>`;
   }
@@ -634,9 +1546,10 @@ function renderDelivery(run) {
     scenes.forEach(s=>{ html += sceneHtml(s, {fail: s.status==="failed"}); });
     html += `</div>`;
   }
-  // 脚本全文
+  // 脚本全文：默认折叠，避免一大段 JSON 占屏（用户需要时再展开）
   if (run.script) {
-    html += `<h4>脚本全文</h4><pre>${esc(JSON.stringify(run.script, null, 2))}</pre>`;
+    html += `<details class="fold" style="margin-top:var(--sp-4);"><summary>查看脚本全文</summary>
+      <pre>${esc(JSON.stringify(run.script, null, 2))}</pre></details>`;
   }
   document.getElementById("delivery").innerHTML = html;
 }

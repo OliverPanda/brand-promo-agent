@@ -57,7 +57,8 @@ function paletteFor(tones = []) {
 }
 
 // ───────────────────────── one-api HTTP 客户端（OpenAI 兼容） ─────────────────────────
-async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } = {}) {
+// 导出：雷达模块（sentiment/topics）的 LLM 调用复用同一 base/key/超时/错误处理，不再各写一份 fetch。
+export async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } = {}) {
   // base/key = 运行时配置覆盖（前端「模型与服务」保存的供应商地址与密钥）> env 默认；每次调用现取，改完即生效。
   const base = getEffectiveOneApiBase();
   const key = activeKey();
@@ -113,7 +114,8 @@ async function oneApiGet(path, { timeoutMs = 15000 } = {}) {
   return res.json();
 }
 
-function parseJSONSafe(s) {
+// 导出：雷达模块 LLM JSON 响应解析复用（直接 parse → 失败抠首个 {...} 再 parse）。
+export function parseJSONSafe(s) {
   try {
     return JSON.parse(s);
   } catch {

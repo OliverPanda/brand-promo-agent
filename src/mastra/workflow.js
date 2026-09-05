@@ -57,9 +57,10 @@ function recordCost(runId, step, out) {
   const usage = out?._usage;
   if (!usage) return; // DEMO 模式无 _usage，不计量
   const c = costFor(step, usage);
-  const run = getRun(runId);
-  const account = run?.createdBy || "anonymous";
-  const costs = [...(run?.cost || []), c];
+  // 配额账户用部署级固定值：此前取 brief.brandName（客户端可控）→ 换个品牌名即可绕过配额。
+  // createdBy 仍记录品牌名（仅作报表分组展示），不再作为限额键。
+  const account = process.env.PROMO_ACCOUNT || "local";
+  const costs = [...(getRun(runId)?.cost || []), c];
   updateRun(runId, { cost: costs });
   const guard = checkBudget(costs, { amount: 0 }, getBudgetCap());
   if (!guard.ok) {
@@ -232,7 +233,10 @@ const generateScenes = createStep({
       const images = getProviderMode() === "real" ? scenes.length : 0;
       const videos = getProviderMode() === "real" && brief.videoModel ? scenes.filter((s) => s.videoUrl).length : 0;
       const usage = images ? { images } : undefined;
-      if (videos) usage.videos = videos;
+      if (videos) {
+        usage.videos = videos;
+        usage.videoModel = brief.videoModel; // 供 costFor 命中按次真实单价（中转站 /api/pricing，见 cost.js）
+      }
       return { brief, script, storyboard: scenes, runId: rid, _usage: usage };
     });
   },

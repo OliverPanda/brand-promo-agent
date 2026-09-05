@@ -13,9 +13,22 @@ import path from "node:path";
 
 const DATA_DIR = process.env.PROMO_DATA_DIR || path.resolve(process.cwd(), "data");
 const RUNS_FILE = path.join(DATA_DIR, "runs.json");
+// 历史保留条数上限（超出淘汰最旧）。runs.json 曾因 steps.output 全量落盘涨到 ~6MB，
+// 每次 setStep 同步重写阻塞事件循环 —— 双管齐下：① 落盘剥离 output（与顶层字段重复）；② 条数封顶。
+const RUNS_CAP = Math.max(1, Number(process.env.PROMO_RUNS_CAP ?? 100));
 
 function persistEnabled() {
   return process.env.PROMO_PERSIST !== "0";
+}
+
+// 落盘/ hydrate 瘦身：剥离 steps[*].output（progress 事件已把 output 实时推给前端，磁盘无需冗余；
+// storyboard/脚本等大对象本就存顶层）。undefined 在 JSON.stringify 中自然消失。
+function slimRun(run) {
+  const steps = {};
+  for (const [k, v] of Object.entries(run.steps || {})) {
+    steps[k] = v && typeof v === "object" && "output" in v ? { ...v, output: undefined } : v;
+  }
+  return { ...run, steps };
 }
 
 /** @type {Map<string, any>} runId -> PromoRun */
@@ -29,7 +42,7 @@ function hydrate() {
   try {
     if (fs.existsSync(RUNS_FILE)) {
       const arr = JSON.parse(fs.readFileSync(RUNS_FILE, "utf8"));
-      if (Array.isArray(arr)) for (const r of arr) if (r && r.runId) runs.set(r.runId, r);
+      if (Array.isArray(arr)) for (const r of arr) if (r && r.runId) runs.set(r.runId, slimRun(r)); // 顺带迁移旧的大文件
     }
   } catch (e) {
     console.warn(`[store] hydrate 失败，忽略磁盘数据：`, e?.message || e);
@@ -41,7 +54,8 @@ function persist() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const tmp = path.join(DATA_DIR, `.runs.${process.pid}.tmp`);
-    fs.writeFileSync(tmp, JSON.stringify([...runs.values()], null, 2));
+    // 紧凑序列化（runs.json 纯机器读写，pretty-print 白费 ~30% 体积）
+    fs.writeFileSync(tmp, JSON.stringify([...runs.values()].map(slimRun)));
     fs.renameSync(tmp, RUNS_FILE); // 原子替换
   } catch (e) {
     console.warn(`[store] 持久化失败：`, e?.message || e);
@@ -74,8 +88,16 @@ export function createRun(runId, brief) {
     note: "",
   };
   runs.set(runId, run);
+  trimRuns();
   persist();
   return run;
+}
+
+// 容量裁剪：超出 RUNS_CAP 淘汰最旧（createdAt 排序，只在超限时触发）
+function trimRuns() {
+  if (runs.size <= RUNS_CAP) return;
+  const sorted = [...runs.values()].sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  for (const r of sorted.slice(0, runs.size - RUNS_CAP)) runs.delete(r.runId);
 }
 
 export function getRun(runId) {

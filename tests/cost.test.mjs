@@ -9,6 +9,8 @@ import {
   getBudgetCap,
   BudgetExceededError,
   formatCostSummary,
+  VIDEO_PER_CALL_CNY,
+  videoCostPerScene,
 } from "../src/cost.js";
 
 test("costFor 按步骤单价估算（tokens / images / minutes / tracks）", () => {
@@ -18,6 +20,26 @@ test("costFor 按步骤单价估算（tokens / images / minutes / tracks）", ()
   assert.equal(costFor("voiceover", { minutes: 0.5 }).amount, 0.05); // 0.5 * 0.1
   assert.equal(costFor("music", { tracks: 1 }).amount, 0.5); // 1 * 0.5
   assert.equal(costFor("composite", { videos: 1 }).amount, 1.0); // 1 * 1.0
+});
+
+// 2026-09-04 视频真实单价（自中转站 new-api /api/pricing 实抓：按次 model_price × 汇率 7.3，分组 ×1）
+test("costFor 视频：videoModel 命中按次表用真实单价", () => {
+  assert.equal(VIDEO_PER_CALL_CNY["sora-2-pro"], 3.65); // $0.5/次 × 7.3
+  assert.equal(VIDEO_PER_CALL_CNY["sora-2"], 2.19); // $0.3/次 × 7.3
+  assert.equal(costFor("generateScenes", { videos: 2, videoModel: "sora-2-pro" }).amount, 7.3);
+  assert.equal(costFor("generateScenes", { videos: 1, videoModel: "sora-2" }).amount, 2.19);
+  // 未带 videoModel（如 composite 本地合成）仍用表内回落单价
+  assert.equal(costFor("generateScenes", { videos: 3 }).amount, 3.0);
+});
+
+test("videoCostPerScene：未知/按量模型回落默认价，PROMO_VIDEO_COST_FALLBACK 可覆盖", () => {
+  assert.equal(videoCostPerScene("kling-v1-6"), 1.0); // 站内按量兜底倍率 37.5，无固定每镜价 → 回落 ¥1
+  assert.equal(videoCostPerScene(""), 1.0);
+  assert.equal(videoCostPerScene(undefined), 1.0);
+  process.env.PROMO_VIDEO_COST_FALLBACK = "2.5";
+  assert.equal(videoCostPerScene("doubao-seedance-2.0"), 2.5);
+  delete process.env.PROMO_VIDEO_COST_FALLBACK;
+  assert.equal(videoCostPerScene("sora-2-pro"), 3.65, "环境变量不影响按次表命中");
 });
 
 test("costFor 未知步骤返回 0 且不抛", () => {
