@@ -266,6 +266,11 @@ app.post("/api/generate/:runId/approve", async (req, res) => {
   if (run.status === "success" || run.status === "failed") {
     return res.status(409).json({ error: `run 已 ${run.status}，无待审批门` });
   }
+  // 网络重试或页面重连可能重复提交同一个审批。审批结果已写入时保持幂等，
+  // 让调用方可以安全重试，不把“已继续执行”误报成失败。
+  if (run.approval?.decision === decision) {
+    return res.json({ ok: true, gate: "already-resumed", status: run.status });
+  }
   return res.status(409).json({ error: "no pending approval (already resumed or finished)" });
 });
 

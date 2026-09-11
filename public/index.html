@@ -1329,7 +1329,9 @@ async function loadRemoteModels(refresh) {
       fillVideoModelSelect(SERVER_CONFIG.models.video, m.video || []);
     }
     if (tag) tag.textContent = j.source === "gateway" ? "（网关实时）" : "（离线占位）";
-    if (hint) hint.textContent = (j.note || "") + (j.source === "gateway" ? ` 网关含 ${m.video?.length || 0} 个视频渠道。` : "");
+    if (hint) hint.textContent = m.llm?.length
+      ? (j.note || "") + (j.source === "gateway" ? ` 网关含 ${m.video?.length || 0} 个视频渠道。` : "")
+      : "网关未返回任何文本模型：当前 API Key/分组只能用于非文本能力，无法生成脚本和选题；请在 New API 开通文本模型渠道后重试";
   } catch (e) {
     if (tag) tag.textContent = "";
     if (hint) hint.textContent = "模型拉取失败：" + e.message;
@@ -1462,9 +1464,10 @@ function showGate(script) {
   document.getElementById("gateScript").innerHTML = html;
   document.getElementById("gateModal").classList.remove("hidden");
 }
-function approveScript(useEdits) {
+async function approveScript(useEdits) {
   const edits = useEdits ? { voiceover: gateVoice.map((x,i)=>({ timecode:x.timecode, text: document.querySelector(`input[data-i="${i}"]`).value })) } : undefined;
-  fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ decision:"approve", edits }) });
+  const r = await fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ decision:"approve", edits }) });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); toastErr(j.error || "脚本审批失败"); return; }
   document.getElementById("gateModal").classList.add("hidden");
   setStep("writeScript", "running", "已确认，继续…");
 }
@@ -1483,9 +1486,10 @@ function onFinalReview(ev) {
   document.getElementById("finalPreview").innerHTML = html;
   document.getElementById("finalGateModal").classList.remove("hidden");
 }
-function approveFinal(approve) {
+async function approveFinal(approve) {
   const body = approve ? { decision: "approve" } : { decision: "reject", scenes: [] };
-  fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  const r = await fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); toastErr(j.error || "成片审批失败"); return; }
   document.getElementById("finalGateModal").classList.add("hidden");
   setStep("composite", approve ? "done" : "running", approve ? "验收通过，交付中…" : "重新生成中…");
 }

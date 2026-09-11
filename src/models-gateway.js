@@ -91,6 +91,11 @@ export async function fetchRemoteModels({ refresh = false } = {}) {
   clearTimeout(timer);
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
+    if (res.status === 401 && /登录已过期|login expired|unauthorized|invalid token/i.test(txt)) {
+      throw new Error(/invalid token/i.test(txt)
+        ? "New API 拒绝了当前 API Key：请在该 New API 实例重新创建或复制有效令牌，再回到页面保存"
+        : "远程地址返回网页登录 401：请填 OpenAI 兼容中转 API 地址（通常以 /v1 结尾），不要填网页前端地址；网页登录会话不能替代 API Key");
+    }
     throw new Error(`网关 /models ${res.status}：${txt.slice(0, 200)}`);
   }
   const json = await res.json();

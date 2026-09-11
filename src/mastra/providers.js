@@ -81,6 +81,14 @@ export async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120
   clearTimeout(timer);
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
+    if (res.status === 401 && /登录已过期|login expired|unauthorized|invalid token/i.test(txt)) {
+      throw new Error(/invalid token/i.test(txt)
+        ? "New API 拒绝了当前 API Key：请在该 New API 实例重新创建或复制有效令牌，再回到页面保存"
+        : "远程地址返回网页登录 401：请改用 OpenAI 兼容中转 API 地址（通常以 /v1 结尾），并填写该中转站生成的 API Key");
+    }
+    if (res.status === 503 && /model_not_found|No available channel/i.test(txt)) {
+      throw new Error(`远程中转没有可用的文本模型渠道：当前请求模型未加入该分组。请在 New API 为 API Key 所属分组开通文本模型，或改用包含文本模型的 API Key（当前请求：${body?.model || "未知模型"}）`);
+    }
     const err = new Error(`one-api ${path} ${res.status}: ${txt.slice(0, 300)}`);
     err.status = res.status;
     throw err;
