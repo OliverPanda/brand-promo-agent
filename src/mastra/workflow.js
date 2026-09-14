@@ -27,7 +27,7 @@ import {
   composite,
   getProviderMode,
 } from "./providers.js";
-import { emitProgress, emitRunDone, emitRunFailed } from "./eventBus.js";
+import { emitProgress, emitRunDone } from "./eventBus.js";
 import { updateRun, setStep, getRun } from "../store.js";
 import { costFor, checkBudget, getBudgetCap, BudgetExceededError } from "../cost.js";
 import { checkQuota, addUsage, QuotaExceededError } from "../quota.js";
@@ -78,7 +78,7 @@ function recordCost(runId, step, out) {
 }
 
 async function withStep(runId, step, fn) {
-  setStep(runId, step, { status: "running", startedAt: Date.now() });
+  setStep(runId, step, { status: "running", startedAt: Date.now(), error: undefined, doneAt: undefined });
   emitProgress(runId, step, "step-start");
   await sleep(STEP_DELAY_MS);
   try {
@@ -90,8 +90,7 @@ async function withStep(runId, step, fn) {
   } catch (err) {
     setStep(runId, step, { status: "failed", doneAt: Date.now(), error: String(err?.message || err) });
     emitProgress(runId, step, "step-failed", { error: String(err?.message || err) });
-    updateRun(runId, { status: "failed" });
-    emitRunFailed(runId, err);
+    // 说明：步骤失败仍由 Mastra 决定是否重试，阶段边界统一发布最终失败。
     throw err;
   }
 }
@@ -121,9 +120,12 @@ const writeScript = createStep({
         return { brief, script, runId: rid };
       }
       // HITL 脚本门：suspend 等待前端 /approve（直接在 execute 体内 await）。
-      updateRun(rid, { status: "suspended" });
-      emitProgress(rid, STEP.SCRIPT, "step-suspended", { script });
-      await suspend({ script });
+      // 说明：resume 会重跑 execute，已有审批时再次 suspend 会把成功结果仍标成 suspended。
+      if (!getRun(rid)?.approval) {
+        updateRun(rid, { status: "suspended" });
+        emitProgress(rid, STEP.SCRIPT, "step-suspended", { script });
+        await suspend({ script });
+      }
       const approval = getRun(rid)?.approval; // 首次挂起时尚未写入 → undefined
       if (!approval) {
         // 初次挂起：引擎已 suspended，等待 /approve 后 resume。不要返回真实结果，避免引擎误判完成。
@@ -145,8 +147,6 @@ const writeScript = createStep({
     } catch (err) {
       setStep(rid, STEP.SCRIPT, { status: "failed", doneAt: Date.now(), error: String(err?.message || err) });
       emitProgress(rid, STEP.SCRIPT, "step-failed", { error: String(err?.message || err) });
-      updateRun(rid, { status: "failed" });
-      emitRunFailed(rid, err);
       throw err;
     }
   },

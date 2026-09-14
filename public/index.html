@@ -1341,16 +1341,16 @@ async function loadRemoteModels(refresh) {
 /* 步骤名映射：后端事件里的 step id 是内部英文标识（writeScript / generateScenes…），
    原实现直接把英文填给用户看。这里翻译成人话，未收录的按原样兜底。 */
 const STEP_LABEL = {
+  ingestBrief: "整理需求",
   writeScript: "写脚本",
-  approveScript: "脚本确认",
+  prepareVideo: "准备成片",
   storyboard: "分镜拆解",
   generateScenes: "生成画面",
-  tts: "配音合成",
-  bgm: "配乐合成",
+  voiceover: "配音合成",
+  music: "配乐合成",
   composite: "合成成片",
-  deliver: "交付",
 };
-const STEP_ORDER = ["writeScript", "approveScript", "storyboard", "generateScenes", "tts", "bgm", "composite", "deliver"];
+const STEP_ORDER = ["ingestBrief", "writeScript", "prepareVideo", "storyboard", "generateScenes", "voiceover", "music", "composite"];
 let stepDone = new Set(), stepCount = 0;
 function stepRow(id) {
   const ul = document.getElementById("steps");
@@ -1412,10 +1412,7 @@ async function submitBrief() {
     const r = await fetch("/api/generate", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(brief) });
     const j = await r.json();
     if (!r.ok) { toastErr("提交失败：" + (j.error||r.status)); return; }
-    currentRunId = j.runId;
-    document.getElementById("progressCard").classList.remove("hidden");
-    document.getElementById("steps").innerHTML = "";
-    stepCount = 0; updateProgress();
+    selectRun(j.runId);
     openStream(currentRunId);
   } catch (e) {
     toastErr("提交异常：" + e.message);
@@ -1433,24 +1430,110 @@ function genBtnReset(){
 
 function openStream(runId) {
   if (es) es.close();
-  es = new EventSource("/api/generate/"+runId+"/stream");
-  es.addEventListener("progress", e => onProgress(JSON.parse(e.data)));
-  es.addEventListener("final-review", e => onFinalReview(JSON.parse(e.data)));
-  es.addEventListener("run-done", e => onDone(JSON.parse(e.data).run));
-  es.addEventListener("run-failed", e => { toastErr("生成失败：" + e.data); genBtnReset(); es.close(); });
+  const stream = new EventSource("/api/generate/"+encodeURIComponent(runId)+"/stream");
+  es = stream;
+  const listen = (type, handler) => stream.addEventListener(type, e => {
+    if (es !== stream || currentRunId !== runId) return;
+    handler(JSON.parse(e.data));
+  });
+  listen("snapshot", e => applyRunSnapshot(e.run));
+  listen("progress", onProgress);
+  listen("final-review", onFinalReview);
+  listen("run-done", e => onDone(e.run));
+  listen("run-failed", e => onFailed(e.error));
+  stream.onerror = () => {
+    if (es !== stream || currentRunId !== runId) return;
+    document.getElementById("progText").textContent = "连接中断，正在自动重连…";
+    // 说明：EventSource 自带重连；服务端每次连接补快照，不在网络错误时 close。
+  };
+}
+const LAST_RUN_KEY = "promo:lastRunId";
+function selectRun(runId) {
+  if (es) { es.close(); es = null; }
+  currentRunId = runId;
+  try { localStorage.setItem(LAST_RUN_KEY, runId); } catch (_) { /* 隐私模式仍可用 URL 恢复 */ }
+  const url = new URL(location.href); url.searchParams.set("runId", runId);
+  history.replaceState(null, "", url);
+  document.getElementById("progressCard").classList.remove("hidden");
+  document.getElementById("resultCard").classList.add("hidden");
+  closeRunGates();
+  document.getElementById("steps").innerHTML = "";
+  stepDone.clear(); stepCount = 0; updateProgress();
+}
+function closeRunGates() {
+  document.getElementById("gateModal").classList.add("hidden");
+  document.getElementById("finalGateModal").classList.add("hidden");
+}
+function applyRunSnapshot(run) {
+  if (!run || run.runId !== currentRunId) return;
+  document.getElementById("progressCard").classList.remove("hidden");
+  document.getElementById("steps").innerHTML = "";
+  stepDone.clear(); stepCount = 0;
+  for (const [id, step] of Object.entries(run.steps || {})) setStep(id, step.status, step.error);
+  updateProgress();
+  closeRunGates();
+  if (run.status === "success") onDone(run);
+  else if (run.status === "failed") onFailed(run.error || Object.values(run.steps || {}).find(s => s.error)?.error);
+  else if (run.status === "suspended" && run.script) showGate(run.script);
+  else if (run.status === "awaiting_delivery") onFinalReview({ preview: {
+    videoUrl: run.videoUrl, gallery: run.storyboard || run.storyboardGallery, poster: run.poster, note: run.note,
+  } });
+}
+async function restoreRun() {
+  if (currentRunId) return;
+  let runId = new URLSearchParams(location.search).get("runId");
+  if (!runId) { try { runId = localStorage.getItem(LAST_RUN_KEY); } catch (_) { /* 存储不可用 */ } }
+  if (!runId) return;
+  try {
+    const response = await fetch("/api/runs/" + encodeURIComponent(runId));
+    if (currentRunId) return;
+    if (response.status === 404) { toastErr("上次任务已不存在，请重新生成"); return; }
+    if (!response.ok) throw new Error("读取任务失败");
+    const run = await response.json();
+    if (currentRunId) return;
+    selectRun(runId);
+    if (!["success", "failed"].includes(run.status)) openStream(runId);
+    applyRunSnapshot(run);
+  } catch (error) {
+    if (currentRunId) return;
+    toastErr("恢复任务失败，稍后自动重试：" + error.message);
+    setTimeout(restoreRun, 5000);
+  }
+}
+function onFailed(error) {
+  if (es) { es.close(); es = null; }
+  closeRunGates();
+  genBtnReset();
+  document.getElementById("progText").textContent = "生成失败：" + (error || "请重新生成");
+  toastErr("生成失败：" + (error || "请重新生成"));
+}
+async function refreshRun(runId) {
+  try {
+    const response = await fetch("/api/runs/" + encodeURIComponent(runId));
+    if (!response.ok) throw new Error("读取任务失败");
+    const run = await response.json();
+    if (currentRunId !== runId) return;
+    if (!es && !["success", "failed"].includes(run.status)) openStream(runId);
+    applyRunSnapshot(run);
+  } catch (error) {
+    if (currentRunId !== runId) return;
+    toastErr("审批已提交，状态同步失败：" + error.message);
+    if (!es) openStream(runId);
+  }
 }
 function onProgress(ev) {
   const map = { "step-start":"running", "step-done":"done", "step-suspended":"running", "step-failed":"failed" };
-  if (map[ev.status]) setStep(ev.step, map[ev.status]);
+  if (map[ev.status]) setStep(ev.step, map[ev.status], ev.error);
   if (ev.step === "writeScript" && ev.status === "step-suspended") showGate(ev.script);
   if (ev.step === "generateScenes" && ev.status === "step-progress") {
     setStep("generateScenes", "running", "场景 #" + ev.scene + " " + (ev.result||""));
   }
 }
 function onDone(run) {
-  es && es.close();
+  if (es) { es.close(); es = null; }
+  closeRunGates();
   genBtnReset();
-  stepDone = new Set(STEP_ORDER); updateProgress();
+  updateProgress();
   toast("成片已交付", "ok");
   renderDelivery(run);
 }
@@ -1465,11 +1548,13 @@ function showGate(script) {
   document.getElementById("gateModal").classList.remove("hidden");
 }
 async function approveScript(useEdits) {
+  const runId = currentRunId;
   const edits = useEdits ? { voiceover: gateVoice.map((x,i)=>({ timecode:x.timecode, text: document.querySelector(`input[data-i="${i}"]`).value })) } : undefined;
-  const r = await fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ decision:"approve", edits }) });
+  const r = await fetch("/api/generate/"+runId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ decision:"approve", edits }) });
+  if (currentRunId !== runId) return;
   if (!r.ok) { const j = await r.json().catch(() => ({})); toastErr(j.error || "脚本审批失败"); return; }
   document.getElementById("gateModal").classList.add("hidden");
-  setStep("writeScript", "running", "已确认，继续…");
+  await refreshRun(runId);
 }
 
 // 成片门（FR-9.2 / M3）：composite 完成后弹出验收门，approve=交付，reject=重新生成。
@@ -1487,11 +1572,14 @@ function onFinalReview(ev) {
   document.getElementById("finalGateModal").classList.remove("hidden");
 }
 async function approveFinal(approve) {
+  const runId = currentRunId;
   const body = approve ? { decision: "approve" } : { decision: "reject", scenes: [] };
-  const r = await fetch("/api/generate/"+currentRunId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  const r = await fetch("/api/generate/"+runId+"/approve", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  if (currentRunId !== runId) return;
   if (!r.ok) { const j = await r.json().catch(() => ({})); toastErr(j.error || "成片审批失败"); return; }
   document.getElementById("finalGateModal").classList.add("hidden");
-  setStep("composite", approve ? "done" : "running", approve ? "验收通过，交付中…" : "重新生成中…");
+  // 说明：审批 HTTP 响应可能晚于 SSE 交付，必须读取权威状态，不能覆盖成旧的“生成中”。
+  await refreshRun(runId);
 }
 // 单镜卡片：有动态片段（videoUrl）→ <video> 可播放；否则静态图；失败显示占位。
 function sceneHtml(s, opts) {
@@ -1558,6 +1646,7 @@ function renderDelivery(run) {
   document.getElementById("delivery").innerHTML = html;
 }
 function srtBlob(srt){ return "data:text/plain;charset=utf-8," + encodeURIComponent(srt); }
+restoreRun();
 </script>
 </body>
 </html>

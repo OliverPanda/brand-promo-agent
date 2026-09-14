@@ -77,7 +77,7 @@ function round4(n) {
   return Math.round((n + Number.EPSILON) * 10000) / 10000;
 }
 
-// 配额超限错误：由 workflow recordCost 抛出，withStep 捕获标记 run=failed（对应 FR-10 中止并提示）。
+// 配额超限错误：recordCost 抛出，由 server 阶段边界确认 run=failed（对应 FR-10 中止并提示）。
 export class QuotaExceededError extends Error {
   constructor(message) {
     super(message);

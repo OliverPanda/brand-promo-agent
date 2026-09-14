@@ -23,7 +23,7 @@ import {
   clearResumer,
   updateRun,
 } from "./store.js";
-import { bus, emitFinalReview } from "./mastra/eventBus.js";
+import { bus, emitFinalReview, emitRunFailed } from "./mastra/eventBus.js";
 import {
   listSubscriptionGroups,
   saveSubscriptionGroup,
@@ -70,6 +70,24 @@ function toPublicRun(runId, run) {
   return { ...run, videoUrl: toPublicVideoUrl(runId, run.videoUrl) };
 }
 
+function failRun(runId, error) {
+  const run = getRun(runId);
+  if (!run || run.status === "failed" || run.status === "success") return;
+  const message = String(error?.message || error || "工作流执行失败");
+  updateRun(runId, { status: "failed", error: message });
+  clearResumer(runId);
+  emitRunFailed(runId, message);
+}
+
+function requireSuccess(result, runId) {
+  // 说明：Mastra 的失败通常 resolve，不能用 Promise 是否 reject 判断执行成功。
+  if (result?.status !== "success") {
+    throw result?.error || new Error(`工作流未成功完成：${result?.status || "unknown"}`);
+  }
+  const failedStep = Object.values(getRun(runId)?.steps || {}).find(step => step.status === "failed");
+  if (failedStep) throw new Error(failedStep.error || "核心步骤失败，无法交付");
+}
+
 // GET /api/video/:runId：以 HTTP 提供该 run 本机合成的 MP4（Range 支持，可直接 <video>/下载）。
 app.get("/api/video/:runId", (req, res) => {
   const run = getRun(req.params.runId);
@@ -99,7 +117,8 @@ async function runVideoPhase(runId, brief, opts = {}) {
   // 关键：与可工作的内联模式一致 —— 直接观察 run.start 的 Promise（detached + .then），
   // 避免在该 continuation 内 await 导致 Mastra 执行引擎卡在 storyboard 之后（Mastra v1.63 已知怪异行为）。
   return mrun.start({ inputData: { brief, script, runId } })
-    .then(() => {
+    .then((result) => {
+      requireSuccess(result, runId);
       const finalGate = opts.finalGate ?? brief.finalGateEnabled !== false;
       const r = getRun(runId);
       if (finalGate) {
@@ -116,7 +135,7 @@ async function runVideoPhase(runId, brief, opts = {}) {
     })
     .catch((err) => {
       console.error(`[video-phase] ${runId} failed:`, err?.message || err);
-      updateRun(runId, { status: "failed" });
+      failRun(runId, err);
       throw err;
     });
 }
@@ -127,11 +146,20 @@ async function runScriptPhase(runId, brief) {
   const run = await mastra.getWorkflow("promoScript").createRun({ runId: scriptRunId });
   // 审批恢复闭包：恢复被挂起的脚本工作流，完成后接力启动成片工作流。
   registerResumer(runId, async (resumeData) => {
-    await run.resume({ resumeData });
+    let result;
+    try {
+      result = await run.resume({ resumeData });
+      if (result?.status === "suspended") return;
+      requireSuccess(result, runId);
+      clearResumer(runId);
+    } catch (err) {
+      failRun(runId, err);
+      throw err;
+    }
     // 同上：脱离 resume 上下文，切到新 tick 启动成片工作流。
     setImmediate(() => runVideoPhase(runId, brief).catch((err) => {
       console.error(`[video-phase] ${runId} failed:`, err?.message || err);
-      updateRun(runId, { status: "failed" });
+      failRun(runId, err);
     }));
   });
   try {
@@ -140,21 +168,18 @@ async function runScriptPhase(runId, brief) {
       updateRun(runId, { status: "suspended" });
       return; // 等待 /approve → resumer 接力
     }
-    // 脚本步若因预算/配额（Budget/QuotaExceeded）已失败，run 已标记 failed 且为终态——
-    // 此时 promoScript.run.start 会「resolve 而非 reject」，不可再启动成片阶段（否则会落入
-    // Mastra 嵌套上下文卡死，storyboard 后莫名置 success）。直接返回，保留 failed 终态。
-    if (getRun(runId)?.status === "failed") return;
+    requireSuccess(result, runId);
+    clearResumer(runId);
     // 非挂起且脚本已产出（HITL 关闭 / 脚本成功）：进入成片阶段。
     // 关键：不能在 promoScript 的 run.start 续跑上下文里直接 await 新工作流（Mastra AsyncLocalStorage
     // 上下文嵌套会导致新 run 卡在 storyboard 之后）。用 setImmediate 切到全新事件循环 tick，脱离父上下文。
     setImmediate(() => runVideoPhase(runId, brief).catch((err) => {
       console.error(`[video-phase] ${runId} failed:`, err?.message || err);
-      updateRun(runId, { status: "failed" });
+      failRun(runId, err);
     }));
   } catch (err) {
     console.error(`[script-phase] ${runId} failed:`, err?.message || err);
-    updateRun(runId, { status: "failed" });
-    bus.emit("run-failed", { runId, ts: Date.now(), error: String(err?.message || err) });
+    failRun(runId, err);
   }
 }
 
@@ -171,7 +196,7 @@ app.post("/api/generate", async (req, res) => {
   // 不 await：脚本段可能在 HITL 处 suspend 或执行到底（异步），进度经 SSE 推送。
   runScriptPhase(runId, brief).catch((err) => {
     console.error(`[generate] ${runId} unexpected:`, err?.message || err);
-    updateRun(runId, { status: "failed" });
+    failRun(runId, err);
   });
   res.json({ runId });
 });
@@ -179,6 +204,7 @@ app.post("/api/generate", async (req, res) => {
 // ── GET /api/generate/:runId/stream：SSE 实时进度 ──
 app.get("/api/generate/:runId/stream", (req, res) => {
   const { runId } = req.params;
+  if (!getRun(runId)) return res.status(404).json({ error: "run not found" });
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -216,9 +242,17 @@ app.get("/api/generate/:runId/stream", (req, res) => {
     bus.off("final-review", onFinalReview);
     bus.off("run-done", onDone);
     bus.off("run-failed", onFailed);
-    clearResumer(runId);
+    clearInterval(heartbeat);
   };
+  const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 15000);
   req.on("close", cleanup);
+  const run = getRun(runId);
+  res.write(`event: snapshot\ndata: ${JSON.stringify({ runId, ts: Date.now(), run: toPublicRun(runId, run) })}\n\n`);
+  if (run.status === "success") onDone({ runId, ts: Date.now(), run });
+  else if (run.status === "failed") onFailed({ runId, ts: Date.now(), error: run.error || "工作流执行失败" });
+  else if (run.status === "awaiting_delivery") onFinalReview({ runId, ts: Date.now(), preview: {
+    videoUrl: run.videoUrl, gallery: run.storyboard || run.storyboardGallery, poster: run.poster, note: run.note,
+  } });
 });
 
 // ── POST /api/generate/:runId/approve：HITL 审核门（脚本门 + 成片门，按 run.status 分流） ──
@@ -256,7 +290,7 @@ app.post("/api/generate/:runId/approve", async (req, res) => {
         regenerateScenes: Array.isArray(scenes) ? scenes : [],
       }).catch((err) => {
         console.error(`[video-phase regenerate] ${runId} failed:`, err?.message || err);
-        updateRun(runId, { status: "failed" });
+        failRun(runId, err);
       })
     );
     return res.json({ ok: true, gate: "final", regenerated: true });

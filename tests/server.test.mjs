@@ -75,6 +75,15 @@ test("HITL 开启：脚本门 suspend → approve → success", async () => {
     const suspended = await waitStatus(port, runId, ["suspended"]);
     assert.equal(suspended.status, "suspended");
 
+    // 说明：审批前主动断开 SSE，模拟刷新；订阅清理不能删除审批恢复闭包。
+    const controller = new AbortController();
+    const stream = await fetch(`${BASE(port)}/api/generate/${runId}/stream`, { signal: controller.signal });
+    const reader = stream.body.getReader();
+    await reader.read();
+    controller.abort();
+    await reader.cancel().catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 30));
+
     const approve = await fetch(`${BASE(port)}/api/generate/${runId}/approve`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: "approve" }),
     });

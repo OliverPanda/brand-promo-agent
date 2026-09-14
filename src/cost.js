@@ -75,7 +75,7 @@ export function getBudgetCap() {
   return readBudgetCap();
 }
 
-// 预算超限错误：由 workflow 步骤抛出后，withStep 捕获并标记 run=failed（对应 FR-10.1 中止并提示）。
+// 预算超限错误：workflow 记录步骤失败后抛出，由 server 阶段边界确认 run=failed（FR-10.1）。
 export class BudgetExceededError extends Error {
   constructor(message) {
     super(message);
