@@ -88,3 +88,36 @@ test("容量封顶：PROMO_RUNS_CAP=5 时创建 7 个 run → 保留最新 5 个
   assert.equal(j.hasOldest, false, "最旧 run 被淘汰");
   assert.equal(j.hasNewest, true, "最新 run 保留");
 });
+
+for (const persist of ["1", "0"]) {
+  test(`容量淘汰在 PROMO_PERSIST=${persist} 时仅清理最旧 run 的产物`, () => {
+    const isolated = fs.mkdtempSync(path.join(os.tmpdir(), `promo-trim-${persist}-`));
+    try {
+      const out = runModule(`
+        import fs from "node:fs";
+        import path from "node:path";
+        import { artifactPaths } from ${JSON.stringify(pathToFileURL(path.join(ROOT, "src/media/artifacts.js")).href)};
+        import { createRun, listRuns } from ${STORE_URL};
+        const oldPaths = artifactPaths("trim-old");
+        const keepPaths = artifactPaths("trim-keep");
+        fs.writeFileSync(oldPaths.finalVideo, "remove");
+        fs.writeFileSync(keepPaths.finalVideo, "keep");
+        const outside = path.join(process.env.PROMO_DATA_DIR, "outside.txt");
+        fs.writeFileSync(outside, "outside");
+        createRun("trim-old", { brandName: "Old" });
+        createRun("trim-keep", { brandName: "Keep" });
+        console.log(JSON.stringify({
+          ids: listRuns().map((run) => run.runId),
+          oldExists: fs.existsSync(oldPaths.runRoot),
+          keepExists: fs.existsSync(keepPaths.finalVideo),
+          outsideExists: fs.existsSync(outside),
+        }));
+      `, { PROMO_DATA_DIR: isolated, PROMO_PERSIST: persist, PROMO_RUNS_CAP: "1" });
+      assert.deepEqual(JSON.parse(out.trim()), {
+        ids: ["trim-keep"], oldExists: false, keepExists: true, outsideExists: true,
+      });
+    } finally {
+      fs.rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+}

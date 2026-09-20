@@ -10,6 +10,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { removeRunArtifacts } from "./media/artifacts.js";
 
 const DATA_DIR = process.env.PROMO_DATA_DIR || path.resolve(process.cwd(), "data");
 const RUNS_FILE = path.join(DATA_DIR, "runs.json");
@@ -97,7 +98,14 @@ export function createRun(runId, brief) {
 function trimRuns() {
   if (runs.size <= RUNS_CAP) return;
   const sorted = [...runs.values()].sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
-  for (const r of sorted.slice(0, runs.size - RUNS_CAP)) runs.delete(r.runId);
+  for (const r of sorted.slice(0, runs.size - RUNS_CAP)) {
+    runs.delete(r.runId);
+    try {
+      removeRunArtifacts(r.runId);
+    } catch (e) {
+      console.warn(`[store] 清理 run 产物失败（${r.runId}）：`, e?.message || e);
+    }
+  }
 }
 
 export function getRun(runId) {
