@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { MEDIA_LIMITS } from "./artifacts.js";
+import { MEDIA_LIMITS, validateManagedDirectory } from "./artifacts.js";
 
 const KIND_LIMIT = { image: "maxImageBytes", video: "maxVideoBytes", audio: "maxAudioBytes" };
 const MIME_PREFIX = { image: "image/", video: "video/", audio: "audio/" };
@@ -116,18 +116,14 @@ async function followHttp(source, signal, kind, maxBytes) {
 }
 
 function dataSource(source, kind) {
-  const match = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(source);
-  if (!match) throw new Error("无效 data URL");
-  verifyMime(match[1], kind);
-  const encoded = match[2] ? match[3] : "";
-  if (match[2] && encoded.length % 4 !== 0) throw new Error("无效 data URL 数据");
-  if (!match[2]) {
-    try {
-      return Readable.from(Buffer.from(decodeURIComponent(match[3])));
-    } catch {
-      throw new Error("无效 data URL 数据");
-    }
-  }
+  const comma = source.indexOf(",", 5);
+  if (!source.startsWith("data:") || comma < 0) throw new Error("无效 data URL");
+  const metadata = source.slice(5, comma).split(";");
+  const mime = metadata.shift();
+  verifyMime(mime, kind);
+  if (!metadata.some((value) => value.toLowerCase() === "base64")) throw new Error("仅支持 base64 编码的媒体 data URL");
+  const encoded = source.slice(comma + 1);
+  if (encoded.length % 4 !== 0) throw new Error("无效 data URL 数据");
   const chunkChars = 64 * 1024;
   async function* decodeChunks() {
     for (let offset = 0; offset < encoded.length; offset += chunkChars) {
@@ -163,8 +159,7 @@ export async function materializeMedia({ source, kind, workspace, downloadTimeou
   if (typeof source !== "string" || source.length === 0) throw new Error("媒体来源不能为空");
   if (!Object.hasOwn(KIND_LIMIT, kind)) throw new Error(`不支持的媒体类型：${kind}`);
   if (typeof workspace !== "string" || workspace.trim() === "") throw new Error("必须提供服务端创建的 workspace 工作区");
-  const root = path.resolve(workspace);
-  fs.mkdirSync(root, { recursive: true });
+  const root = validateManagedDirectory(workspace);
   const maxBytes = MEDIA_LIMITS[KIND_LIMIT[kind]];
   const temporary = path.join(root, `.materialize.${randomUUID()}.tmp`);
   if (!contained(root, temporary)) throw new Error("物化目标路径越界");

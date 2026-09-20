@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { MEDIA_LIMITS } from "../src/media/artifacts.js";
+import { MEDIA_LIMITS, artifactPaths } from "../src/media/artifacts.js";
 import { materializeMedia } from "../src/media/materialize.js";
 
 const roots = [];
@@ -18,11 +18,19 @@ const servers = [];
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
 const MP4 = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypisom"), Buffer.alloc(16)]);
 const WAV = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVEfmt "), Buffer.alloc(16)]);
+let workspaceIndex = 0;
 
 function workspace() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "promo-materialize-"));
-  roots.push(root);
-  return root;
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-materialize-"));
+  roots.push(dataRoot);
+  const previous = process.env.PROMO_DATA_DIR;
+  process.env.PROMO_DATA_DIR = dataRoot;
+  try {
+    return artifactPaths(`materialize-${workspaceIndex += 1}`).inputs;
+  } finally {
+    if (previous === undefined) delete process.env.PROMO_DATA_DIR;
+    else process.env.PROMO_DATA_DIR = previous;
+  }
 }
 
 async function fixture(handler) {
@@ -205,6 +213,14 @@ test("拒绝 data URL 的错误 MIME、错误魔数和空数据", async () => {
   await assert.rejects(materializeMedia({ source: "data:image/png;base64,", kind: "image", workspace: dir }), /空/);
 });
 
+test("拒绝非 base64 data URL，并在巨大载荷解码前直接失败", async () => {
+  const dir = workspace();
+  await assert.rejects(materializeMedia({ source: "data:image/png,%89PNG", kind: "image", workspace: dir }), /base64/);
+  const hugeNonBase64 = `data:video/mp4,${"A".repeat(4 * 1024 * 1024)}`;
+  await assert.rejects(materializeMedia({ source: hugeNonBase64, kind: "video", workspace: dir }), /base64/);
+  assert.deepEqual(fs.readdirSync(dir), []);
+});
+
 test("base64 解码字节数精确处理 padding：各类型上限本身可接受，上限加一被拒绝", async () => {
   const dir = workspace();
   const cases = [
@@ -238,5 +254,14 @@ test("必须显式提供服务端创建的 workspace", async () => {
   await assert.rejects(
     materializeMedia({ source: `data:image/png;base64,${PNG.toString("base64")}`, kind: "image" }),
     /workspace|工作区/,
+  );
+});
+
+test("拒绝未由 artifactPaths 注册的任意本地目录作为 workspace", async () => {
+  const raw = fs.mkdtempSync(path.join(os.tmpdir(), "promo-unmanaged-"));
+  roots.push(raw);
+  await assert.rejects(
+    materializeMedia({ source: `data:image/png;base64,${PNG.toString("base64")}`, kind: "image", workspace: raw }),
+    /受管|artifactPaths|工作区/,
   );
 });

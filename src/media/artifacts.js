@@ -22,6 +22,7 @@ export const MEDIA_LIMITS = {
 const RESERVED_RUN_IDS = new Set([...Object.getOwnPropertyNames(Object.prototype), "__proto__", "prototype"]);
 const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 const trustedArtifactPaths = new WeakSet();
+const managedDirectories = new Map();
 
 /**
  * 返回当前媒体输出根目录。
@@ -66,6 +67,45 @@ function verifyCanonicalPaths(paths) {
   return { realRoot, realRunRoot, realWorkspace };
 }
 
+function registerManagedDirectory(directory, realRoot, realRunRoot) {
+  rejectLink(directory, "受管媒体目录");
+  const realDirectory = fs.realpathSync(directory);
+  if (realDirectory !== path.resolve(directory)) throw new Error("受管媒体目录不得包含符号链接或目录联接");
+  const stat = fs.statSync(realDirectory);
+  if (!stat.isDirectory() || !isContained(realRoot, realDirectory) || !isContained(realRunRoot, realDirectory)) {
+    throw new Error("受管媒体目录越界");
+  }
+  managedDirectories.set(realDirectory, { dev: stat.dev, ino: stat.ino, realRoot, realRunRoot });
+  return realDirectory;
+}
+
+/**
+ * 验证目录由 `artifactPaths` 创建且目录身份与真实边界未发生变化。
+ * @param {string} directory 待验证的受管工作目录。
+ * @returns {string} 通过验证的规范绝对路径。
+ * @throws {Error} 目录未注册、被替换或逃逸时抛出。
+ * @example validateManagedDirectory(artifactPaths("run-123").inputs);
+ */
+export function validateManagedDirectory(directory) {
+  if (typeof directory !== "string" || directory.trim() === "") throw new Error("必须提供 artifactPaths 创建的受管工作区");
+  const resolved = path.resolve(directory);
+  rejectLink(resolved, "受管媒体目录");
+  let realDirectory;
+  try {
+    realDirectory = fs.realpathSync(resolved);
+  } catch {
+    throw new Error("受管工作区不存在");
+  }
+  if (realDirectory !== resolved) throw new Error("受管工作区不得包含符号链接或目录联接");
+  const record = managedDirectories.get(realDirectory);
+  const stat = fs.statSync(realDirectory);
+  if (!record || !stat.isDirectory() || stat.dev !== record.dev || stat.ino !== record.ino
+    || !isContained(record.realRoot, realDirectory) || !isContained(record.realRunRoot, realDirectory)) {
+    throw new Error("工作区不是 artifactPaths 创建的可信受管目录，或目录已被替换");
+  }
+  return realDirectory;
+}
+
 function resolveArtifactPaths(runId, createDirectories) {
   validateRunId(runId);
   const configuredRoot = outputRoot();
@@ -105,7 +145,16 @@ function resolveArtifactPaths(runId, createDirectories) {
   for (const value of Object.values(paths)) {
     if (value !== root && !isContained(root, value)) throw new Error("产物路径越界");
   }
-  if (createDirectories) for (const dir of [paths.inputs, paths.scenes, paths.audio, paths.temp]) fs.mkdirSync(dir, { recursive: true });
+  if (createDirectories) {
+    const realRunRoot = fs.realpathSync(runRoot);
+    fs.mkdirSync(workspace, { recursive: true });
+    registerManagedDirectory(workspace, root, realRunRoot);
+    for (const dir of [paths.inputs, paths.scenes, paths.audio, paths.temp]) {
+      rejectLink(dir, "受管媒体子目录");
+      fs.mkdirSync(dir, { recursive: true });
+      registerManagedDirectory(dir, root, realRunRoot);
+    }
+  }
   const frozen = Object.freeze(paths);
   trustedArtifactPaths.add(frozen);
   return frozen;
@@ -233,6 +282,9 @@ export function removeRunArtifacts(runId) {
   if (!isContained(root, target)) throw new Error("拒绝删除输出根目录外的路径");
   const existed = fs.existsSync(target);
   fs.rmSync(target, { recursive: true, force: true });
+  for (const directory of managedDirectories.keys()) {
+    if (isContained(target, directory)) managedDirectories.delete(directory);
+  }
   return existed;
 }
 

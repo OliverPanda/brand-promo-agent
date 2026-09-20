@@ -157,6 +157,26 @@ test("artifactPaths 拒绝已存在的 run-root 目录联接逃逸", (t) => with
   assert.deepEqual(fs.readdirSync(outside), []);
 }));
 
+for (const childName of ["inputs", "audio"]) {
+  test(`artifactPaths 复用时拒绝 ${childName} 子目录联接逃逸`, (t) => withDataDir((dataDir) => {
+    const paths = artifactPaths(`child-link-${childName}`);
+    const outside = path.join(dataDir, `outside-${childName}`);
+    fs.mkdirSync(outside);
+    fs.rmSync(paths[childName], { recursive: true, force: true });
+    try {
+      fs.symlinkSync(outside, paths[childName], process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EPERM", "EACCES"].includes(error.code)) {
+        t.skip(`当前操作系统权限不允许创建目录联接：${error.code}`);
+        return;
+      }
+      throw error;
+    }
+    assert.throws(() => artifactPaths(`child-link-${childName}`), /符号链接|联接|越界/);
+    assert.deepEqual(fs.readdirSync(outside), []);
+  }));
+}
+
 test("产物写入与提升拒绝调用方伪造的路径对象", async () => withDataDir(async () => {
   const real = artifactPaths("trusted-run");
   const forged = { ...real, runRoot: path.dirname(real.runRoot), manifest: path.join(path.dirname(real.runRoot), "forged.json") };
