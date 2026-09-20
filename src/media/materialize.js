@@ -66,40 +66,79 @@ async function followHttp(source, signal, kind, maxBytes) {
     visited.add(current.href);
     const response = await fetch(current, { redirect: "manual", signal });
     if (REDIRECT_STATUSES.has(response.status)) {
-      if (redirects === MAX_REDIRECTS) throw new Error("HTTP 重定向次数过多");
+      if (redirects === MAX_REDIRECTS) {
+        await response.body?.cancel();
+        throw new Error("HTTP 重定向次数过多");
+      }
       const location = response.headers.get("location");
-      if (!location) throw new Error("HTTP 重定向缺少 Location");
-      const next = new URL(location, current);
-      if (!new Set(["http:", "https:"]).has(next.protocol)) throw new Error("拒绝非 HTTP(S) 重定向");
-      if (current.protocol === "https:" && next.protocol === "http:") throw new Error("拒绝 HTTPS 降级重定向");
+      if (!location) {
+        await response.body?.cancel();
+        throw new Error("HTTP 重定向缺少 Location");
+      }
+      let next;
+      try {
+        next = new URL(location, current);
+      } catch (error) {
+        await response.body?.cancel();
+        throw error;
+      }
+      if (!new Set(["http:", "https:"]).has(next.protocol)) {
+        await response.body?.cancel();
+        throw new Error("拒绝非 HTTP(S) 重定向");
+      }
+      if (current.protocol === "https:" && next.protocol === "http:") {
+        await response.body?.cancel();
+        throw new Error("拒绝 HTTPS 降级重定向");
+      }
       await response.body?.cancel();
       current = next;
       continue;
     }
-    if (!response.ok) throw new Error(`媒体下载失败：HTTP ${response.status}`);
-    verifyMime(response.headers.get("content-type"), kind);
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`媒体下载失败：HTTP ${response.status}`);
+    }
+    try {
+      verifyMime(response.headers.get("content-type"), kind);
+    } catch (error) {
+      await response.body?.cancel();
+      throw error;
+    }
     const declared = Number(response.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`媒体过大，超过 ${maxBytes} 字节上限`);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await response.body?.cancel();
+      throw new Error(`媒体过大，超过 ${maxBytes} 字节上限`);
+    }
     if (!response.body) throw new Error("媒体响应为空");
     return Readable.fromWeb(response.body);
   }
   throw new Error("HTTP 重定向次数过多");
 }
 
-function dataSource(source, kind, maxBytes) {
+function dataSource(source, kind) {
   const match = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(source);
   if (!match) throw new Error("无效 data URL");
   verifyMime(match[1], kind);
-  const encoded = match[2] ? match[3].replace(/\s/g, "") : "";
-  if (match[2] && (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded))) throw new Error("无效 data URL 数据");
-  if (match[2] && Buffer.byteLength(encoded, "base64") > maxBytes) throw new Error(`媒体过大，超过 ${maxBytes} 字节上限`);
-  let bytes;
-  try {
-    bytes = match[2] ? Buffer.from(encoded, "base64") : Buffer.from(decodeURIComponent(match[3]));
-  } catch {
-    throw new Error("无效 data URL 数据");
+  const encoded = match[2] ? match[3] : "";
+  if (match[2] && encoded.length % 4 !== 0) throw new Error("无效 data URL 数据");
+  if (!match[2]) {
+    try {
+      return Readable.from(Buffer.from(decodeURIComponent(match[3])));
+    } catch {
+      throw new Error("无效 data URL 数据");
+    }
   }
-  return Readable.from(bytes);
+  const chunkChars = 64 * 1024;
+  async function* decodeChunks() {
+    for (let offset = 0; offset < encoded.length; offset += chunkChars) {
+      const chunk = encoded.slice(offset, offset + chunkChars);
+      const isLast = offset + chunkChars >= encoded.length;
+      const pattern = isLast ? /^[A-Za-z0-9+/]*={0,2}$/ : /^[A-Za-z0-9+/]+$/;
+      if (!pattern.test(chunk)) throw new Error("无效 data URL 数据");
+      yield Buffer.from(chunk, "base64");
+    }
+  }
+  return Readable.from(decodeChunks());
 }
 
 function fileSource(source, workspace) {
@@ -134,7 +173,7 @@ export async function materializeMedia({ source, kind, workspace, downloadTimeou
   let timer;
   try {
     let input;
-    if (source.startsWith("data:")) input = dataSource(source, kind, maxBytes);
+    if (source.startsWith("data:")) input = dataSource(source, kind);
     else if (/^https?:\/\//i.test(source)) {
       timer = setTimeout(() => controller.abort(new Error("媒体下载超时")), downloadTimeoutMs);
       input = await followHttp(source, controller.signal, kind, maxBytes);

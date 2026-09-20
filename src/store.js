@@ -100,6 +100,7 @@ function trimRuns() {
   const sorted = [...runs.values()].sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
   for (const r of sorted.slice(0, runs.size - RUNS_CAP)) {
     runs.delete(r.runId);
+    resumers.delete(r.runId);
     try {
       removeRunArtifacts(r.runId);
     } catch (e) {

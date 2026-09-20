@@ -180,6 +180,24 @@ test("HTTP 下载超时会中止且不留下文件", async () => {
   assert.deepEqual(fs.readdirSync(dir), []);
 });
 
+test("HTTP 在进入落盘管线前拒绝响应时取消 body 并关闭服务端流", async () => {
+  let resolveClosed;
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
+  const base = await fixture((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    const interval = setInterval(() => res.write(Buffer.alloc(1024)), 5);
+    req.on("close", () => {
+      clearInterval(interval);
+      resolveClosed();
+    });
+  });
+  await assert.rejects(materializeMedia({ source: base, kind: "video", workspace: workspace() }), /MIME/);
+  await Promise.race([
+    closed,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("响应 body 未取消，服务端流仍保持连接")), 1_000)),
+  ]);
+});
+
 test("拒绝 data URL 的错误 MIME、错误魔数和空数据", async () => {
   const dir = workspace();
   await assert.rejects(materializeMedia({ source: `data:text/plain;base64,${PNG.toString("base64")}`, kind: "image", workspace: dir }), /MIME/);

@@ -17,12 +17,12 @@ import {
   writeManifest,
 } from "../src/media/artifacts.js";
 
-function withDataDir(fn) {
+async function withDataDir(fn) {
   const previous = process.env.PROMO_DATA_DIR;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "promo-artifacts-"));
   process.env.PROMO_DATA_DIR = root;
   try {
-    return fn(root);
+    return await fn(root);
   } finally {
     if (previous === undefined) delete process.env.PROMO_DATA_DIR;
     else process.env.PROMO_DATA_DIR = previous;
@@ -67,7 +67,7 @@ test("writeManifest 原子写入 manifest.json", () => withDataDir(() => {
   assert.deepEqual(fs.readdirSync(paths.runRoot).filter((name) => name.includes(".tmp")), []);
 }));
 
-test("promoteArtifacts 成功时提升全部文件，失败时不留下部分最终产物", () => withDataDir(() => {
+test("promoteArtifacts 成功时提升全部文件，失败时不留下部分最终产物", () => withDataDir(async () => {
   const ok = artifactPaths("promote-ok");
   const sources = {
     finalVideo: path.join(ok.temp, "render.mp4"),
@@ -77,7 +77,7 @@ test("promoteArtifacts 成功时提升全部文件，失败时不留下部分最
   fs.writeFileSync(sources.finalVideo, "video");
   fs.writeFileSync(sources.subtitles, "subtitle");
   fs.writeFileSync(sources.poster, "poster");
-  promoteArtifacts(ok, sources);
+  await promoteArtifacts(ok, sources);
   assert.equal(fs.readFileSync(ok.finalVideo, "utf8"), "video");
   assert.equal(fs.readFileSync(ok.subtitles, "utf8"), "subtitle");
   assert.equal(fs.readFileSync(ok.poster, "utf8"), "poster");
@@ -85,12 +85,12 @@ test("promoteArtifacts 成功时提升全部文件，失败时不留下部分最
   const bad = artifactPaths("promote-bad");
   const valid = path.join(bad.temp, "render.mp4");
   fs.writeFileSync(valid, "video");
-  assert.throws(() => promoteArtifacts(bad, { finalVideo: valid, subtitles: path.join(bad.temp, "missing.srt") }), /不存在/);
+  await assert.rejects(promoteArtifacts(bad, { finalVideo: valid, subtitles: path.join(bad.temp, "missing.srt") }), /不存在/);
   assert.equal(fs.existsSync(bad.finalVideo), false);
   assert.equal(fs.existsSync(bad.subtitles), false);
 }));
 
-test("promoteArtifacts 拒绝通过 workspace 内目录联接读取外部文件", (t) => withDataDir((dataDir) => {
+test("promoteArtifacts 拒绝通过 workspace 内目录联接读取外部文件", (t) => withDataDir(async (dataDir) => {
   const paths = artifactPaths("promote-link");
   const outsideDir = path.join(dataDir, "outside-promotion");
   fs.mkdirSync(outsideDir);
@@ -105,14 +105,14 @@ test("promoteArtifacts 拒绝通过 workspace 内目录联接读取外部文件"
     }
     throw error;
   }
-  assert.throws(
-    () => promoteArtifacts(paths, { finalVideo: path.join(link, "external.mp4") }),
+  await assert.rejects(
+    promoteArtifacts(paths, { finalVideo: path.join(link, "external.mp4") }),
     /越界|工作区/,
   );
   assert.equal(fs.existsSync(paths.finalVideo), false);
 }));
 
-test("promoteArtifacts 部分提升失败后恢复既有产物且不留下新产物", () => withDataDir(() => {
+test("promoteArtifacts 部分提升失败后恢复既有产物且不留下新产物", () => withDataDir(async () => {
   const paths = artifactPaths("promote-rollback");
   fs.writeFileSync(paths.finalVideo, "old-video");
   fs.writeFileSync(paths.subtitles, "old-subtitles");
@@ -121,21 +121,48 @@ test("promoteArtifacts 部分提升失败后恢复既有产物且不留下新产
   fs.writeFileSync(video, "new-video");
   fs.writeFileSync(subtitles, "new-subtitles");
   let promotedCount = 0;
-  const renameSync = (source, target) => {
+  const rename = async (source, target) => {
     if (source.endsWith(".promoting")) {
       promotedCount += 1;
       if (promotedCount === 2) throw new Error("injected second promotion failure");
     }
-    fs.renameSync(source, target);
+    await fs.promises.rename(source, target);
   };
-  assert.throws(
-    () => promoteArtifacts(paths, { finalVideo: video, subtitles }, { renameSync }),
+  await assert.rejects(
+    promoteArtifacts(paths, { finalVideo: video, subtitles }, { rename }),
     /injected second promotion failure/,
   );
   assert.equal(promotedCount, 2, "故障应发生在一个目标已经完成提升之后");
   assert.equal(fs.readFileSync(paths.finalVideo, "utf8"), "old-video");
   assert.equal(fs.readFileSync(paths.subtitles, "utf8"), "old-subtitles");
   assert.deepEqual(fs.readdirSync(paths.runRoot).filter((name) => /promoting|backup/.test(name)), []);
+}));
+
+test("artifactPaths 拒绝已存在的 run-root 目录联接逃逸", (t) => withDataDir((dataDir) => {
+  const outputs = path.join(dataDir, "outputs");
+  const outside = path.join(dataDir, "outside-run-root");
+  fs.mkdirSync(outputs, { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  const linkedRun = path.join(outputs, "linked-run");
+  try {
+    fs.symlinkSync(outside, linkedRun, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES"].includes(error.code)) {
+      t.skip(`当前操作系统权限不允许创建目录联接：${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  assert.throws(() => artifactPaths("linked-run"), /符号链接|联接|越界/);
+  assert.deepEqual(fs.readdirSync(outside), []);
+}));
+
+test("产物写入与提升拒绝调用方伪造的路径对象", async () => withDataDir(async () => {
+  const real = artifactPaths("trusted-run");
+  const forged = { ...real, runRoot: path.dirname(real.runRoot), manifest: path.join(path.dirname(real.runRoot), "forged.json") };
+  assert.throws(() => writeManifest(forged, { forged: true }), /可信|artifactPaths/);
+  await assert.rejects(promoteArtifacts(forged, { finalVideo: real.tempFinalVideo }), /可信|artifactPaths/);
+  assert.equal(Object.isFrozen(real), true);
 }));
 
 test("removeRunArtifacts 只删除精确 run 目录", () => withDataDir((dataDir) => {

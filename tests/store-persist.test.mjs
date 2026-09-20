@@ -121,3 +121,19 @@ for (const persist of ["1", "0"]) {
     }
   });
 }
+
+test("容量淘汰同步移除最旧 run 的 resumer", () => {
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "promo-trim-resumer-"));
+  try {
+    const out = runModule(`
+      import { createRun, registerResumer, getResumer } from ${STORE_URL};
+      createRun("resumer-old", { brandName: "Old" });
+      registerResumer("resumer-old", async () => {});
+      createRun("resumer-keep", { brandName: "Keep" });
+      console.log(JSON.stringify({ old: !!getResumer("resumer-old"), keep: !!getResumer("resumer-keep") }));
+    `, { PROMO_DATA_DIR: isolated, PROMO_PERSIST: "0", PROMO_RUNS_CAP: "1" });
+    assert.deepEqual(JSON.parse(out.trim()), { old: false, keep: false });
+  } finally {
+    fs.rmSync(isolated, { recursive: true, force: true });
+  }
+});

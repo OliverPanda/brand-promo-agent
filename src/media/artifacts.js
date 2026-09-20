@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { pipeline } from "node:stream/promises";
 
 /** 媒体下载、验收和时间轴使用的统一阈值。 */
 export const MEDIA_LIMITS = {
@@ -20,6 +21,7 @@ export const MEDIA_LIMITS = {
 
 const RESERVED_RUN_IDS = new Set([...Object.getOwnPropertyNames(Object.prototype), "__proto__", "prototype"]);
 const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+const trustedArtifactPaths = new WeakSet();
 
 /**
  * 返回当前媒体输出根目录。
@@ -28,7 +30,8 @@ const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
  */
 export function outputRoot() {
   const dataDir = process.env.PROMO_DATA_DIR || path.resolve(process.cwd(), "data");
-  return path.resolve(process.env.PROMO_OUTPUT_ROOT || path.join(dataDir, "outputs"));
+  const configured = path.resolve(process.env.PROMO_OUTPUT_ROOT || path.join(dataDir, "outputs"));
+  return fs.existsSync(configured) ? fs.realpathSync(configured) : configured;
 }
 
 function isContained(root, target, allowRoot = false) {
@@ -42,12 +45,46 @@ function validateRunId(runId) {
     || RESERVED_RUN_IDS.has(runId) || WINDOWS_DEVICE_NAME.test(runId)) throw new Error("非法 runId");
 }
 
+function rejectLink(target, label) {
+  const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (stat?.isSymbolicLink()) throw new Error(`${label} 不得是符号链接或目录联接`);
+}
+
+function assertTrustedPaths(paths) {
+  if (!paths || !trustedArtifactPaths.has(paths)) throw new Error("必须使用 artifactPaths 返回的可信路径对象");
+}
+
+function verifyCanonicalPaths(paths) {
+  assertTrustedPaths(paths);
+  rejectLink(paths.runRoot, "runRoot");
+  rejectLink(paths.workspace, "workspace");
+  const realRoot = fs.realpathSync(paths.outputRoot);
+  const realRunRoot = fs.realpathSync(paths.runRoot);
+  const realWorkspace = fs.realpathSync(paths.workspace);
+  if (!isContained(realRoot, realRunRoot) || !isContained(realRoot, realWorkspace)
+    || realRunRoot !== paths.runRoot || realWorkspace !== paths.workspace) throw new Error("产物路径越界或已被替换");
+  return { realRoot, realRunRoot, realWorkspace };
+}
+
 function resolveArtifactPaths(runId, createDirectories) {
   validateRunId(runId);
-  const root = outputRoot();
+  const configuredRoot = outputRoot();
+  fs.mkdirSync(configuredRoot, { recursive: true });
+  const root = fs.realpathSync(configuredRoot);
   const runRoot = path.resolve(root, runId);
   if (!isContained(root, runRoot)) throw new Error("非法 runId：输出路径越界");
+  rejectLink(runRoot, "runRoot");
   const workspace = path.resolve(runRoot, "workspace");
+  rejectLink(workspace, "workspace");
+  if (createDirectories) {
+    fs.mkdirSync(runRoot, { recursive: true });
+    rejectLink(runRoot, "runRoot");
+    fs.mkdirSync(workspace, { recursive: true });
+    rejectLink(workspace, "workspace");
+    const realRunRoot = fs.realpathSync(runRoot);
+    const realWorkspace = fs.realpathSync(workspace);
+    if (!isContained(root, realRunRoot) || !isContained(root, realWorkspace)) throw new Error("运行产物目录越界");
+  }
   const paths = {
     outputRoot: root,
     runRoot,
@@ -68,10 +105,10 @@ function resolveArtifactPaths(runId, createDirectories) {
   for (const value of Object.values(paths)) {
     if (value !== root && !isContained(root, value)) throw new Error("产物路径越界");
   }
-  if (createDirectories) {
-    for (const dir of [root, runRoot, workspace, paths.inputs, paths.scenes, paths.audio, paths.temp]) fs.mkdirSync(dir, { recursive: true });
-  }
-  return paths;
+  if (createDirectories) for (const dir of [paths.inputs, paths.scenes, paths.audio, paths.temp]) fs.mkdirSync(dir, { recursive: true });
+  const frozen = Object.freeze(paths);
+  trustedArtifactPaths.add(frozen);
+  return frozen;
 }
 
 /**
@@ -93,6 +130,7 @@ export function artifactPaths(runId) {
  * @example writeManifest(artifactPaths("run-123"), { runId: "run-123" });
  */
 export function writeManifest(paths, manifest) {
+  verifyCanonicalPaths(paths);
   const runRoot = path.resolve(paths?.runRoot || "");
   const target = path.resolve(paths?.manifest || "");
   if (!isContained(runRoot, target)) throw new Error("manifest 路径越界");
@@ -111,61 +149,74 @@ export function writeManifest(paths, manifest) {
  * 将工作区内已完成的文件原子替换到公开产物位置。
  * @param {ReturnType<typeof artifactPaths>} paths `artifactPaths` 返回的路径集合。
  * @param {Partial<Record<"finalVideo"|"subtitles"|"manifest"|"poster", string>>} sources 产物键到工作区源文件的映射。
- * @param {{renameSync?: typeof fs.renameSync}} [operations] 可注入的文件系统原子 rename 边界。
- * @returns {Record<string, string>} 已提升的最终路径。
- * @example promoteArtifacts(paths, { finalVideo: paths.tempFinalVideo });
+ * @param {{rename?: typeof fs.promises.rename}} [operations] 可注入的文件系统原子 rename 边界。
+ * @returns {Promise<Record<string, string>>} 已提升的最终路径。
+ * @example await promoteArtifacts(paths, { finalVideo: paths.tempFinalVideo });
  */
-export function promoteArtifacts(paths, sources, operations = {}) {
-  const renameSync = operations.renameSync || fs.renameSync;
-  if (typeof renameSync !== "function") throw new Error("无效的产物提升操作");
+export async function promoteArtifacts(paths, sources, operations = {}) {
+  const rename = operations.rename || fs.promises.rename;
+  if (typeof rename !== "function") throw new Error("无效的产物提升操作");
+  const { realWorkspace } = verifyCanonicalPaths(paths);
   const allowed = new Set(["finalVideo", "subtitles", "manifest", "poster"]);
   const entries = Object.entries(sources || {});
   if (entries.length === 0) throw new Error("没有待提升的产物");
-  const realWorkspace = fs.realpathSync(paths.workspace);
+  const validated = [];
+  const opened = [];
   for (const [key, source] of entries) {
     if (!allowed.has(key) || typeof source !== "string") throw new Error(`未知产物：${key}`);
     const resolvedSource = path.resolve(source);
     const target = path.resolve(paths[key] || "");
     if (!isContained(paths.workspace, resolvedSource)) throw new Error(`产物源路径越界：${key}`);
     if (!isContained(paths.runRoot, target)) throw new Error(`产物目标路径越界：${key}`);
-    if (!fs.statSync(resolvedSource, { throwIfNoEntry: false })?.isFile()) throw new Error(`产物不存在：${key}`);
-    const realSource = fs.realpathSync(resolvedSource);
+    let realSource;
+    try {
+      realSource = await fs.promises.realpath(resolvedSource);
+    } catch {
+      throw new Error(`产物不存在：${key}`);
+    }
     if (!isContained(realWorkspace, realSource)) throw new Error(`产物源路径越界：${key}`);
+    validated.push({ key, realSource, target });
   }
 
   const staged = [];
   const backups = [];
   const promoted = {};
   try {
-    for (const [key, source] of entries) {
-      const target = path.resolve(paths[key]);
+    for (const { key, realSource, target } of validated) {
+      const handle = await fs.promises.open(realSource, "r");
+      opened.push({ handle });
+      if (!(await handle.stat()).isFile()) throw new Error(`产物不存在：${key}`);
       const stage = path.join(paths.runRoot, `.${path.basename(target)}.${randomUUID()}.promoting`);
-      fs.copyFileSync(path.resolve(source), stage, fs.constants.COPYFILE_EXCL);
       staged.push({ key, stage, target });
+      await pipeline(handle.createReadStream({ autoClose: false }), fs.createWriteStream(stage, { flags: "wx" }));
+      await handle.close();
     }
     for (const item of staged) {
-      if (fs.existsSync(item.target)) {
+      if (await fs.promises.lstat(item.target).then(() => true, () => false)) {
         const backup = `${item.target}.${randomUUID()}.backup`;
-        renameSync(item.target, backup);
+        await rename(item.target, backup);
         backups.push({ target: item.target, backup });
       }
-      renameSync(item.stage, item.target);
+      await rename(item.stage, item.target);
       promoted[item.key] = item.target;
     }
     for (const { backup } of backups) {
       try {
-        fs.rmSync(backup, { force: true });
+        await fs.promises.rm(backup, { force: true });
       } catch (error) {
         console.warn(`[artifacts] 清理产物备份失败（${backup}）：`, error?.message || error);
       }
     }
     return promoted;
   } catch (error) {
-    for (const target of Object.values(promoted)) fs.rmSync(target, { force: true });
-    for (const { target, backup } of backups.reverse()) if (fs.existsSync(backup)) renameSync(backup, target);
+    for (const target of Object.values(promoted)) await fs.promises.rm(target, { force: true });
+    for (const { target, backup } of backups.reverse()) {
+      if (await fs.promises.lstat(backup).then(() => true, () => false)) await rename(backup, target);
+    }
     throw error;
   } finally {
-    for (const { stage } of staged) fs.rmSync(stage, { force: true });
+    for (const { handle } of opened) await handle.close().catch(() => {});
+    for (const { stage } of staged) await fs.promises.rm(stage, { force: true });
   }
 }
 
