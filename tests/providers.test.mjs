@@ -57,6 +57,11 @@ test("generateVoiceover 产出 SRT", async () => {
   const script = await generateScript(brief);
   const v = await generateVoiceover(script, brief);
   assert.ok(v.srt.includes("-->"));
+  assert.equal(script.voiceover.length, 5);
+  assert.equal(v.durationSec, 30);
+  assert.deepEqual(v.sceneDurationsMs, [6000, 6000, 6000, 6000, 6000]);
+  assert.match(v.srt, /00:00:24,000 --> 00:00:30,000/);
+  assert.equal(v.sceneDurationsMs.reduce((sum, value) => sum + value, 0), 30_000);
 });
 
 test("generateMusic / composite 占位可跑通", async () => {

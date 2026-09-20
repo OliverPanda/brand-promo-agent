@@ -53,6 +53,7 @@ function makeWav(durationSec, frequency) {
 const DEFAULT_SPEECH = makeWav(0.25, 440);
 const DEFAULT_MUSIC = makeWav(1, 220);
 let speechResponses = [];
+let storyboardResponseCounts = [];
 let failSpeechAt = 0;
 let speechCallIndex = 0;
 let invalidMusicResponse = false;
@@ -80,7 +81,10 @@ function route(path, body) {
         return makeRes({
           json: {
             choices: [{ message: { content: JSON.stringify({
-              title: "T", voiceover: [{ timecode: "00:00:00.000", text: "hi" }],
+              title: "T", voiceover: [
+                { timecode: "00:00:00.000", text: "hi" },
+                { timecode: "00:00:01.000", text: "again" },
+              ],
               structure: ["a"], moodCurve: ["x"],
             }) } }],
             usage: { total_tokens: 120 },
@@ -88,13 +92,18 @@ function route(path, body) {
         });
       }
       // 分镜
+      const sceneCount = storyboardResponseCounts.length ? storyboardResponseCounts.shift() : 2;
       return makeRes({
         json: {
           choices: [{ message: { content: JSON.stringify({
-            scenes: [
-              { index: 1, visualPrompt: "p1", subtitle: "s1", camera: "push", durationSec: 5, musicClimax: false },
-              { index: 2, visualPrompt: "p2", subtitle: "s2", camera: "pull", durationSec: 5, musicClimax: true },
-            ],
+            scenes: Array.from({ length: sceneCount }, (_, index) => ({
+              index: index + 1,
+              visualPrompt: `p${index + 1}`,
+              subtitle: `s${index + 1}`,
+              camera: index % 2 ? "pull" : "push",
+              durationSec: 5,
+              musicClimax: index === sceneCount - 1,
+            })),
           }) } }],
           usage: { total_tokens: 200 },
         },
@@ -225,6 +234,24 @@ test("generateStoryboard 真实模式：返回 Scene[] 且提示词含画布安�
   assert.match(storyboardCall.body.messages[1].content, /1:1/);
   assert.match(storyboardCall.body.messages[1].content, /主体居中/);
   assert.match(storyboardCall.body.messages[1].content, /安全区/);
+  assert.match(storyboardCall.body.messages[1].content, /恰好输出 2 个分镜|严格.*2.*分镜/);
+});
+
+test("generateStoryboard 数量不符只纠错重试一次，仍不符则失败", async () => {
+  const script = await generateScript(baseBrief);
+  calls = [];
+  storyboardResponseCounts = [1, 2];
+  const recovered = await generateStoryboard(baseBrief, script);
+  const recoveredCalls = calls.filter((call) => call.url.endsWith("/chat/completions"));
+  assert.equal(recoveredCalls.length, 2);
+  assert.equal(recovered.length, 2);
+  assert.match(recoveredCalls[1].body.messages[1].content, /纠正|上次|必须.*2/);
+
+  calls = [];
+  storyboardResponseCounts = [1, 1, 2];
+  await assert.rejects(generateStoryboard(baseBrief, script), /分镜数量.*2|数量不一致/);
+  assert.equal(calls.filter((call) => call.url.endsWith("/chat/completions")).length, 2, "最多一次纠错重试");
+  storyboardResponseCounts = [];
 });
 
 test("generateSceneMedia 真实模式：POST /images/generations + 返回 url + _usage.images", async () => {

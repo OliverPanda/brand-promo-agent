@@ -13,6 +13,7 @@ import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey
 import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
 import { materializeMedia } from "../media/materialize.js";
 import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration } from "../media/audio.js";
+import { MEDIA_LIMITS } from "../media/artifacts.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // ───────────────────────── 模式判定 ─────────────────────────
@@ -256,29 +257,43 @@ function demoScript(brief) {
 export async function generateStoryboard(brief, script) {
   if (getProviderMode() !== "real") return demoStoryboard(brief, script);
   const model = brief.llmModel || process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
+  const expectedSceneCount = script?.voiceover?.length || 0;
+  if (expectedSceneCount === 0) throw new Error("确认脚本没有可生成分镜的旁白");
   const sys = "你是资深分镜师，把脚本拆为若干 Scene，严格只输出 JSON 数组，结构：[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]。";
   const vo = (script?.voiceover || []).map((v) => `${v.timecode} ${v.text}`).join("\n");
   let user =
     `品牌：${brief.brandName} 产品：${brief.productName}\n调性：${(brief.tones || []).join("、")}\n` +
     `时长：${brief.durationSec}s\n旁白：\n${vo}\n` +
-    `约每 5s 一个镜头；camera ∈ push/pull/pan/fixed；视觉风格全程统一。\n${canvasPrompt(brief)}`;
+    `必须恰好输出 ${expectedSceneCount} 个分镜，与旁白逐句一一对应，不得合并、拆分或增删；` +
+    `camera ∈ push/pull/pan/fixed；视觉风格全程统一。\n${canvasPrompt(brief)}`;
   if (brief.bannedWords?.length) user += `\n禁用词：${brief.bannedWords.join("、")}。`;
   if (brief.logoColor) user += `\n品牌主色 ${brief.logoColor}，画面配色需呼应。`;
-  user = withGlobalLanguage(user, brief.language);
-  const data = await oneApiPost("/chat/completions", {
-    model,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: user },
-    ],
-    response_format: { type: "json_object" },
-    temperature: 0.7,
-  });
-  const content = data.choices?.[0]?.message?.content || "{}";
-  const parsed = parseJSONSafe(content);
-  const arr = Array.isArray(parsed) ? parsed : parsed.scenes || [];
-  const tokens = data.usage?.total_tokens ?? estimateTokens(user + content);
-  if (!arr.length) return demoStoryboard(brief, script);
+  let arr = [];
+  let tokens = 0;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const correction = attempt === 0 ? "" : `\n纠正上次输出：上次分镜数量为 ${arr.length}，本次必须严格返回 ${expectedSceneCount} 个分镜。`;
+    const attemptUser = withGlobalLanguage(`${user}${correction}`, brief.language);
+    const data = await oneApiPost("/chat/completions", {
+      model,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: attemptUser },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.7,
+    });
+    const content = data.choices?.[0]?.message?.content || "{}";
+    const parsed = parseJSONSafe(content);
+    arr = Array.isArray(parsed) ? parsed : parsed.scenes || [];
+    tokens += data.usage?.total_tokens ?? estimateTokens(attemptUser + content);
+    if (arr.length === expectedSceneCount) break;
+  }
+  if (arr.length !== expectedSceneCount) {
+    throw attachPartialUsage(
+      new Error(`分镜数量与确认旁白不一致：需要 ${expectedSceneCount} 个，实际 ${arr.length} 个`),
+      { tokens },
+    );
+  }
   const scenes = arr.map((s, i) => ({
     index: s.index || i + 1,
     visualPrompt: s.visualPrompt || `${brief.brandName} ${brief.productName} 画面`,
@@ -586,17 +601,41 @@ export async function generateVoiceover(script, brief, options = {}) {
 
 function demoVoiceover(script, brief) {
   const lines = script?.voiceover || [];
-  const srt = lines
-    .map((v, i) => `${i + 1}\n${v.timecode} --> ${fmtTC((i + 1) * 3)}\n${v.text}\n`)
-    .join("\n");
+  if (lines.length === 0) throw new Error("DEMO 确认脚本旁白不能为空");
+  const totalDurationSec = Number(brief.durationSec || 30);
+  if (!Number.isFinite(totalDurationSec) || totalDurationSec <= 0) throw new Error("DEMO 目标时长无效");
+  const totalDurationMs = Math.round(totalDurationSec * 1000);
+  const startsMs = lines.map((line, index) => parseTimecodeMs(line.timecode, index));
+  if (startsMs[0] !== 0) throw new Error("DEMO 第一条旁白 timecode 必须从 00:00:00.000 开始");
+  const speechDurationsSec = startsMs.map((startMs, index) => {
+    const endMs = index < startsMs.length - 1 ? startsMs[index + 1] : totalDurationMs;
+    const intervalMs = endMs - startMs;
+    const speechMs = intervalMs - (index < startsMs.length - 1 ? MEDIA_LIMITS.voiceGapMs : 0);
+    if (intervalMs <= 0 || speechMs <= 0) throw new Error(`DEMO 第 ${index + 1} 条旁白 timecode 非单调或超出目标时长`);
+    return speechMs / 1000;
+  });
+  const timeline = buildVoiceTimeline(lines.map((line) => line.text), speechDurationsSec, {
+    maxCharsPerLine: resolveCanvas(brief.canvasPreset).subtitle.maxCharsPerLine,
+  });
+  if (Math.round(timeline.durationSec * 1000) !== totalDurationMs) throw new Error("DEMO 时间轴总时长与目标时长不一致");
+  const srt = formatSrt(timeline.cues, timeline.durationSec);
   return {
     voiceUrl: null,
+    cues: timeline.cues,
     srt,
-    durationSec: lines.length * 3,
-    sceneDurationsMs: lines.map(() => 3000),
+    durationSec: timeline.durationSec,
+    sceneDurationsMs: timeline.sceneDurationsMs,
     voiceTone: brief.voiceTone || "男声",
     model: "demo-tts",
   };
+}
+
+function parseTimecodeMs(value, index) {
+  const match = /^(\d{2,}):(\d{2}):(\d{2})[.,](\d{3})$/u.exec(String(value || ""));
+  if (!match) throw new Error(`DEMO 第 ${index + 1} 条旁白 timecode 格式无效`);
+  const [, hours, minutes, seconds, milliseconds] = match;
+  if (Number(minutes) >= 60 || Number(seconds) >= 60) throw new Error(`DEMO 第 ${index + 1} 条旁白 timecode 格式无效`);
+  return Number(hours) * 3_600_000 + Number(minutes) * 60_000 + Number(seconds) * 1000 + Number(milliseconds);
 }
 
 // ───────────────────────── 5) 音乐（Mureka 桥 / one-api 音乐通道） ─────────────────────────

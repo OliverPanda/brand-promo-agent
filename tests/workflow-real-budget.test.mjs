@@ -12,8 +12,20 @@ process.env.PROMO_MUSIC_MODEL = "mureka-v1";
 process.env.PROMO_MUSIC_PATH = "/audio/music";
 process.env.PROMO_BUDGET_CAP = "100"; // 充足预算，确保成功路径
 
-const { test } = await import("node:test");
+const fs = (await import("node:fs")).default;
+const os = (await import("node:os")).default;
+const path = (await import("node:path")).default;
+const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "promo-workflow-real-"));
+const previousDataDir = process.env.PROMO_DATA_DIR;
+process.env.PROMO_DATA_DIR = testDataDir;
+
+const { test, after } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
+after(() => {
+  if (previousDataDir === undefined) delete process.env.PROMO_DATA_DIR;
+  else process.env.PROMO_DATA_DIR = previousDataDir;
+  fs.rmSync(testDataDir, { recursive: true, force: true });
+});
 
 function silentWav(durationSec = 0.25) {
   const sampleRate = 8_000;
@@ -44,6 +56,9 @@ let scriptVoiceover = [
 let workflowSpeechCall = 0;
 let workflowFailSpeechAt = 0;
 let workflowInvalidMusic = false;
+let workflowStoryboardCount = 2;
+let workflowImageCalls = 0;
+let workflowVideoCalls = 0;
 
 // ── fetch mock（与 providers-real 同形）──
 function makeRes({ ok = true, status = 200, json, text, bytes } = {}) {
@@ -70,12 +85,22 @@ function route(path, body) {
         title: "T", voiceover: scriptVoiceover, structure: ["a"], moodCurve: ["x"],
       }) } }], usage: { total_tokens: 120 } } });
     }
-    return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ scenes: [
-      { index: 1, visualPrompt: "p1", subtitle: "s1", camera: "push", durationSec: 5, musicClimax: false },
-      { index: 2, visualPrompt: "p2", subtitle: "s2", camera: "pull", durationSec: 5, musicClimax: true },
-    ] }) } }], usage: { total_tokens: 200 } } });
+    return makeRes({ json: { choices: [{ message: { content: JSON.stringify({
+      scenes: Array.from({ length: workflowStoryboardCount }, (_, index) => ({
+        index: index + 1,
+        visualPrompt: `p${index + 1}`,
+        subtitle: `s${index + 1}`,
+        camera: index % 2 ? "pull" : "push",
+        durationSec: 5,
+        musicClimax: index === workflowStoryboardCount - 1,
+      })),
+    }) } }], usage: { total_tokens: 200 } } });
   }
-  if (path.endsWith("/images/generations")) return makeRes({ json: { data: [{ url: "https://cdn.example/scene.png" }] } });
+  if (path.endsWith("/images/generations")) {
+    workflowImageCalls += 1;
+    return makeRes({ json: { data: [{ url: "https://cdn.example/scene.png" }] } });
+  }
+  if (path.includes("/video") || path.includes("/videos")) workflowVideoCalls += 1;
   if (path.endsWith("/audio/speech")) {
     workflowSpeechCall += 1;
     if (workflowSpeechCall === workflowFailSpeechAt) return makeRes({ ok: false, status: 500, text: "line failed" });
@@ -172,9 +197,11 @@ test("voice timeline 严格校验旁白/分镜数量并传播权威场景时长"
   );
 });
 
-test("voice step 数量不一致会失败且不调用 TTS", async () => {
-  scriptVoiceover = [{ timecode: "00:00:00.000", text: "只有一句" }];
+test("storyboard 两次数量不一致会在任何图像/视频调用前失败", async () => {
   workflowSpeechCall = 0;
+  workflowImageCalls = 0;
+  workflowVideoCalls = 0;
+  workflowStoryboardCount = 1;
   const server = app.listen(0);
   const port = server.address().port;
   try {
@@ -184,14 +211,13 @@ test("voice step 数量不一致会失败且不调用 TTS", async () => {
     });
     const { runId } = await response.json();
     const run = await waitStatus(port, runId, ["failed"]);
-    assert.equal(run.steps.voiceover.status, "failed");
-    assert.match(run.steps.voiceover.error, /旁白.*分镜.*数量|数量.*不一致/);
+    assert.equal(run.steps.storyboard.status, "failed");
+    assert.match(run.steps.storyboard.error, /分镜数量.*2|数量不一致/);
+    assert.equal(workflowImageCalls, 0);
+    assert.equal(workflowVideoCalls, 0);
     assert.equal(workflowSpeechCall, 0);
   } finally {
-    scriptVoiceover = [
-      { timecode: "00:00:00.000", text: "第一句" },
-      { timecode: "00:00:00.000", text: "第二句" },
-    ];
+    workflowStoryboardCount = 2;
     server.close();
   }
 });

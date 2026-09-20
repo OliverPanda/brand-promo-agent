@@ -389,6 +389,7 @@ const storyboard = createStep({
     const { brief, script } = inputData;
     return withStep(rid, STEP.STORYBOARD, async () => {
       const storyboard = await generateStoryboard(brief, script);
+      assertVoiceoverMatchesStoryboard(script, storyboard);
       const tokens = (storyboard || []).reduce((a, s) => a + (s._usage?.tokens || 0), 0);
       updateRun(rid, { storyboard });
       return { brief, script, storyboard, runId: rid, _usage: tokens ? { tokens } : undefined };

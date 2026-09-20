@@ -234,6 +234,8 @@ test("HITL 关闭：端到端产出分镜画廊 + SRT", async () => {
     assert.ok(Array.isArray(run.storyboardGallery) && run.storyboardGallery.length >= 3, "应产出分镜画廊");
     assert.ok(run.srt && run.srt.includes("-->"), "应产出 SRT");
     assert.equal(run.brief.language, "zh-CN");
+    assert.equal(run.storyboard.reduce((sum, scene) => sum + scene.durationSec, 0), 30, "DEMO 权威分镜总时长保持 30 秒");
+    assert.match(run.srt, /00:00:24,000 --> 00:00:30,000/);
   } finally {
     server.close();
   }
