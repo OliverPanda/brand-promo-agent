@@ -65,6 +65,31 @@ test("Unicode 长中文最多两行且按码点数比例拆为连续子 cue，�
   for (let i = 1; i < out.cues.length; i += 1) assert.equal(out.cues[i].startMs, out.cues[i - 1].endMs);
 });
 
+test("源文本多种空白先归一为单空格，任何 cue 仍最多两行", () => {
+  const text = "  第一段\r\n\r\n第二段\t第三段　第四段   结尾  ";
+  const normalized = "第一段 第二段 第三段 第四段 结尾";
+  const out = buildVoiceTimeline([text], [2], { maxCharsPerLine: 4 });
+  assert.ok(out.cues.every((cue) => cue.text.split("\n").length <= 2));
+  assert.ok(out.cues.every((cue) => cue.text.split("\n").every((line) => [...line].length <= 4)));
+  assert.equal(out.cues.map((cue) => cue.text.replaceAll("\n", "")).join(""), normalized);
+});
+
+test("极短语音按最大余数法重平衡，每个子 cue 至少 1ms 且精确耗尽片段", () => {
+  const out = buildVoiceTimeline(["一二三四五六七八九十甲乙"], [0.004], { maxCharsPerLine: 2 });
+  assert.equal(out.cues.length, 3);
+  const cueDurations = out.cues.map((cue) => cue.endMs - cue.startMs);
+  assert.ok(cueDurations.every((duration) => duration >= 1));
+  assert.equal(cueDurations.reduce((sum, duration) => sum + duration, 0), 4);
+  assert.equal(out.cues.at(-1).endMs, 4);
+});
+
+test("语音毫秒数小于所需字幕块数量时明确拒绝时间轴容量不足", () => {
+  assert.throws(
+    () => buildVoiceTimeline(["一二三四五六七八九十甲乙"], [0.002], { maxCharsPerLine: 2 }),
+    /时间轴容量不足|毫秒.*字幕/,
+  );
+});
+
 test("SRT 使用 UTF-8 标准逗号时间戳并移除非法控制字符", () => {
   const srt = formatSrt([
     { startMs: 0, endMs: 1400, text: "你\u0000好，世界！" },

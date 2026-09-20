@@ -16,6 +16,10 @@ function cleanSubtitleText(value) {
   return String(value ?? "").replace(ILLEGAL_CONTROL_CHARACTERS, "").replace(/\r\n?/gu, "\n");
 }
 
+function normalizeDialogueText(value) {
+  return cleanSubtitleText(value).replace(/\s+/gu, " ").trim();
+}
+
 function assertDuration(value, label = "音频时长") {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     throw new Error(`${label}必须是大于 0 的有限数字`);
@@ -38,6 +42,23 @@ function wrapText(text, maxCharsPerLine) {
     lines.push(characters.slice(offset, offset + maxCharsPerLine).join(""));
   }
   return lines;
+}
+
+function allocateCueDurations(durationMs, characterCounts, lineIndex) {
+  const cueCount = characterCounts.length;
+  if (durationMs < cueCount) {
+    throw new Error(`第 ${lineIndex + 1} 句字幕时间轴容量不足：${durationMs} 毫秒无法容纳 ${cueCount} 个字幕块`);
+  }
+  const distributableMs = durationMs - cueCount;
+  const totalCharacters = characterCounts.reduce((sum, count) => sum + count, 0);
+  const exactExtras = characterCounts.map((count) => distributableMs * count / totalCharacters);
+  const allocations = exactExtras.map((value) => 1 + Math.floor(value));
+  let remainingMs = durationMs - allocations.reduce((sum, value) => sum + value, 0);
+  const priority = exactExtras
+    .map((value, index) => ({ index, remainder: value - Math.floor(value) }))
+    .sort((left, right) => right.remainder - left.remainder || left.index - right.index);
+  for (let index = 0; index < remainingMs; index += 1) allocations[priority[index].index] += 1;
+  return allocations;
 }
 
 /**
@@ -127,7 +148,7 @@ export function buildVoiceTimeline(lines, durationsSec, options) {
   const sceneDurationsMs = [];
   let cursorMs = 0;
   lines.forEach((rawLine, lineIndex) => {
-    const line = cleanSubtitleText(rawLine);
+    const line = normalizeDialogueText(rawLine);
     if (line.length === 0) throw new Error(`第 ${lineIndex + 1} 句旁白文本为空`);
     assertDuration(durationsSec[lineIndex], `第 ${lineIndex + 1} 句音频时长`);
     const speechMs = Math.max(1, Math.round(durationsSec[lineIndex] * 1000));
@@ -136,15 +157,13 @@ export function buildVoiceTimeline(lines, durationsSec, options) {
     const groups = [];
     for (let index = 0; index < wrappedLines.length; index += 2) groups.push(wrappedLines.slice(index, index + 2));
     const characterCounts = groups.map((group) => [...group.join("")].length);
-    const totalCharacters = characterCounts.reduce((sum, count) => sum + count, 0);
-    let allocatedCharacters = 0;
+    const cueDurationsMs = allocateCueDurations(speechMs, characterCounts, lineIndex);
+    let cueCursorMs = cursorMs;
     groups.forEach((group, groupIndex) => {
-      const startMs = cursorMs + Math.round(speechMs * allocatedCharacters / totalCharacters);
-      allocatedCharacters += characterCounts[groupIndex];
-      const endMs = groupIndex === groups.length - 1
-        ? speechEndMs
-        : cursorMs + Math.round(speechMs * allocatedCharacters / totalCharacters);
+      const startMs = cueCursorMs;
+      const endMs = startMs + cueDurationsMs[groupIndex];
       cues.push({ lineIndex, startMs, endMs, text: group.join("\n") });
+      cueCursorMs = endMs;
     });
     const trailingGap = lineIndex < lines.length - 1 ? gapMs : 0;
     sceneDurationsMs.push(speechMs + trailingGap);
