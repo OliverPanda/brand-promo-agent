@@ -273,19 +273,24 @@ export async function generateStoryboard(brief, script) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const correction = attempt === 0 ? "" : `\n纠正上次输出：上次分镜数量为 ${arr.length}，本次必须严格返回 ${expectedSceneCount} 个分镜。`;
     const attemptUser = withGlobalLanguage(`${user}${correction}`, brief.language);
-    const data = await oneApiPost("/chat/completions", {
-      model,
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: attemptUser },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-    });
-    const content = data.choices?.[0]?.message?.content || "{}";
-    const parsed = parseJSONSafe(content);
-    arr = Array.isArray(parsed) ? parsed : parsed.scenes || [];
-    tokens += data.usage?.total_tokens ?? estimateTokens(attemptUser + content);
+    try {
+      const data = await oneApiPost("/chat/completions", {
+        model,
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content: attemptUser },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.7,
+      });
+      const content = data.choices?.[0]?.message?.content || "{}";
+      const parsed = parseJSONSafe(content);
+      arr = Array.isArray(parsed) ? parsed : parsed.scenes || [];
+      tokens += data.usage?.total_tokens ?? estimateTokens(attemptUser + content);
+    } catch (error) {
+      if (tokens > 0) throw attachPartialUsage(error, { tokens });
+      throw error;
+    }
     if (arr.length === expectedSceneCount) break;
   }
   if (arr.length !== expectedSceneCount) {

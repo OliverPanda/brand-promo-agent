@@ -54,6 +54,8 @@ const DEFAULT_SPEECH = makeWav(0.25, 440);
 const DEFAULT_MUSIC = makeWav(1, 220);
 let speechResponses = [];
 let storyboardResponseCounts = [];
+let storyboardCallIndex = 0;
+let failStoryboardAt = 0;
 let failSpeechAt = 0;
 let speechCallIndex = 0;
 let invalidMusicResponse = false;
@@ -92,6 +94,8 @@ function route(path, body) {
         });
       }
       // 分镜
+      storyboardCallIndex += 1;
+      if (storyboardCallIndex === failStoryboardAt) return makeRes({ ok: false, status: 500, text: "storyboard retry failed" });
       const sceneCount = storyboardResponseCounts.length ? storyboardResponseCounts.shift() : 2;
       return makeRes({
         json: {
@@ -252,6 +256,27 @@ test("generateStoryboard 数量不符只纠错重试一次，仍不符则失败"
   await assert.rejects(generateStoryboard(baseBrief, script), /分镜数量.*2|数量不一致/);
   assert.equal(calls.filter((call) => call.url.endsWith("/chat/completions")).length, 2, "最多一次纠错重试");
   storyboardResponseCounts = [];
+});
+
+test("generateStoryboard 纠错请求失败时保留首轮已付 tokens", async () => {
+  const script = await generateScript(baseBrief);
+  calls = [];
+  storyboardCallIndex = 0;
+  failStoryboardAt = 2;
+  storyboardResponseCounts = [1];
+  try {
+    await assert.rejects(
+      generateStoryboard(baseBrief, script),
+      (error) => {
+        assert.match(error.message, /500|retry failed/);
+        assert.deepEqual(error._usage, { tokens: 200 });
+        return true;
+      },
+    );
+  } finally {
+    failStoryboardAt = 0;
+    storyboardResponseCounts = [];
+  }
 });
 
 test("generateSceneMedia 真实模式：POST /images/generations + 返回 url + _usage.images", async () => {

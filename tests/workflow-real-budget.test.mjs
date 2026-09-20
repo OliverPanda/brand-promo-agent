@@ -57,6 +57,8 @@ let workflowSpeechCall = 0;
 let workflowFailSpeechAt = 0;
 let workflowInvalidMusic = false;
 let workflowStoryboardCount = 2;
+let workflowStoryboardCall = 0;
+let workflowFailStoryboardAt = 0;
 let workflowImageCalls = 0;
 let workflowVideoCalls = 0;
 
@@ -84,6 +86,10 @@ function route(path, body) {
       return makeRes({ json: { choices: [{ message: { content: JSON.stringify({
         title: "T", voiceover: scriptVoiceover, structure: ["a"], moodCurve: ["x"],
       }) } }], usage: { total_tokens: 120 } } });
+    }
+    workflowStoryboardCall += 1;
+    if (workflowStoryboardCall === workflowFailStoryboardAt) {
+      return makeRes({ ok: false, status: 500, text: "storyboard correction failed" });
     }
     return makeRes({ json: { choices: [{ message: { content: JSON.stringify({
       scenes: Array.from({ length: workflowStoryboardCount }, (_, index) => ({
@@ -217,6 +223,31 @@ test("storyboard 两次数量不一致会在任何图像/视频调用前失败",
     assert.equal(workflowVideoCalls, 0);
     assert.equal(workflowSpeechCall, 0);
   } finally {
+    workflowStoryboardCount = 2;
+    server.close();
+  }
+});
+
+test("storyboard 首轮已付费且纠错请求失败时精确归集一次成本", async () => {
+  workflowStoryboardCall = 0;
+  workflowFailStoryboardAt = 2;
+  workflowStoryboardCount = 1;
+  workflowImageCalls = 0;
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const response = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
+    });
+    const { runId } = await response.json();
+    const run = await waitStatus(port, runId, ["failed"]);
+    const storyboardCosts = run.cost.filter((entry) => entry.step === "storyboard");
+    assert.equal(storyboardCosts.length, 1);
+    assert.ok(storyboardCosts[0].amount > 0);
+    assert.equal(workflowImageCalls, 0);
+  } finally {
+    workflowFailStoryboardAt = 0;
     workflowStoryboardCount = 2;
     server.close();
   }
