@@ -11,6 +11,11 @@ process.env.PROMO_TTS_MODEL = "tiny-iceberg";
 process.env.PROMO_MUSIC_MODEL = "mureka-v1";
 process.env.PROMO_MUSIC_PATH = "/audio/music";
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+
 const { test } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
 const providers = await import("../src/mastra/providers.js");
@@ -114,6 +119,31 @@ test("getProviderMode：运行时显式 demo 优先于 env real", async () => {
     assert.equal(getProviderMode(), "demo");
   } finally {
     setRuntimeConfig({ providerMode: "" });
+  }
+});
+
+test("getProviderMode：持久化 runtime demo 在新进程中优先于 env real", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "promo-runtime-mode-"));
+  try {
+    fs.writeFileSync(path.join(dataDir, "runtime-config.json"), JSON.stringify({ providerMode: "demo" }));
+    const stdout = execFileSync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      "import('./src/runtime-config.js').then(m => process.stdout.write(m.getEffectiveProviderMode()))",
+    ], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        PROMO_DATA_DIR: dataDir,
+        PROMO_PERSIST: "1",
+        PROMO_PROVIDER_MODE: "real",
+      },
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(stdout, "demo");
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
 

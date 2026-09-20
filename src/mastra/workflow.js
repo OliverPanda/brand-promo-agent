@@ -43,6 +43,7 @@ import {
 } from "../runtime-config.js";
 import { artifactPaths } from "../media/artifacts.js";
 import { resolveDeliveryModels } from "../media/model-selection.js";
+import { fontSupportsChinese } from "../media/font-readiness.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -64,6 +65,27 @@ function configuredFontPath(font) {
     return path.join(process.env.WINDIR || "C:\\Windows", "Fonts", "msyh.ttc");
   }
   return "";
+}
+
+function normalizeFamily(value) {
+  return String(value || "").toLowerCase().replace(/[\s_-]+/g, "").replace(/["']/g, "");
+}
+
+async function resolveFontPath(font) {
+  const knownPath = configuredFontPath(font);
+  if (knownPath) return knownPath;
+  try {
+    const match = await runCommand("fc-match", ["-f", "%{family}\n%{file}", font]);
+    const [family = "", matchedPath = ""] = String(match.stdout || "").trim().split(/\r?\n/);
+    const expected = normalizeFamily(font);
+    const actualFamilies = family.split(",").map(normalizeFamily);
+    if (!expected || !actualFamilies.some((actual) => actual === expected) || !fs.existsSync(matchedPath)) {
+      throw new Error("font fallback detected");
+    }
+    return matchedPath;
+  } catch {
+    throw new GenerationPreflightError("真实生成预检失败：配置的中文字幕字体无法精确解析；请配置字体文件路径");
+  }
 }
 
 async function verifyMediaToolchain() {
@@ -90,17 +112,9 @@ async function verifyMediaToolchain() {
   }
   const font = String(process.env.PROMO_SUBTITLE_FONT || "Microsoft YaHei").trim();
   if (!font) throw new GenerationPreflightError("真实生成预检失败：未配置中文字幕字体 PROMO_SUBTITLE_FONT");
-  const knownPath = configuredFontPath(font);
-  if (knownPath) {
-    if (!fs.existsSync(knownPath)) throw new GenerationPreflightError("真实生成预检失败：配置的中文字幕字体不可用");
-    return;
-  }
-  try {
-    const match = await runCommand("fc-match", ["-f", "%{file}", font]);
-    const matchedPath = String(match.stdout || "").trim();
-    if (!matchedPath || !fs.existsSync(matchedPath)) throw new Error("font not found");
-  } catch {
-    throw new GenerationPreflightError("真实生成预检失败：配置的中文字幕字体不可用；请配置字体文件路径");
+  const exactFontPath = await resolveFontPath(font);
+  if (!fs.existsSync(exactFontPath) || !fontSupportsChinese(exactFontPath)) {
+    throw new GenerationPreflightError("真实生成预检失败：配置字体缺少中文字幕字形（cmap 校验未通过）");
   }
 }
 
