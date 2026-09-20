@@ -1,6 +1,7 @@
 // Zod 校验 Schema：BrandBrief（对应 PRD §7）与各步输入/输出的轻量约束。
 // 工作流步骤的 schema 刻意放宽（passthrough），避免 Mastra 严格校验阻断 DEMO 确定性数据。
 import { z } from "zod";
+import { CANVAS_PRESETS, DEFAULT_CANVAS_PRESET } from "./media/canvas.js";
 
 export const LANGUAGES = ["zh-CN", "zh-TW", "en", "ja", "ko"];
 export const DURATIONS = [15, 30, 60, 90];
@@ -25,6 +26,7 @@ export const BrandBriefSchema = z.object({
   voiceTone: z.string().default("男声"),
   hitlEnabled: z.boolean().default(true),
   finalGateEnabled: z.boolean().default(true),
+  canvasPreset: z.enum(Object.keys(CANVAS_PRESETS)).default(DEFAULT_CANVAS_PRESET),
   // M4 模板库：Logo 主色 / 禁用词（从品牌模板回灌，用于约束生成与配色统一）
   logoColor: LOGO_COLOR,
   bannedWords: z.array(z.string()).default([]),

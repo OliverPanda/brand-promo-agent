@@ -121,15 +121,23 @@ test("generateScript 真实模式：POST /chat/completions + 解析 JSON + _usag
   assert.equal(out.language, "zh-CN");
 });
 
-test("generateStoryboard 真实模式：返回 Scene[] 且每镜带 _usage.tokens", async () => {
+test("generateStoryboard 真实模式：返回 Scene[] 且提示词含画布安全构图", async () => {
   calls = [];
-  const script = await generateScript(baseBrief);
-  const scenes = await generateStoryboard(baseBrief, script);
+  const brief = { ...baseBrief, canvasPreset: "social-square" };
+  const script = await generateScript(brief);
+  const scenes = await generateStoryboard(brief, script);
   assert.ok(calls.some((c) => c.url.endsWith("/chat/completions")));
   assert.ok(Array.isArray(scenes) && scenes.length === 2);
   assert.equal(scenes[0].index, 1);
   assert.equal(scenes[0].camera, "push");
   assert.ok(scenes[0]._usage && scenes[0]._usage.tokens > 0);
+  const storyboardCall = calls.find(
+    (call) => call.url.endsWith("/chat/completions") && call.body.messages?.[0]?.content.includes("分镜师")
+  );
+  assert.match(storyboardCall.body.messages[1].content, /1080×1080/);
+  assert.match(storyboardCall.body.messages[1].content, /1:1/);
+  assert.match(storyboardCall.body.messages[1].content, /主体居中/);
+  assert.match(storyboardCall.body.messages[1].content, /安全区/);
 });
 
 test("generateSceneMedia 真实模式：POST /images/generations + 返回 url + _usage.images", async () => {
@@ -139,11 +147,27 @@ test("generateSceneMedia 真实模式：POST /images/generations + 返回 url + 
   const media = await generateSceneMedia(scenes[0], baseBrief);
   assert.match(calls[calls.length - 1].url, /\/images\/generations$/);
   assert.equal(calls[calls.length - 1].body.model, "doubao-seedream-4-0-250828");
-  // 渠道适配：doubao/seedream 系 size 用词汇 1K|2K|4K（像素写法会 400）+ 16:9 画幅
+  // Seedream 使用分辨率档位 + 画布比例；未指定画布时默认竖屏。
   assert.equal(calls[calls.length - 1].body.size, "1K");
-  assert.equal(calls[calls.length - 1].body.aspect_ratio, "16:9");
+  assert.equal(calls[calls.length - 1].body.aspect_ratio, "9:16");
+  assert.match(calls[calls.length - 1].body.prompt, /1080×1920/);
+  assert.match(calls[calls.length - 1].body.prompt, /主体居中/);
   assert.equal(media.mediaUrl, "https://cdn.example/scene.png");
   assert.equal(media._usage.images, 1);
+});
+
+test("generateSceneMedia 普通图像模型：使用所选画布的像素尺寸", async () => {
+  calls = [];
+  await generateSceneMedia(
+    { visualPrompt: "产品主视觉" },
+    { ...baseBrief, imageModel: "gpt-image-1", canvasPreset: "social-landscape" }
+  );
+  const imageCall = calls.find((call) => call.url.endsWith("/images/generations"));
+  assert.equal(imageCall.body.size, "1920x1080");
+  assert.equal(imageCall.body.aspect_ratio, undefined);
+  assert.match(imageCall.body.prompt, /1920×1080/);
+  assert.match(imageCall.body.prompt, /16:9/);
+  assert.match(imageCall.body.prompt, /安全区/);
 });
 
 test("generateSceneMedia 参考图为 data:image → 走图生图（image 字段 base64）", async () => {

@@ -10,6 +10,7 @@
 import { encodeSVG } from "./svg.js";
 import { withGlobalLanguage } from "../i18n.js";
 import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey } from "../runtime-config.js";
+import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
 
 // ───────────────────────── 模式判定 ─────────────────────────
 // 生效顺序：运行时配置（页面「模型与服务」保存的 providerMode）> env（PROMO_PROVIDER_MODE=real）；
@@ -257,7 +258,7 @@ export async function generateStoryboard(brief, script) {
   let user =
     `品牌：${brief.brandName} 产品：${brief.productName}\n调性：${(brief.tones || []).join("、")}\n` +
     `时长：${brief.durationSec}s\n旁白：\n${vo}\n` +
-    `约每 5s 一个镜头；camera ∈ push/pull/pan/fixed；视觉风格全程统一。`;
+    `约每 5s 一个镜头；camera ∈ push/pull/pan/fixed；视觉风格全程统一。\n${canvasPrompt(brief)}`;
   if (brief.bannedWords?.length) user += `\n禁用词：${brief.bannedWords.join("、")}。`;
   if (brief.logoColor) user += `\n品牌主色 ${brief.logoColor}，画面配色需呼应。`;
   user = withGlobalLanguage(user, brief.language);
@@ -298,7 +299,7 @@ function demoStoryboard(brief, script) {
     const camera = pick(["push", "pull", "pan", "fixed"], rnd);
     scenes.push({
       index: i + 1,
-      visualPrompt: `${brief.brandName} ${brief.productName} 的${pick(tones, rnd)}风格画面，镜头${camera}，突出${brief.coreSellingPoint}`,
+      visualPrompt: `${brief.brandName} ${brief.productName} 的${pick(tones, rnd)}风格画面，镜头${camera}，突出${brief.coreSellingPoint}；${canvasPrompt(brief)}`,
       subtitle: script?.voiceover?.[i]?.text || `场景 ${i + 1}`,
       camera,
       durationSec: Math.round((dur / n) * 10) / 10,
@@ -313,16 +314,19 @@ function demoStoryboard(brief, script) {
 export async function generateSceneMedia(scene, brief) {
   if (getProviderMode() !== "real") return demoSceneMedia(scene, brief);
   const model = brief.imageModel || process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
-  let prompt = scene.visualPrompt;
+  const canvas = resolveCanvas(brief.canvasPreset);
+  let prompt = `${scene.visualPrompt}；${canvasPrompt(brief)}`;
   if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
-  // 渠道适配：doubao/seedream 系渠道 size 词汇为 1K|2K|4K（像素写法会 400），
-  //   并接受 aspect_ratio 控制画幅（宣传片默认 16:9 横版）；其余渠道保持像素尺寸写法。
+  // 渠道适配：doubao/seedream 系渠道 size 使用 1K|2K|4K 档位，
+  // 并用 aspect_ratio 传递画布比例；其余渠道直接使用受控画布的像素尺寸。
   const isSeedream = /seedream|doubao/i.test(model);
-  let size = process.env.PROMO_IMAGE_SIZE || (isSeedream ? "1K" : "1024x576");
+  const configuredSeedreamSize = process.env.PROMO_IMAGE_SIZE;
+  const size = isSeedream && /^(1K|2K|4K)$/i.test(configuredSeedreamSize || "")
+    ? configuredSeedreamSize.toUpperCase()
+    : isSeedream ? "1K" : `${canvas.width}x${canvas.height}`;
   const body = { model, prompt, n: 1, size };
   if (isSeedream) {
-    if (/^\d{3,4}x\d{3,4}$/.test(size)) body.size = "1K"; // 旧像素默认 → 词汇
-    body.aspect_ratio = process.env.PROMO_IMAGE_ASPECT || "16:9";
+    body.aspect_ratio = canvas.aspectRatio;
   }
   // M3-D 真实参考图图生图（Seedream 参考图输入，M2 仅关键词透传）：
   //   styleReference 为 data:image 或 http(s) URL → 作为 image 字段走图生图（参考图输入免费，见 PRD §10）。
