@@ -90,6 +90,54 @@ test("promoteArtifacts 成功时提升全部文件，失败时不留下部分最
   assert.equal(fs.existsSync(bad.subtitles), false);
 }));
 
+test("promoteArtifacts 拒绝通过 workspace 内目录联接读取外部文件", (t) => withDataDir((dataDir) => {
+  const paths = artifactPaths("promote-link");
+  const outsideDir = path.join(dataDir, "outside-promotion");
+  fs.mkdirSync(outsideDir);
+  fs.writeFileSync(path.join(outsideDir, "external.mp4"), "external");
+  const link = path.join(paths.temp, "linked-outside");
+  try {
+    fs.symlinkSync(outsideDir, link, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES"].includes(error.code)) {
+      t.skip(`当前操作系统权限不允许创建目录联接：${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  assert.throws(
+    () => promoteArtifacts(paths, { finalVideo: path.join(link, "external.mp4") }),
+    /越界|工作区/,
+  );
+  assert.equal(fs.existsSync(paths.finalVideo), false);
+}));
+
+test("promoteArtifacts 部分提升失败后恢复既有产物且不留下新产物", () => withDataDir(() => {
+  const paths = artifactPaths("promote-rollback");
+  fs.writeFileSync(paths.finalVideo, "old-video");
+  fs.writeFileSync(paths.subtitles, "old-subtitles");
+  const video = path.join(paths.temp, "new.mp4");
+  const subtitles = path.join(paths.temp, "new.srt");
+  fs.writeFileSync(video, "new-video");
+  fs.writeFileSync(subtitles, "new-subtitles");
+  let promotedCount = 0;
+  const renameSync = (source, target) => {
+    if (source.endsWith(".promoting")) {
+      promotedCount += 1;
+      if (promotedCount === 2) throw new Error("injected second promotion failure");
+    }
+    fs.renameSync(source, target);
+  };
+  assert.throws(
+    () => promoteArtifacts(paths, { finalVideo: video, subtitles }, { renameSync }),
+    /injected second promotion failure/,
+  );
+  assert.equal(promotedCount, 2, "故障应发生在一个目标已经完成提升之后");
+  assert.equal(fs.readFileSync(paths.finalVideo, "utf8"), "old-video");
+  assert.equal(fs.readFileSync(paths.subtitles, "utf8"), "old-subtitles");
+  assert.deepEqual(fs.readdirSync(paths.runRoot).filter((name) => /promoting|backup/.test(name)), []);
+}));
+
 test("removeRunArtifacts 只删除精确 run 目录", () => withDataDir((dataDir) => {
   const old = artifactPaths("run-old");
   const sibling = artifactPaths("run-old-copy");

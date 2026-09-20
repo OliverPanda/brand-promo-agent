@@ -79,6 +79,22 @@ test("HTTP 使用流式边界并验证 MIME 与最终魔数", async () => {
   await assert.rejects(materializeMedia({ source: `${base}/wrong-magic`, kind: "image", workspace: dir }), /格式|魔数/);
 });
 
+test("HTTP 可物化 video 与 audio 并验证真实容器签名", async () => {
+  const base = await fixture((req, res) => {
+    if (req.url === "/video") {
+      res.writeHead(200, { "Content-Type": "video/mp4" });
+      return res.end(MP4);
+    }
+    res.writeHead(200, { "Content-Type": "audio/wav" });
+    return res.end(WAV);
+  });
+  const dir = workspace();
+  const video = await materializeMedia({ source: `${base}/video`, kind: "video", workspace: dir });
+  const audio = await materializeMedia({ source: `${base}/audio`, kind: "audio", workspace: dir });
+  assert.deepEqual(fs.readFileSync(video), MP4);
+  assert.deepEqual(fs.readFileSync(audio), WAV);
+});
+
 test("仅允许读取 workspace 内的服务端文件", async () => {
   const dir = workspace();
   const inside = path.join(dir, "输入.png");
@@ -95,6 +111,18 @@ test("仅允许读取 workspace 内的服务端文件", async () => {
   } finally {
     fs.rmSync(outside, { force: true });
   }
+});
+
+test("workspace 文件输入支持 video 与 audio", async () => {
+  const dir = workspace();
+  const videoInput = path.join(dir, "input.mp4");
+  const audioInput = path.join(dir, "input.wav");
+  fs.writeFileSync(videoInput, MP4);
+  fs.writeFileSync(audioInput, WAV);
+  const video = await materializeMedia({ source: videoInput, kind: "video", workspace: dir });
+  const audio = await materializeMedia({ source: audioInput, kind: "audio", workspace: dir });
+  assert.deepEqual(fs.readFileSync(video), MP4);
+  assert.deepEqual(fs.readFileSync(audio), WAV);
 });
 
 test("拒绝通过 workspace 内目录联接读取外部本地文件", async (t) => {
@@ -157,6 +185,35 @@ test("拒绝 data URL 的错误 MIME、错误魔数和空数据", async () => {
   await assert.rejects(materializeMedia({ source: `data:text/plain;base64,${PNG.toString("base64")}`, kind: "image", workspace: dir }), /MIME/);
   await assert.rejects(materializeMedia({ source: `data:image/png;base64,${Buffer.from("bad").toString("base64")}`, kind: "image", workspace: dir }), /格式|魔数/);
   await assert.rejects(materializeMedia({ source: "data:image/png;base64,", kind: "image", workspace: dir }), /空/);
+});
+
+test("base64 解码字节数精确处理 padding：各类型上限本身可接受，上限加一被拒绝", async () => {
+  const dir = workspace();
+  const cases = [
+    ["image", "image/png", "maxImageBytes", PNG],
+    ["video", "video/mp4", "maxVideoBytes", MP4],
+    ["audio", "audio/wav", "maxAudioBytes", Buffer.concat([WAV, Buffer.alloc(2)])],
+  ];
+  for (const [kind, mime, limitKey, exactBytes] of cases) {
+    const original = MEDIA_LIMITS[limitKey];
+    MEDIA_LIMITS[limitKey] = exactBytes.length;
+    try {
+      const exact = await materializeMedia({
+        source: `data:${mime};base64,${exactBytes.toString("base64")}`,
+        kind,
+        workspace: dir,
+      });
+      assert.deepEqual(fs.readFileSync(exact), exactBytes, `${limitKey} 精确边界应通过`);
+      const overflow = Buffer.concat([exactBytes, Buffer.from([0])]);
+      await assert.rejects(
+        materializeMedia({ source: `data:${mime};base64,${overflow.toString("base64")}`, kind, workspace: dir }),
+        /过大|上限/,
+        `${limitKey} + 1 字节应拒绝`,
+      );
+    } finally {
+      MEDIA_LIMITS[limitKey] = original;
+    }
+  }
 });
 
 test("必须显式提供服务端创建的 workspace", async () => {

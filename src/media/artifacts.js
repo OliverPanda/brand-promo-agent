@@ -111,13 +111,17 @@ export function writeManifest(paths, manifest) {
  * 将工作区内已完成的文件原子替换到公开产物位置。
  * @param {ReturnType<typeof artifactPaths>} paths `artifactPaths` 返回的路径集合。
  * @param {Partial<Record<"finalVideo"|"subtitles"|"manifest"|"poster", string>>} sources 产物键到工作区源文件的映射。
+ * @param {{renameSync?: typeof fs.renameSync}} [operations] 可注入的文件系统原子 rename 边界。
  * @returns {Record<string, string>} 已提升的最终路径。
  * @example promoteArtifacts(paths, { finalVideo: paths.tempFinalVideo });
  */
-export function promoteArtifacts(paths, sources) {
+export function promoteArtifacts(paths, sources, operations = {}) {
+  const renameSync = operations.renameSync || fs.renameSync;
+  if (typeof renameSync !== "function") throw new Error("无效的产物提升操作");
   const allowed = new Set(["finalVideo", "subtitles", "manifest", "poster"]);
   const entries = Object.entries(sources || {});
   if (entries.length === 0) throw new Error("没有待提升的产物");
+  const realWorkspace = fs.realpathSync(paths.workspace);
   for (const [key, source] of entries) {
     if (!allowed.has(key) || typeof source !== "string") throw new Error(`未知产物：${key}`);
     const resolvedSource = path.resolve(source);
@@ -125,6 +129,8 @@ export function promoteArtifacts(paths, sources) {
     if (!isContained(paths.workspace, resolvedSource)) throw new Error(`产物源路径越界：${key}`);
     if (!isContained(paths.runRoot, target)) throw new Error(`产物目标路径越界：${key}`);
     if (!fs.statSync(resolvedSource, { throwIfNoEntry: false })?.isFile()) throw new Error(`产物不存在：${key}`);
+    const realSource = fs.realpathSync(resolvedSource);
+    if (!isContained(realWorkspace, realSource)) throw new Error(`产物源路径越界：${key}`);
   }
 
   const staged = [];
@@ -140,10 +146,10 @@ export function promoteArtifacts(paths, sources) {
     for (const item of staged) {
       if (fs.existsSync(item.target)) {
         const backup = `${item.target}.${randomUUID()}.backup`;
-        fs.renameSync(item.target, backup);
+        renameSync(item.target, backup);
         backups.push({ target: item.target, backup });
       }
-      fs.renameSync(item.stage, item.target);
+      renameSync(item.stage, item.target);
       promoted[item.key] = item.target;
     }
     for (const { backup } of backups) {
@@ -156,7 +162,7 @@ export function promoteArtifacts(paths, sources) {
     return promoted;
   } catch (error) {
     for (const target of Object.values(promoted)) fs.rmSync(target, { force: true });
-    for (const { target, backup } of backups.reverse()) if (fs.existsSync(backup)) fs.renameSync(backup, target);
+    for (const { target, backup } of backups.reverse()) if (fs.existsSync(backup)) renameSync(backup, target);
     throw error;
   } finally {
     for (const { stage } of staged) fs.rmSync(stage, { force: true });

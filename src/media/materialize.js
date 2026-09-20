@@ -90,10 +90,12 @@ function dataSource(source, kind, maxBytes) {
   const match = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(source);
   if (!match) throw new Error("无效 data URL");
   verifyMime(match[1], kind);
-  if (match[2] && Math.floor(match[3].length * 0.75) > maxBytes) throw new Error(`媒体过大，超过 ${maxBytes} 字节上限`);
+  const encoded = match[2] ? match[3].replace(/\s/g, "") : "";
+  if (match[2] && (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded))) throw new Error("无效 data URL 数据");
+  if (match[2] && Buffer.byteLength(encoded, "base64") > maxBytes) throw new Error(`媒体过大，超过 ${maxBytes} 字节上限`);
   let bytes;
   try {
-    bytes = match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3]));
+    bytes = match[2] ? Buffer.from(encoded, "base64") : Buffer.from(decodeURIComponent(match[3]));
   } catch {
     throw new Error("无效 data URL 数据");
   }
