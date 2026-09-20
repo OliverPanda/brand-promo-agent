@@ -74,10 +74,19 @@ export function getEffectiveOneApiBase() {
   return state.providerBaseUrl || process.env.PROMO_ONEAPI_BASE_URL || process.env.MINGSTAR_LLM_BASE_URL || "";
 }
 
-// 当前生效的运行模式：运行时配置（demo|real）> env（PROMO_PROVIDER_MODE=real），默认 demo（安全）。
+/**
+ * 返回当前生效的运行模式：运行时覆盖 > 显式环境变量 > 默认 real。
+ *
+ * @returns {"demo" | "real"} 生效模式。
+ * @example
+ * getEffectiveProviderMode();
+ */
 export function getEffectiveProviderMode() {
   if (state.providerMode === "real" || state.providerMode === "demo") return state.providerMode;
-  return process.env.PROMO_PROVIDER_MODE === "real" ? "real" : "demo";
+  if (process.env.PROMO_PROVIDER_MODE === "real" || process.env.PROMO_PROVIDER_MODE === "demo") {
+    return process.env.PROMO_PROVIDER_MODE;
+  }
+  return "real";
 }
 
 // 当前生效的网关密钥：运行时配置（页面保存）> env（PROMO_ONEAPI_API_KEY / OPENAI_API_KEY）。

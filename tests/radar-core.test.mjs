@@ -109,7 +109,7 @@ test("radar hotwords：day 榜确定性 + 爆点/新词标记 + 品牌词 tag", 
 });
 
 // ── TikHub 适配器：DEMO 确定性 + real mock fetch ──
-delete process.env.PROMO_PROVIDER_MODE;
+process.env.PROMO_PROVIDER_MODE = "demo";
 const tikhub = await import("../src/radar/tikhub.js");
 
 test("radar tikhub：DEMO 模式确定性种子（同参数两次采集内容一致、id 稳定）", async () => {
@@ -156,6 +156,6 @@ test("radar tikhub：real 模式请求构造正确（鉴权/端点/参数）+ �
   } finally {
     fetchMock.mock.restore();
     delete process.env.TIKHUB_API_KEY;
-    delete process.env.PROMO_PROVIDER_MODE;
+    process.env.PROMO_PROVIDER_MODE = "demo";
   }
 });

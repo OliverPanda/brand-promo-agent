@@ -31,7 +31,7 @@ const TYPE_MAP = {
   "image-to-video": "video",
 };
 
-const VIDEO_RE = /kling|veo|seedance|runway|cogvideox|cogvideo|wan[0-9]|hunyuan[-_]?video|luma|pika|dreamina|pixverse|vividi|hailuo|mochi|sora|minimax[-_]?video|doubao[-_]?video|即梦|可灵|海螺/i;
+const VIDEO_RE = /kling|veo|seedance|runway|cogvideox|cogvideo|wan[0-9]|hunyuan[-_]?video|luma|pika|dreamina|pixverse|vividi|hailuo|mochi|sora|minimax(?:[-_]?video|-h3)|doubao[-_]?video|即梦|可灵|海螺/i;
 const AUDIO_RE = /\b(tts|speech|voice|audio|music)\b|mureka|suno|iceberg|elevenlabs|bark|dictvoice|minimax[-_]?audio|doubao[-_]?tts|chatts/i;
 const IMAGE_RE = /seedream|stable[-_]?diffusion|\bsd3\b|dall[-_]?e|dall|flux|midjourney|\bmj[-_]?|gpt[-_]?image|\bimage\b|wanx|tongyi[-_]?image|doubao[-_]?image|kolors|nano[-_]?banana|可图/i;
 // 视频「子能力」API 黑名单：与视频生成本体同家族的图像/语音/特效/口型/运动控制/元素编辑/检测/角色

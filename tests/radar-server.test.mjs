@@ -3,7 +3,7 @@ import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.PROMO_PERSIST = "0";
-delete process.env.PROMO_PROVIDER_MODE; // 强制 DEMO
+process.env.PROMO_PROVIDER_MODE = "demo"; // 显式 DEMO
 
 const { app } = await import("../src/server.js");
 

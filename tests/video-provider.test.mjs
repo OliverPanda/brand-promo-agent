@@ -273,8 +273,14 @@ test("generateSceneVideo：new-api 任务 FAILURE → 抛错（带 fail_reason�
 });
 
 test("generateSceneVideo：DEMO 模式返回 stub（不产生网络调用）", async () => {
-  // 不设 real —— 保持测试进程默认 demo
-  const out = await generateSceneVideo(scene, { ...brief, videoModel: "kling-v1-6" });
-  assert.equal(out.videoUrl, null, "demo 不产出真实片段");
-  assert.equal(out.kind, "video-stub");
+  const before = process.env.PROMO_PROVIDER_MODE;
+  process.env.PROMO_PROVIDER_MODE = "demo";
+  try {
+    const out = await generateSceneVideo(scene, { ...brief, videoModel: "kling-v1-6" });
+    assert.equal(out.videoUrl, null, "demo 不产出真实片段");
+    assert.equal(out.kind, "video-stub");
+  } finally {
+    if (before === undefined) delete process.env.PROMO_PROVIDER_MODE;
+    else process.env.PROMO_PROVIDER_MODE = before;
+  }
 });

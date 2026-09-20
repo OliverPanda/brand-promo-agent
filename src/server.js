@@ -4,11 +4,10 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { mastra, publishDelivery, STEP } from "./mastra/workflow.js";
+import { mastra, prepareGenerationBrief, publishDelivery, STEP } from "./mastra/workflow.js";
 import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
-import { parseBrief } from "./schemas.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import { listCopyIdeas } from "./copyideas.js";
 import { getEffectiveOneApiBase, getEffectiveOneApiKey, setRuntimeConfig, validateProviderBaseUrl, validateProviderMode, validateApiKey } from "./runtime-config.js";
@@ -185,13 +184,13 @@ async function runScriptPhase(runId, brief) {
 
 // ── POST /api/generate：提交 Brief，启动工作流，返回 runId ──
 app.post("/api/generate", async (req, res) => {
+  const runId = newRunId();
   let brief;
   try {
-    brief = parseBrief(req.body);
+    brief = await prepareGenerationBrief(req.body, { runId });
   } catch (e) {
-    return res.status(400).json({ error: e.message });
+    return res.status(e.statusCode === 503 ? 503 : 400).json({ error: e.message });
   }
-  const runId = newRunId();
   createRun(runId, brief);
   // 不 await：脚本段可能在 HITL 处 suspend 或执行到底（异步），进度经 SSE 推送。
   runScriptPhase(runId, brief).catch((err) => {
@@ -376,7 +375,7 @@ app.get("/api/config", (_req, res) => {
         current: imgCurrent,
         choices: mergeChoices("PROMO_IMAGE_CHOICES", imgCurrent, ["doubao-seedream-4-0-250828", "doubao-seedream-3-0-t2i"]),
       },
-      tts: { label: "配音（TTS）", current: process.env.PROMO_TTS_MODEL || "tiny-iceberg" },
+      tts: { label: "配音（TTS）", current: process.env.PROMO_TTS_MODEL || "speech-02-hd" },
       music: { label: "配乐", current: process.env.PROMO_MUSIC_MODEL || "mureka-v1" },
       // 视频（动态镜头）：choices 不在此静态下发 —— 由 GET /api/models 从网关实时拉取（含真实渠道）。
       // 当前值支持 env PROMO_VIDEO_MODEL 预置；选择后存 Brief.videoModel（请求级覆盖，语义同 llmModel/imageModel）。
@@ -640,13 +639,13 @@ app.get("/api/radar/topics", (_req, res) => {
 
 // 一键下发（FR-9.3 直连版）：选题 → Brief（人设预填）→ 复用 POST /api/generate 流水线
 // hitl 默认开启 → 脚本确认门照常弹出，人类仍在回路（不因直连跳过审核）。
-app.post("/api/radar/topics/:id/dispatch", (req, res) => {
+app.post("/api/radar/topics/:id/dispatch", async (req, res) => {
   const { hitlEnabled = true, finalGateEnabled = true } = req.body || {};
   const t = todayTopics().topics.find((x) => x.id === req.params.id);
   if (!t) return res.status(404).json({ error: "选题不存在或已过期（请重新生成今日选题）" });
   try {
-    const brief = parseBrief(topicBrief(t, { hitlEnabled, finalGateEnabled }));
     const runId = newRunId();
+    const brief = await prepareGenerationBrief(topicBrief(t, { hitlEnabled, finalGateEnabled }), { runId });
     createRun(runId, brief);
     recordDispatch(t.id, runId);
     // 不 await：与 /api/generate 一致，进度经 SSE 推送（前端复用 openStream(runId)）。
@@ -656,7 +655,7 @@ app.post("/api/radar/topics/:id/dispatch", (req, res) => {
     });
     res.json({ runId, topicId: t.id, title: t.title, brief });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.statusCode === 503 ? 503 : 400).json({ error: e.message });
   }
 });
 

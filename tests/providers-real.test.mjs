@@ -100,11 +100,21 @@ const baseBrief = {
 test("getProviderMode 在 PROMO_PROVIDER_MODE=real 时返回 real", () => {
   assert.equal(getProviderMode(), "real");
 });
-test("getProviderMode 默认（未设置）返回 demo（独立断言，临时改环境）", () => {
+test("getProviderMode 默认（未设置）返回 real（独立断言，临时改环境）", () => {
   const prev = process.env.PROMO_PROVIDER_MODE;
   delete process.env.PROMO_PROVIDER_MODE;
-  assert.equal(getProviderMode(), "demo");
+  assert.equal(getProviderMode(), "real");
   process.env.PROMO_PROVIDER_MODE = prev;
+});
+
+test("getProviderMode：运行时显式 demo 优先于 env real", async () => {
+  const { setRuntimeConfig } = await import("../src/runtime-config.js");
+  setRuntimeConfig({ providerMode: "demo" });
+  try {
+    assert.equal(getProviderMode(), "demo");
+  } finally {
+    setRuntimeConfig({ providerMode: "" });
+  }
 });
 
 test("generateScript 真实模式：POST /chat/completions + 解析 JSON + _usage.tokens", async () => {

@@ -1,0 +1,57 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  resolveDeliveryModels,
+  selectTtsModel,
+  selectVideoModel,
+  validateSelectedVideoModel,
+} from "../src/media/model-selection.js";
+
+test("selectVideoModel：精确模型按交付优先级选择", () => {
+  assert.equal(selectVideoModel(["seedance-2.0", "7zhe-seedance", "minimax-h3"]), "minimax-h3");
+  assert.equal(selectVideoModel(["seedance-2.0", "7zhe-seedance"]), "7zhe-seedance");
+  assert.equal(selectVideoModel(["seedance-2.0"]), "seedance-2.0");
+});
+
+test("selectVideoModel：Seedance 2.0 兼容候选稳定选择正式版、fast、mini", () => {
+  assert.equal(
+    selectVideoModel(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128"]),
+    "doubao-seedance-2-0-260128"
+  );
+  assert.equal(selectVideoModel(["x-seedance-2.0-mini", "x-seedance-2.0-fast"]), "x-seedance-2.0-fast");
+  assert.throws(() => selectVideoModel([]), /没有可用的动态视频模型/);
+});
+
+test("validateSelectedVideoModel：手选模型必须存在于实时视频集合", () => {
+  assert.equal(validateSelectedVideoModel("seedance-2.0", ["seedance-2.0"]), "seedance-2.0");
+  assert.throws(
+    () => validateSelectedVideoModel("fake-video", ["seedance-2.0"]),
+    /所选动态视频模型不可用/
+  );
+});
+
+test("selectTtsModel：默认优先 speech-02-hd，并支持显式配置", () => {
+  assert.equal(selectTtsModel(["tiny-iceberg", "speech-02-hd"]), "speech-02-hd");
+  assert.equal(selectTtsModel(["speech-02-hd", "tts-special"], "tts-special"), "tts-special");
+  assert.throws(() => selectTtsModel(["speech-02-hd"], "missing-tts"), /TTS 模型不可用/);
+});
+
+test("resolveDeliveryModels：返回视频、TTS、配乐与来源审计", () => {
+  assert.deepEqual(
+    resolveDeliveryModels({
+      brief: { videoModel: "7zhe-seedance" },
+      liveModels: {
+        byType: { video: ["minimax-h3", "7zhe-seedance"], audio: ["speech-02-hd", "mureka-v1"] },
+        raw: [
+          { id: "minimax-h3", type: "video" },
+          { id: "7zhe-seedance", type: "video" },
+          { id: "speech-02-hd", type: "tts" },
+          { id: "mureka-v1", type: "music" },
+        ],
+      },
+      musicModel: "mureka-v1",
+    }),
+    { videoModel: "7zhe-seedance", ttsModel: "speech-02-hd", musicModel: "mureka-v1", source: "manual" }
+  );
+});

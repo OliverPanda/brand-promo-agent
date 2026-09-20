@@ -3,7 +3,7 @@ import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.PROMO_PERSIST = "0";
-delete process.env.PROMO_PROVIDER_MODE; // 默认 DEMO
+process.env.PROMO_PROVIDER_MODE = "demo"; // 显式 DEMO
 process.env.PROMO_NLP_BATCH_SIZE = "2"; // 强制小批，验证分批
 process.env.PROMO_NLP_DAILY_CAP = "2"; // 今日 LLM 预算 2 条（第 1 批用满 → 第 2 批验证超限降级）
 
@@ -117,7 +117,7 @@ test("real 模式 LLM 批量打分：批量 ≤2 分批调用；反讽判负；�
     assert.ok(s3.confidence < 0.6);
   } finally {
     fetchMock.mock.restore();
-    delete process.env.PROMO_PROVIDER_MODE;
+    process.env.PROMO_PROVIDER_MODE = "demo";
     delete process.env.PROMO_ONEAPI_BASE_URL;
     delete process.env.PROMO_ONEAPI_API_KEY;
   }
@@ -143,7 +143,7 @@ test("LLM 单批失败 → 该批整体词典兜底，不阻断不抛错", async
     assert.equal(sentiment.getScore("f1").source, "dict");
   } finally {
     fetchMock.mock.restore();
-    delete process.env.PROMO_PROVIDER_MODE;
+    process.env.PROMO_PROVIDER_MODE = "demo";
     delete process.env.PROMO_ONEAPI_BASE_URL;
     delete process.env.PROMO_ONEAPI_API_KEY;
     delete process.env.PROMO_NLP_DAILY_CAP;

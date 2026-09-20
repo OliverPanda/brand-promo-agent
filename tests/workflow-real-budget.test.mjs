@@ -7,11 +7,12 @@ process.env.PROMO_ONEAPI_API_KEY = "sk-test-xxxx";
 process.env.PROMO_LLM_MODEL = "deepseek-v4-flash";
 process.env.PROMO_IMAGE_MODEL = "doubao-seedream-4-0-250828";
 process.env.PROMO_IMAGE_SIZE = "1024x576";
-process.env.PROMO_TTS_MODEL = "tiny-iceberg";
+process.env.PROMO_TTS_MODEL = "speech-02-hd";
 process.env.PROMO_MUSIC_MODEL = "mureka-v1";
 process.env.PROMO_MUSIC_PATH = "/audio/music";
 process.env.PROMO_BUDGET_CAP = "100"; // 充足预算，确保成功路径
-delete process.env.PROMO_FFMPEG_BIN; // 沙箱无 ffmpeg → 合成降级为分镜包（仍走真实代码路径）
+process.env.PROMO_FFMPEG_BIN = process.env.PROMO_FFMPEG_BIN || "ffmpeg";
+process.env.PROMO_FFPROBE_BIN = process.env.PROMO_FFPROBE_BIN || "ffprobe";
 
 const { test } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
@@ -27,6 +28,13 @@ function makeRes({ ok = true, status = 200, json, text, bytes } = {}) {
   };
 }
 function route(path, body) {
+  if (path.endsWith("/models")) {
+    return makeRes({ json: { data: [
+      { id: "minimax-h3", type: "video" },
+      { id: "speech-02-hd", type: "tts" },
+      { id: "mureka-v1", type: "music" },
+    ] } });
+  }
   if (path.endsWith("/chat/completions")) {
     const sys = body.messages?.[0]?.content || "";
     if (sys.includes("资深品牌文案")) {

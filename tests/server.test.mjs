@@ -27,6 +27,101 @@ const baseBrief = {
   voiceTone: "男声",
 };
 
+test("prepareGenerationBrief：REAL 成功预检写回画布与模型审计字段", async () => {
+  const { prepareGenerationBrief } = await import("../src/mastra/workflow.js");
+  const calls = [];
+  const brief = await prepareGenerationBrief(baseBrief, {
+    runId: "preflight-unit-1",
+    dependencies: {
+      verifyMediaToolchain: async () => calls.push("toolchain"),
+      fetchRemoteModels: async () => ({
+        byType: { video: ["7zhe-seedance", "minimax-h3"], audio: ["speech-02-hd", "mureka-v1"] },
+        raw: [
+          { id: "minimax-h3", type: "video" },
+          { id: "7zhe-seedance", type: "video" },
+          { id: "speech-02-hd", type: "tts" },
+          { id: "mureka-v1", type: "music" },
+        ],
+      }),
+      artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
+      verifyWritable: async () => calls.push("writable"),
+      providerMode: () => "real",
+      providerBase: () => "https://gateway.example/v1",
+      providerKey: () => "secret-not-returned",
+      musicPath: () => "/audio/music",
+      musicModel: () => "mureka-v1",
+      ttsModel: () => "",
+    },
+  });
+  assert.equal(brief.canvasPreset, "social-portrait");
+  assert.equal(brief.videoModel, "minimax-h3");
+  assert.equal(brief.ttsModel, "speech-02-hd");
+  assert.equal(brief.musicModel, "mureka-v1");
+  assert.equal(brief.modelSelectionSource, "automatic");
+  assert.deepEqual(calls, ["toolchain", "writable"]);
+});
+
+test("prepareGenerationBrief：REAL 手选非实时视频模型标记为 400", async () => {
+  const { prepareGenerationBrief } = await import("../src/mastra/workflow.js");
+  await assert.rejects(
+    prepareGenerationBrief({ ...baseBrief, videoModel: "fake-video" }, {
+      runId: "preflight-unit-2",
+      dependencies: {
+        verifyMediaToolchain: async () => {},
+        fetchRemoteModels: async () => ({
+          byType: { video: ["minimax-h3"], audio: ["speech-02-hd"] },
+          raw: [{ id: "minimax-h3", type: "video" }, { id: "speech-02-hd", type: "tts" }],
+        }),
+        artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
+        verifyWritable: async () => {},
+        providerMode: () => "real",
+        providerBase: () => "https://gateway.example/v1",
+        providerKey: () => "secret-not-returned",
+        musicPath: () => "/audio/music",
+        musicModel: () => "mureka-v1",
+        ttsModel: () => "",
+      },
+    }),
+    (error) => error.statusCode === 400 && /所选动态视频模型不可用/.test(error.message)
+  );
+});
+
+test("POST /api/generate：REAL 环境预检失败返回 503 且不创建 run", async () => {
+  const { app } = await import("../src/server.js");
+  const { setRuntimeConfig } = await import("../src/runtime-config.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  const before = (await (await fetch(`${BASE(port)}/api/runs`)).json()).length;
+  const previous = {
+    mode: process.env.PROMO_PROVIDER_MODE,
+    base: process.env.PROMO_ONEAPI_BASE_URL,
+    key: process.env.PROMO_ONEAPI_API_KEY,
+  };
+  try {
+    process.env.PROMO_PROVIDER_MODE = "real";
+    delete process.env.PROMO_ONEAPI_BASE_URL;
+    delete process.env.PROMO_ONEAPI_API_KEY;
+    setRuntimeConfig({ providerMode: "", providerBaseUrl: "", apiKey: "" });
+    const response = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(baseBrief),
+    });
+    assert.equal(response.status, 503);
+    assert.match((await response.json()).error, /预检|供应商地址/);
+    const after = (await (await fetch(`${BASE(port)}/api/runs`)).json()).length;
+    assert.equal(after, before, "预检失败不得留下 run");
+  } finally {
+    process.env.PROMO_PROVIDER_MODE = previous.mode || "demo";
+    if (previous.base === undefined) delete process.env.PROMO_ONEAPI_BASE_URL;
+    else process.env.PROMO_ONEAPI_BASE_URL = previous.base;
+    if (previous.key === undefined) delete process.env.PROMO_ONEAPI_API_KEY;
+    else process.env.PROMO_ONEAPI_API_KEY = previous.key;
+    setRuntimeConfig({ providerMode: "", providerBaseUrl: "", apiKey: "" });
+    server.close();
+  }
+});
+
 test("非法 Brief 返回 400", async () => {
   const { app } = await import("../src/server.js");
   const server = app.listen(0);
@@ -403,7 +498,7 @@ test("POST /api/config 保存运行模式 + API Key：real 即时生效、密钥
     });
     assert.equal(r.status, 200);
     const cleared = await (await fetch(`${BASE(port)}/api/config`)).json();
-    assert.equal(cleared.mode, process.env.PROMO_PROVIDER_MODE === "real" ? "real" : "demo", "清空后回落 env/demo");
+    assert.equal(cleared.mode, ["real", "demo"].includes(process.env.PROMO_PROVIDER_MODE) ? process.env.PROMO_PROVIDER_MODE : "real", "清空后回落显式 env 或默认 real");
     assert.equal(cleared.apiKeySet, !!envKey, "清空后密钥状态回落 env");
     assert.equal(getProviderMode(), cleared.mode);
   } finally {

@@ -31,6 +31,183 @@ import { emitProgress, emitRunDone } from "./eventBus.js";
 import { updateRun, setStep, getRun } from "../store.js";
 import { costFor, checkBudget, getBudgetCap, BudgetExceededError } from "../cost.js";
 import { checkQuota, addUsage, QuotaExceededError } from "../quota.js";
+import fs from "node:fs";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { parseBrief } from "../schemas.js";
+import { fetchRemoteModels, demoVideoChoices } from "../models-gateway.js";
+import {
+  getEffectiveOneApiBase,
+  getEffectiveOneApiKey,
+} from "../runtime-config.js";
+import { artifactPaths } from "../media/artifacts.js";
+import { resolveDeliveryModels } from "../media/model-selection.js";
+
+const execFileAsync = promisify(execFile);
+
+class GenerationPreflightError extends Error {
+  constructor(message, statusCode = 503) {
+    super(message);
+    this.name = "GenerationPreflightError";
+    this.statusCode = statusCode;
+  }
+}
+
+async function runCommand(bin, args) {
+  return execFileAsync(bin, args, { windowsHide: true, timeout: 15_000, maxBuffer: 2 * 1024 * 1024 });
+}
+
+function configuredFontPath(font) {
+  if (path.isAbsolute(font) || /[\\/]/.test(font) || /\.(?:ttf|ttc|otf)$/i.test(font)) return path.resolve(font);
+  if (process.platform === "win32" && /^Microsoft YaHei$/i.test(font)) {
+    return path.join(process.env.WINDIR || "C:\\Windows", "Fonts", "msyh.ttc");
+  }
+  return "";
+}
+
+async function verifyMediaToolchain() {
+  const ffmpeg = process.env.PROMO_FFMPEG_BIN || "ffmpeg";
+  const ffprobe = process.env.PROMO_FFPROBE_BIN || "ffprobe";
+  try {
+    await runCommand(ffmpeg, ["-version"]);
+  } catch {
+    throw new GenerationPreflightError("真实生成预检失败：FFmpeg 不可执行，请检查 PROMO_FFMPEG_BIN");
+  }
+  try {
+    await runCommand(ffprobe, ["-version"]);
+  } catch {
+    throw new GenerationPreflightError("真实生成预检失败：ffprobe 不可执行，请检查 PROMO_FFPROBE_BIN");
+  }
+  let filters;
+  try {
+    filters = await runCommand(ffmpeg, ["-hide_banner", "-filters"]);
+  } catch {
+    throw new GenerationPreflightError("真实生成预检失败：无法读取 FFmpeg 滤镜清单");
+  }
+  if (!/(?:^|\s)subtitles(?:\s|$)/m.test(`${filters.stdout || ""}\n${filters.stderr || ""}`)) {
+    throw new GenerationPreflightError("真实生成预检失败：FFmpeg 缺少 subtitles/libass 滤镜");
+  }
+  const font = String(process.env.PROMO_SUBTITLE_FONT || "Microsoft YaHei").trim();
+  if (!font) throw new GenerationPreflightError("真实生成预检失败：未配置中文字幕字体 PROMO_SUBTITLE_FONT");
+  const knownPath = configuredFontPath(font);
+  if (knownPath) {
+    if (!fs.existsSync(knownPath)) throw new GenerationPreflightError("真实生成预检失败：配置的中文字幕字体不可用");
+    return;
+  }
+  try {
+    const match = await runCommand("fc-match", ["-f", "%{file}", font]);
+    const matchedPath = String(match.stdout || "").trim();
+    if (!matchedPath || !fs.existsSync(matchedPath)) throw new Error("font not found");
+  } catch {
+    throw new GenerationPreflightError("真实生成预检失败：配置的中文字幕字体不可用；请配置字体文件路径");
+  }
+}
+
+async function verifyWritable(paths) {
+  await fs.promises.access(paths.outputRoot, fs.constants.W_OK);
+  const probe = path.join(paths.workspace, `.preflight-${process.pid}-${Date.now()}.tmp`);
+  try {
+    await fs.promises.writeFile(probe, "ok", { flag: "wx" });
+  } finally {
+    await fs.promises.unlink(probe).catch(() => {});
+  }
+}
+
+/**
+ * 在创建运行和任何付费生成调用前解析 Brief 并执行共享预检。
+ *
+ * @param {unknown} rawBrief 未解析的请求 Brief。
+ * @param {{runId?: string, dependencies?: Record<string, Function>}} [options] 运行 ID 与边界依赖；依赖覆盖仅用于确定性测试。
+ * @returns {Promise<Record<string, unknown>>} 含画布和已解析视频、TTS、配乐模型的 Brief。
+ * @throws {Error} 输入错误携带 statusCode=400，环境未就绪携带 statusCode=503。
+ * @example
+ * await prepareGenerationBrief(body, { runId });
+ */
+export async function prepareGenerationBrief(rawBrief, options = {}) {
+  let brief;
+  try {
+    brief = parseBrief(rawBrief);
+  } catch (error) {
+    error.statusCode = 400;
+    throw error;
+  }
+  const dependencies = {
+    verifyMediaToolchain,
+    fetchRemoteModels,
+    artifactPaths,
+    verifyWritable,
+    providerMode: getProviderMode,
+    providerBase: getEffectiveOneApiBase,
+    providerKey: getEffectiveOneApiKey,
+    musicPath: () => process.env.PROMO_MUSIC_PATH || "",
+    musicModel: () => process.env.PROMO_MUSIC_MODEL || "",
+    ttsModel: () => process.env.PROMO_TTS_MODEL || "",
+    ...options.dependencies,
+  };
+
+  if (dependencies.providerMode() !== "real") {
+    return {
+      ...brief,
+      videoModel: brief.videoModel || demoVideoChoices()[0],
+      ttsModel: dependencies.ttsModel() || "speech-02-hd",
+      musicModel: dependencies.musicModel() || "mureka-v1",
+      modelSelectionSource: brief.videoModel ? "manual" : "demo",
+    };
+  }
+  if (!dependencies.providerBase()) {
+    throw new GenerationPreflightError("真实生成预检失败：未配置供应商地址 PROMO_ONEAPI_BASE_URL");
+  }
+  if (!dependencies.providerKey()) {
+    throw new GenerationPreflightError("真实生成预检失败：未配置供应商 API Key");
+  }
+  if (!options.runId) throw new GenerationPreflightError("真实生成预检失败：缺少 runId");
+  try {
+    await dependencies.verifyMediaToolchain();
+  } catch (error) {
+    if (error?.statusCode === 503) throw error;
+    throw new GenerationPreflightError("真实生成预检失败：本地媒体工具链不可用");
+  }
+  let liveModels;
+  try {
+    liveModels = await dependencies.fetchRemoteModels({ refresh: true });
+  } catch {
+    throw new GenerationPreflightError("真实生成预检失败：无法取得网关实时模型清单");
+  }
+  if (!dependencies.musicPath()) {
+    throw new GenerationPreflightError("真实生成预检失败：未配置配乐端点 PROMO_MUSIC_PATH");
+  }
+  const musicModel = dependencies.musicModel();
+  if (!musicModel) {
+    throw new GenerationPreflightError("真实生成预检失败：未配置配乐模型 PROMO_MUSIC_MODEL");
+  }
+  let models;
+  try {
+    models = resolveDeliveryModels({
+      brief,
+      liveModels,
+      ttsModel: dependencies.ttsModel() || undefined,
+      musicModel,
+    });
+  } catch (error) {
+    if (error instanceof RangeError) throw new GenerationPreflightError(error.message, 400);
+    throw new GenerationPreflightError(`真实生成预检失败：${error.message}`);
+  }
+  let paths;
+  try {
+    paths = dependencies.artifactPaths(options.runId);
+    await dependencies.verifyWritable(paths);
+  } catch (error) {
+    throw new GenerationPreflightError(`真实生成预检失败：输出目录不可写（${String(error?.message || "unknown").slice(0, 120)}）`);
+  }
+  return {
+    ...brief,
+    videoModel: models.videoModel,
+    ttsModel: models.ttsModel,
+    musicModel: models.musicModel,
+    modelSelectionSource: models.source,
+  };
+}
 
 const STEP = {
   INGEST: "ingestBrief",

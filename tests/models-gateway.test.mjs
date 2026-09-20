@@ -14,7 +14,7 @@ test("classifyModelId：type 字段优先", () => {
 
 test("classifyModelId：无 type 时按关键词分类", () => {
   // 视频
-  for (const id of ["kling-v1-6", "doubao-seedance-1-0", "veo-3", "runway-gen4", "hunyuan-video-pro", "luma-dream-machine", "hailuo-02", "wan2.1-t2v", "sora-2", "cogvideox-flash"]) {
+  for (const id of ["minimax-h3", "kling-v1-6", "doubao-seedance-1-0", "veo-3", "runway-gen4", "hunyuan-video-pro", "luma-dream-machine", "hailuo-02", "wan2.1-t2v", "sora-2", "cogvideox-flash"]) {
     assert.equal(classifyModelId(id), "video", `${id} 应归 video`);
   }
   // 音频

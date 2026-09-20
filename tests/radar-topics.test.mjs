@@ -3,7 +3,7 @@ import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.PROMO_PERSIST = "0";
-delete process.env.PROMO_PROVIDER_MODE; // 默认 DEMO
+process.env.PROMO_PROVIDER_MODE = "demo"; // 显式 DEMO
 process.env.STEP_DELAY_MS = "0"; // e2e 下发走 DEMO 工作流，提速
 
 const persona = await import("../src/radar/persona.js");
@@ -103,7 +103,7 @@ test("real 模式 LLM 选题：依据词越界丢弃、无依据淘汰、DEMO �
     assert.ok(r.errors.some((e) => e.includes("回落 DEMO")));
   } finally {
     fetchMock.mock.restore();
-    delete process.env.PROMO_PROVIDER_MODE;
+    process.env.PROMO_PROVIDER_MODE = "demo";
     delete process.env.PROMO_ONEAPI_BASE_URL;
     delete process.env.PROMO_ONEAPI_API_KEY;
   }
@@ -143,7 +143,7 @@ test("real 模式 LLM 合规产出：source=llm，DEMO 补齐缺口，钳制生�
     assert.ok(a.evidence.length >= 1 && a.model, "依据来自真实热词 + 模型记录");
   } finally {
     fetchMock.mock.restore();
-    delete process.env.PROMO_PROVIDER_MODE;
+    process.env.PROMO_PROVIDER_MODE = "demo";
     delete process.env.PROMO_ONEAPI_BASE_URL;
     delete process.env.PROMO_ONEAPI_API_KEY;
   }
@@ -179,6 +179,8 @@ test("server e2e：采集→打分→生成→一键下发→run 进入流水线
     assert.ok(dj.runId);
     assert.equal(dj.brief.brandName, "铭星链", "Brief 由人设预填");
     assert.ok(dj.brief.keyMessages.includes(list.topics[0].title), "选题标题注入 keyMessages");
+    assert.equal(dj.brief.canvasPreset, "social-portrait", "共享预检写入默认画布");
+    assert.ok(dj.brief.videoModel && dj.brief.ttsModel && dj.brief.musicModel, "共享预检写入视频/TTS/配乐模型");
     // 轮询 run 状态直到进入稳定态（suspended = 脚本门挂起）
     let status = "";
     for (let i = 0; i < 40; i++) {
@@ -193,6 +195,15 @@ test("server e2e：采集→打分→生成→一键下发→run 进入流水线
     assert.equal(again.status, 200);
     const hist = (await (await fetch(`${base}/api/radar/topics`)).json()).dispatched;
     assert.equal(hist.filter((x) => x.runId === dj.runId).length, 1, "下发历史留痕");
+    // REAL 缺少网关前置条件时，共享预检应在 createRun/脚本生成之前拒绝。
+    const runsBefore = (await (await fetch(`${base}/api/runs`)).json()).length;
+    const historyBefore = hist.length;
+    process.env.PROMO_PROVIDER_MODE = "real";
+    const badDispatch = await fetch(`${base}/api/radar/topics/${list.topics[1].id}/dispatch`, { method: "POST" });
+    process.env.PROMO_PROVIDER_MODE = "demo";
+    assert.equal(badDispatch.status, 503);
+    assert.equal((await (await fetch(`${base}/api/runs`)).json()).length, runsBefore, "预检失败不得创建 run");
+    assert.equal((await (await fetch(`${base}/api/radar/topics`)).json()).dispatched.length, historyBefore, "预检失败不得记录下发");
     // 不存在的选题 404
     const nf = await fetch(`${base}/api/radar/topics/nope/dispatch`, { method: "POST" });
     assert.equal(nf.status, 404);
