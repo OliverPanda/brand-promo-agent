@@ -157,16 +157,17 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
     musicPath: () => process.env.PROMO_MUSIC_PATH || "",
     musicModel: () => process.env.PROMO_MUSIC_MODEL || "",
     ttsModel: () => process.env.PROMO_TTS_MODEL || "",
+    videoModel: () => process.env.PROMO_VIDEO_MODEL || "",
     ...options.dependencies,
   };
 
   if (dependencies.providerMode() !== "real") {
     return {
       ...brief,
-      videoModel: brief.videoModel || demoVideoChoices()[0],
+      videoModel: brief.videoModel || dependencies.videoModel() || demoVideoChoices()[0],
       ttsModel: dependencies.ttsModel() || "speech-02-hd",
       musicModel: dependencies.musicModel() || "mureka-v1",
-      modelSelectionSource: brief.videoModel ? "manual" : "demo",
+      modelSelectionSource: brief.videoModel ? "manual" : dependencies.videoModel() ? "configured" : "demo",
     };
   }
   if (!dependencies.providerBase()) {
@@ -200,6 +201,7 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
     models = resolveDeliveryModels({
       brief,
       liveModels,
+      configuredVideoModel: dependencies.videoModel() || undefined,
       ttsModel: dependencies.ttsModel() || undefined,
       musicModel,
     });
@@ -212,7 +214,8 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
     paths = dependencies.artifactPaths(options.runId);
     await dependencies.verifyWritable(paths);
   } catch (error) {
-    throw new GenerationPreflightError(`真实生成预检失败：输出目录不可写（${String(error?.message || "unknown").slice(0, 120)}）`);
+    console.error("[generation-preflight] 输出目录创建或写入失败：", error?.message || error);
+    throw new GenerationPreflightError("真实生成预检失败：输出目录不可创建或写入");
   }
   return {
     ...brief,

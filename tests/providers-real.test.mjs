@@ -147,6 +147,21 @@ test("getProviderMode：持久化 runtime demo 在新进程中优先于 env real
   }
 });
 
+test("tests/setup.mjs：普通套件预加载无条件强制 demo", () => {
+  const stdout = execFileSync(process.execPath, [
+    "--import",
+    "./tests/setup.mjs",
+    "-e",
+    "process.stdout.write(process.env.PROMO_PROVIDER_MODE)",
+  ], {
+    cwd: process.cwd(),
+    env: { ...process.env, PROMO_PROVIDER_MODE: "real" },
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  assert.equal(stdout, "demo");
+});
+
 test("generateScript 真实模式：POST /chat/completions + 解析 JSON + _usage.tokens", async () => {
   calls = [];
   const out = await generateScript(baseBrief);

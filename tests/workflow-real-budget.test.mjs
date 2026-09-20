@@ -11,8 +11,6 @@ process.env.PROMO_TTS_MODEL = "speech-02-hd";
 process.env.PROMO_MUSIC_MODEL = "mureka-v1";
 process.env.PROMO_MUSIC_PATH = "/audio/music";
 process.env.PROMO_BUDGET_CAP = "100"; // 充足预算，确保成功路径
-process.env.PROMO_FFMPEG_BIN = process.env.PROMO_FFMPEG_BIN || "ffmpeg";
-process.env.PROMO_FFPROBE_BIN = process.env.PROMO_FFPROBE_BIN || "ffprobe";
 
 const { test } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
@@ -63,6 +61,11 @@ globalThis.fetch = async (url, opts = {}) => {
 };
 
 const { app } = await import("../src/server.js");
+app.locals.generationPreflightDependencies = {
+  verifyMediaToolchain: async () => {},
+  artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
+  verifyWritable: async () => {},
+};
 
 const BASE = (port) => `http://127.0.0.1:${port}`;
 const waitStatus = async (port, runId, statuses, timeoutMs = 20000) => {

@@ -61,6 +61,37 @@ test("prepareGenerationBrief：REAL 成功预检写回画布与模型审计字�
   assert.deepEqual(calls, ["toolchain", "writable"]);
 });
 
+test("prepareGenerationBrief：Brief 未选时采用并校验 PROMO_VIDEO_MODEL", async () => {
+  const { prepareGenerationBrief } = await import("../src/mastra/workflow.js");
+  const previous = process.env.PROMO_VIDEO_MODEL;
+  process.env.PROMO_VIDEO_MODEL = "seedance-2.0";
+  try {
+    const brief = await prepareGenerationBrief(baseBrief, {
+      runId: "preflight-env-video",
+      dependencies: {
+        verifyMediaToolchain: async () => {},
+        fetchRemoteModels: async () => ({
+          byType: { video: ["minimax-h3", "seedance-2.0"], audio: ["speech-02-hd"] },
+          raw: [{ id: "speech-02-hd", type: "tts" }],
+        }),
+        artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
+        verifyWritable: async () => {},
+        providerMode: () => "real",
+        providerBase: () => "https://gateway.example/v1",
+        providerKey: () => "secret-not-returned",
+        musicPath: () => "/audio/music",
+        musicModel: () => "mureka-v1",
+        ttsModel: () => "speech-02-hd",
+      },
+    });
+    assert.equal(brief.videoModel, "seedance-2.0");
+    assert.equal(brief.modelSelectionSource, "configured");
+  } finally {
+    if (previous === undefined) delete process.env.PROMO_VIDEO_MODEL;
+    else process.env.PROMO_VIDEO_MODEL = previous;
+  }
+});
+
 test("prepareGenerationBrief：REAL 手选非实时视频模型标记为 400", async () => {
   const { prepareGenerationBrief } = await import("../src/mastra/workflow.js");
   await assert.rejects(
@@ -83,6 +114,57 @@ test("prepareGenerationBrief：REAL 手选非实时视频模型标记为 400", a
       },
     }),
     (error) => error.statusCode === 400 && /所选动态视频模型不可用/.test(error.message)
+  );
+});
+
+test("prepareGenerationBrief：PROMO_TTS_MODEL 指向音乐模型时预检失败", async () => {
+  const { prepareGenerationBrief } = await import("../src/mastra/workflow.js");
+  await assert.rejects(
+    prepareGenerationBrief(baseBrief, {
+      runId: "preflight-tts-music",
+      dependencies: {
+        verifyMediaToolchain: async () => {},
+        fetchRemoteModels: async () => ({
+          byType: { video: ["minimax-h3"], audio: ["speech-02-hd", "mureka-v1"] },
+          raw: [{ id: "speech-02-hd", type: "tts" }, { id: "mureka-v1", type: "music" }],
+        }),
+        providerMode: () => "real",
+        providerBase: () => "https://gateway.example/v1",
+        providerKey: () => "secret-not-returned",
+        musicPath: () => "/audio/music",
+        musicModel: () => "mureka-v1",
+        ttsModel: () => "mureka-v1",
+      },
+    }),
+    (error) => error.statusCode === 503 && /TTS 模型不可用/.test(error.message)
+  );
+});
+
+test("prepareGenerationBrief：文件系统异常不向 503 暴露路径或底层文本", async (t) => {
+  const { prepareGenerationBrief } = await import("../src/mastra/workflow.js");
+  t.mock.method(console, "error", () => {});
+  await assert.rejects(
+    prepareGenerationBrief(baseBrief, {
+      runId: "preflight-fs-error",
+      dependencies: {
+        verifyMediaToolchain: async () => {},
+        fetchRemoteModels: async () => ({
+          byType: { video: ["minimax-h3"], audio: ["speech-02-hd"] },
+          raw: [{ id: "speech-02-hd", type: "tts" }],
+        }),
+        artifactPaths: () => { throw new Error("EACCES: C:\\secret\\customer\\outputs"); },
+        providerMode: () => "real",
+        providerBase: () => "https://gateway.example/v1",
+        providerKey: () => "secret-not-returned",
+        musicPath: () => "/audio/music",
+        musicModel: () => "mureka-v1",
+        ttsModel: () => "speech-02-hd",
+      },
+    }),
+    (error) => error.statusCode === 503
+      && error.message === "真实生成预检失败：输出目录不可创建或写入"
+      && !error.message.includes("secret")
+      && !error.message.includes("EACCES")
   );
 });
 

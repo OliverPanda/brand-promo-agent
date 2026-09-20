@@ -3,4 +3,4 @@
 // - PROMO_PERSIST=0：关闭 store/quota 文件写穿与启动 hydrate，测试全程内存态、互不污染、不落盘。
 process.env.STEP_DELAY_MS = process.env.STEP_DELAY_MS || "10";
 process.env.PROMO_PERSIST = "0";
-process.env.PROMO_PROVIDER_MODE = process.env.PROMO_PROVIDER_MODE || "demo";
+process.env.PROMO_PROVIDER_MODE = "demo";

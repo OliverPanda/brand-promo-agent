@@ -50,36 +50,70 @@ export function validateSelectedVideoModel(selected, videoModels = []) {
  *
  * @param {string[]} audioModels 实时分类为 audio 的模型 ID。
  * @param {string | undefined} configured 显式配置的 TTS 模型。
+ * @param {Array<{id?: string, type?: string}>} raw 网关原始模型元数据。
  * @returns {string} 可用的 TTS 模型 ID。
  * @throws {Error} 无可用 TTS 模型时抛出。
  * @example
  * selectTtsModel(["speech-02-hd"]);
  */
-export function selectTtsModel(audioModels = [], configured) {
+export function selectTtsModel(audioModels = [], configured, raw = []) {
   const selected = configured || "speech-02-hd";
-  if (audioModels.includes(selected)) return selected;
+  if (audioModels.includes(selected) && isTtsModel(selected, raw)) return selected;
   throw new Error(`TTS 模型不可用：${selected}`);
+}
+
+const MUSIC_MODEL_RE = /(?:^|[-_.])(music|mureka|suno|udio)(?:$|[-_.])/i;
+const TTS_MODEL_RE = /(?:^|[-_.])(tts|speech|voice)(?:$|[-_.])|elevenlabs|dictvoice|chatts|tiny[-_.]?iceberg|minimax[-_.]?audio|doubao[-_.]?tts|\bbark\b/i;
+
+/**
+ * 判断 combined audio 分类中的模型是否确实提供语音合成能力。
+ *
+ * @param {string} modelId 候选模型 ID。
+ * @param {Array<{id?: string, type?: string}>} raw 网关原始模型元数据。
+ * @returns {boolean} 明确为 TTS/speech/voice 且非音乐家族时为 true。
+ * @example
+ * isTtsModel("speech-02-hd", [{ id: "speech-02-hd", type: "tts" }]);
+ */
+export function isTtsModel(modelId, raw = []) {
+  const id = String(modelId || "");
+  const entry = raw.find((item) => item?.id === id);
+  const type = String(entry?.type || "").toLowerCase();
+  if (type === "music" || MUSIC_MODEL_RE.test(id)) return false;
+  if (["tts", "speech", "voice", "text-to-speech"].includes(type)) return true;
+  return TTS_MODEL_RE.test(id);
 }
 
 /**
  * 一次性解析真实交付使用的模型并返回审计对象。
  *
- * @param {{brief?: {videoModel?: string}, liveModels: {byType?: {video?: string[], audio?: string[]}, raw?: Array<{id?: string, type?: string}>}, ttsModel?: string, musicModel: string}} input 解析输入。
- * @returns {{videoModel: string, ttsModel: string, musicModel: string, source: "manual" | "automatic"}} 解析结果。
+ * @param {{brief?: {videoModel?: string}, liveModels: {byType?: {video?: string[], audio?: string[]}, raw?: Array<{id?: string, type?: string}>}, configuredVideoModel?: string, ttsModel?: string, musicModel: string}} input 解析输入。
+ * @returns {{videoModel: string, ttsModel: string, musicModel: string, source: "manual" | "configured" | "automatic"}} 解析结果。
  * @throws {Error} 任一必需模型不可用时抛出。
  * @example
  * resolveDeliveryModels({ brief: {}, liveModels, musicModel: "mureka-v1" });
  */
-export function resolveDeliveryModels({ brief = {}, liveModels, ttsModel, musicModel }) {
+export function resolveDeliveryModels({ brief = {}, liveModels, configuredVideoModel, ttsModel, musicModel }) {
   const videoModels = liveModels?.byType?.video || [];
   const audioModels = liveModels?.byType?.audio || [];
-  const videoModel = brief.videoModel
-    ? validateSelectedVideoModel(brief.videoModel, videoModels)
-    : selectVideoModel(videoModels);
-  const resolvedTts = selectTtsModel(audioModels, ttsModel);
+  let videoModel;
+  let source;
+  if (brief.videoModel) {
+    videoModel = validateSelectedVideoModel(brief.videoModel, videoModels);
+    source = "manual";
+  } else if (configuredVideoModel) {
+    if (!videoModels.includes(configuredVideoModel)) {
+      throw new Error(`配置的动态视频模型不可用：${configuredVideoModel}`);
+    }
+    videoModel = configuredVideoModel;
+    source = "configured";
+  } else {
+    videoModel = selectVideoModel(videoModels);
+    source = "automatic";
+  }
+  const raw = Array.isArray(liveModels?.raw) ? liveModels.raw : [];
+  const resolvedTts = selectTtsModel(audioModels, ttsModel, raw);
   if (!musicModel) throw new Error("未配置配乐模型 PROMO_MUSIC_MODEL");
 
-  const raw = Array.isArray(liveModels?.raw) ? liveModels.raw : [];
   const catalogHasMusic = raw.some((item) =>
     String(item?.type || "").toLowerCase() === "music"
       || /(?:music|mureka|suno)/i.test(String(item?.id || ""))
@@ -91,6 +125,6 @@ export function resolveDeliveryModels({ brief = {}, liveModels, ttsModel, musicM
     videoModel,
     ttsModel: resolvedTts,
     musicModel,
-    source: brief.videoModel ? "manual" : "automatic",
+    source,
   };
 }

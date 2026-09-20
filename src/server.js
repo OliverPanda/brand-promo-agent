@@ -187,7 +187,7 @@ app.post("/api/generate", async (req, res) => {
   const runId = newRunId();
   let brief;
   try {
-    brief = await prepareGenerationBrief(req.body, { runId });
+    brief = await prepareGenerationBrief(req.body, { runId, dependencies: app.locals.generationPreflightDependencies });
   } catch (e) {
     return res.status(e.statusCode === 503 ? 503 : 400).json({ error: e.message });
   }
@@ -645,7 +645,10 @@ app.post("/api/radar/topics/:id/dispatch", async (req, res) => {
   if (!t) return res.status(404).json({ error: "选题不存在或已过期（请重新生成今日选题）" });
   try {
     const runId = newRunId();
-    const brief = await prepareGenerationBrief(topicBrief(t, { hitlEnabled, finalGateEnabled }), { runId });
+    const brief = await prepareGenerationBrief(topicBrief(t, { hitlEnabled, finalGateEnabled }), {
+      runId,
+      dependencies: app.locals.generationPreflightDependencies,
+    });
     createRun(runId, brief);
     recordDispatch(t.id, runId);
     // 不 await：与 /api/generate 一致，进度经 SSE 推送（前端复用 openStream(runId)）。

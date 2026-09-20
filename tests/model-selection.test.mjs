@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  isTtsModel,
   resolveDeliveryModels,
   selectTtsModel,
   selectVideoModel,
@@ -54,4 +55,30 @@ test("resolveDeliveryModels：返回视频、TTS、配乐与来源审计", () =>
     }),
     { videoModel: "7zhe-seedance", ttsModel: "speech-02-hd", musicModel: "mureka-v1", source: "manual" }
   );
+});
+
+test("resolveDeliveryModels：Brief 手选优先于 env，env 优先于自动模型", () => {
+  const liveModels = {
+    byType: { video: ["minimax-h3", "seedance-2.0"], audio: ["speech-02-hd"] },
+    raw: [{ id: "speech-02-hd", type: "tts" }],
+  };
+  assert.equal(resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-v1" }).videoModel, "seedance-2.0");
+  assert.equal(resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-v1" }).source, "configured");
+  assert.equal(resolveDeliveryModels({ brief: { videoModel: "minimax-h3" }, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-v1" }).source, "manual");
+  assert.throws(
+    () => resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "missing-video", musicModel: "mureka-v1" }),
+    /配置的动态视频模型不可用/
+  );
+});
+
+test("TTS 判定：combined audio 中的音乐模型不能充当 TTS", () => {
+  const raw = [
+    { id: "speech-02-hd", type: "tts" },
+    { id: "mureka-v1", type: "music" },
+    { id: "suno-v4", type: "audio" },
+  ];
+  assert.equal(isTtsModel("speech-02-hd", raw), true);
+  assert.equal(isTtsModel("mureka-v1", raw), false);
+  assert.equal(isTtsModel("suno-v4", raw), false);
+  assert.throws(() => selectTtsModel(["speech-02-hd", "mureka-v1"], "mureka-v1", raw), /TTS 模型不可用/);
 });
