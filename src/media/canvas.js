@@ -3,6 +3,7 @@
  * @description 统一解析分辨率、画幅比例与字幕安全区，禁止调用方提交任意宽高。
  */
 
+/** 默认社交媒体画布预设标识。 */
 export const DEFAULT_CANVAS_PRESET = "social-portrait";
 
 const freezePreset = (preset) => Object.freeze({
@@ -10,6 +11,7 @@ const freezePreset = (preset) => Object.freeze({
   subtitle: Object.freeze({ ...preset.subtitle }),
 });
 
+/** 不可变的受控社交媒体画布注册表。 */
 export const CANVAS_PRESETS = Object.freeze({
   "social-portrait": freezePreset({
     id: "social-portrait",
