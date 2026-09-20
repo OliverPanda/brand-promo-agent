@@ -13,7 +13,7 @@ import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey
 import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
 import { materializeMedia } from "../media/materialize.js";
 import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration } from "../media/audio.js";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // ───────────────────────── 模式判定 ─────────────────────────
 // 生效顺序：运行时配置（页面「模型与服务」保存的 providerMode）> env（PROMO_PROVIDER_MODE=real）；
@@ -295,7 +295,7 @@ function demoStoryboard(brief, script) {
   const seed = hashSeed(brief.brandName + (script?.title || ""));
   const rnd = mulberry32(seed);
   const dur = brief.durationSec || 30;
-  const n = Math.max(3, Math.round(dur / 5));
+  const n = script?.voiceover?.length || Math.max(3, Math.round(dur / 5));
   const tones = brief.tones || ["专业"];
   const scenes = [];
   for (let i = 0; i < n; i++) {
@@ -501,6 +501,12 @@ function demoSceneVideo(scene, brief) {
 }
 
 // ───────────────────────── 4) TTS 配音 ─────────────────────────
+function attachPartialUsage(error, usage) {
+  const failure = error instanceof Error ? error : new Error(String(error));
+  failure._usage = usage;
+  return failure;
+}
+
 /**
  * 按确认脚本逐句生成真实配音，并用实测时长生成权威字幕时间轴。
  * @param {{voiceover?: Array<{text?: string}>}} script 已确认脚本。
@@ -523,44 +529,74 @@ export async function generateVoiceover(script, brief, options = {}) {
   const openaiTts = /^(?:tts-|gpt-4o-mini-tts(?:$|-))/i.test(model);
   const segmentPaths = [];
   const speechDurationsSec = [];
-  for (const input of lines) {
-    const body = { model, input, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN" };
-    if (openaiTts) body.response_format = "mp3";
-    const audio = await oneApiPost("/audio/speech", body, { isBinary: true });
-    if (!Buffer.isBuffer(audio) || audio.length === 0) throw new Error("TTS 返回空音频响应");
-    const source = `data:audio/mpeg;base64,${audio.toString("base64")}`;
-    const segmentPath = await materializeMedia({ source, kind: "audio", workspace: options.workspace });
-    const durationSec = await probeAudioDuration(segmentPath);
-    segmentPaths.push(segmentPath);
-    speechDurationsSec.push(durationSec);
+  const paidDurationsSec = [];
+  let voicePath;
+  try {
+    for (const input of lines) {
+      const body = { model, input, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN" };
+      if (openaiTts) body.response_format = "mp3";
+      const audio = await oneApiPost("/audio/speech", body, { isBinary: true });
+      // 网关成功返回即可能产生费用；在素材不可解码时按既有 3 秒/句估算，探测成功后替换为实测值。
+      paidDurationsSec.push(3);
+      if (!Buffer.isBuffer(audio) || audio.length === 0) throw new Error("TTS 返回空音频响应");
+      const source = `data:audio/mpeg;base64,${audio.toString("base64")}`;
+      const segmentPath = await materializeMedia({ source, kind: "audio", workspace: options.workspace });
+      const durationSec = await probeAudioDuration(segmentPath);
+      segmentPaths.push(segmentPath);
+      speechDurationsSec.push(durationSec);
+      paidDurationsSec[paidDurationsSec.length - 1] = durationSec;
+    }
+    voicePath = await concatenateVoiceSegments(segmentPaths, { workspace: options.workspace });
+  } catch (error) {
+    if (paidDurationsSec.length > 0) {
+      const paidSeconds = paidDurationsSec.reduce((sum, value) => sum + value, 0);
+      throw attachPartialUsage(error, {
+        minutes: paidSeconds / 60,
+        audioSeconds: paidSeconds,
+        requests: paidDurationsSec.length,
+      });
+    }
+    throw error;
   }
-  const voicePath = await concatenateVoiceSegments(segmentPaths, { workspace: options.workspace });
-  const concatenatedDuration = await probeAudioDuration(voicePath);
-  const canvas = resolveCanvas(brief.canvasPreset);
-  const timeline = buildVoiceTimeline(lines, speechDurationsSec, { maxCharsPerLine: canvas.subtitle.maxCharsPerLine });
-  if (Math.abs(concatenatedDuration - timeline.durationSec) > 0.08) {
-    throw new Error(`拼接语音时长与权威时间轴不一致：${concatenatedDuration}s / ${timeline.durationSec}s`);
-  }
-  const srt = formatSrt(timeline.cues, timeline.durationSec);
   const speechSeconds = speechDurationsSec.reduce((sum, value) => sum + value, 0);
-  return {
-    voicePath,
-    voiceUrl: pathToFileURL(voicePath).href,
-    cues: timeline.cues,
-    srt,
-    durationSec: timeline.durationSec,
-    sceneDurationsMs: timeline.sceneDurationsMs,
-    voiceTone: brief.voiceTone || "男声",
-    model,
-    _usage: { minutes: speechSeconds / 60, audioSeconds: speechSeconds, requests: lines.length },
-  };
+  const usage = { minutes: speechSeconds / 60, audioSeconds: speechSeconds, requests: lines.length };
+  try {
+    const concatenatedDuration = await probeAudioDuration(voicePath);
+    const canvas = resolveCanvas(brief.canvasPreset);
+    const timeline = buildVoiceTimeline(lines, speechDurationsSec, { maxCharsPerLine: canvas.subtitle.maxCharsPerLine });
+    if (Math.abs(concatenatedDuration - timeline.durationSec) > 0.08) {
+      throw new Error(`拼接语音时长与权威时间轴不一致：${concatenatedDuration}s / ${timeline.durationSec}s`);
+    }
+    const srt = formatSrt(timeline.cues, timeline.durationSec);
+    return {
+      voicePath,
+      voiceUrl: pathToFileURL(voicePath).href,
+      cues: timeline.cues,
+      srt,
+      durationSec: timeline.durationSec,
+      sceneDurationsMs: timeline.sceneDurationsMs,
+      voiceTone: brief.voiceTone || "男声",
+      model,
+      _usage: usage,
+    };
+  } catch (error) {
+    throw attachPartialUsage(error, usage);
+  }
 }
 
 function demoVoiceover(script, brief) {
-  const srt = (script?.voiceover || [])
+  const lines = script?.voiceover || [];
+  const srt = lines
     .map((v, i) => `${i + 1}\n${v.timecode} --> ${fmtTC((i + 1) * 3)}\n${v.text}\n`)
     .join("\n");
-  return { voiceUrl: null, srt, voiceTone: brief.voiceTone || "男声", model: "demo-tts" };
+  return {
+    voiceUrl: null,
+    srt,
+    durationSec: lines.length * 3,
+    sceneDurationsMs: lines.map(() => 3000),
+    voiceTone: brief.voiceTone || "男声",
+    model: "demo-tts",
+  };
 }
 
 // ───────────────────────── 5) 音乐（Mureka 桥 / one-api 音乐通道） ─────────────────────────
@@ -580,11 +616,17 @@ export async function generateMusic(brief, storyboard, options = {}) {
   const path = process.env.PROMO_MUSIC_PATH || "/audio/music";
   const prompt = `背景音乐：${(brief.tones || ["专业"]).join("/")}风格，匹配宣传片情绪曲线`;
   const data = await oneApiPost(path, { model, prompt, lyrics: "", instrumental: true });
-  const item = data.data?.[0] || {};
-  const musicUrl = item.url || (item.b64_json ? `data:audio/mp3;base64,${item.b64_json}` : null);
-  if (!musicUrl) throw new Error("配乐服务返回空音频响应");
-  const musicPath = await materializeMedia({ source: musicUrl, kind: "audio", workspace: options.workspace });
-  const durationSec = await probeAudioDuration(musicPath);
+  let musicPath;
+  let durationSec;
+  try {
+    const item = data.data?.[0] || {};
+    const musicUrl = item.url || (item.b64_json ? `data:audio/mp3;base64,${item.b64_json}` : null);
+    if (!musicUrl) throw new Error("配乐服务返回空音频响应");
+    musicPath = await materializeMedia({ source: musicUrl, kind: "audio", workspace: options.workspace });
+    durationSec = await probeAudioDuration(musicPath);
+  } catch (error) {
+    throw attachPartialUsage(error, { tracks: 1 });
+  }
   return {
     musicPath,
     musicUrl: pathToFileURL(musicPath).href,
@@ -638,6 +680,19 @@ function demoComposite(scenes, voice, music, brief) {
   return fallbackComposite(scenes, voice, music, brief, "未接入真实合成服务，以下为分镜故事板");
 }
 
+function compositorAudioFile(track, { pathKey, urlKey, target, fs }) {
+  const directPath = track?.[pathKey];
+  if (typeof directPath === "string" && directPath) return directPath;
+  const source = track?.[urlKey];
+  if (typeof source !== "string" || !source) return null;
+  if (source.startsWith("file:")) return fileURLToPath(source);
+  if (source.startsWith("data:audio")) {
+    fs.writeFileSync(target, Buffer.from(source.split(",")[1], "base64"));
+    return target;
+  }
+  return null;
+}
+
 // 服务端 FFmpeg 组装：将场景图/动态片段 + 配音 + 配乐合为 MP4。要求 ffmpeg 可用且素材可本地读取。
 async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
   // 动态视频路径：全部镜均已产出动态片段（scene.videoUrl）→ concat demuxer 直拼 + 音频混流。
@@ -683,17 +738,19 @@ async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
   let voiceIdx = -1, musicIdx = -1;
   const audioInputs = [];
   let audioCount = 0;
-  if (voice?.voiceUrl?.startsWith("data:audio")) {
-    const a = path.join(tmp, "voice.mp3");
-    fs.writeFileSync(a, Buffer.from(voice.voiceUrl.split(",")[1], "base64"));
+  const voiceFile = compositorAudioFile(voice, {
+    pathKey: "voicePath", urlKey: "voiceUrl", target: path.join(tmp, "voice.audio"), fs,
+  });
+  if (voiceFile) {
     voiceIdx = n + audioCount++;
-    audioInputs.push("-i", a);
+    audioInputs.push("-i", voiceFile);
   }
-  if (music?.musicUrl?.startsWith("data:audio")) {
-    const m = path.join(tmp, "music.mp3");
-    fs.writeFileSync(m, Buffer.from(music.musicUrl.split(",")[1], "base64"));
+  const musicFile = compositorAudioFile(music, {
+    pathKey: "musicPath", urlKey: "musicUrl", target: path.join(tmp, "music.audio"), fs,
+  });
+  if (musicFile) {
     musicIdx = n + audioCount++;
-    audioInputs.push("-i", m);
+    audioInputs.push("-i", musicFile);
   }
   const out = path.join(tmp, "out.mp4");
   // 统一画布：seedream/doubao 等渠道对 aspect_ratio 是 best-effort，同一批场景图可能混出不同几何
@@ -757,17 +814,18 @@ async function ffmpegAssembleVideo(ffmpeg, scenes, voice, music, brief) {
   fs.writeFileSync(list, lines.join("\n"));
   const out = path.join(tmp, "out.mp4");
   const args = ["-f", "concat", "-safe", "0", "-i", list];
-  if (voice?.voiceUrl?.startsWith("data:audio")) {
-    const a = path.join(tmp, "voice.mp3");
-    fs.writeFileSync(a, Buffer.from(voice.voiceUrl.split(",")[1], "base64"));
-    args.push("-i", a);
-    if (music?.musicUrl?.startsWith("data:audio")) {
-      const m = path.join(tmp, "music.mp3");
-      fs.writeFileSync(m, Buffer.from(music.musicUrl.split(",")[1], "base64"));
-      args.push("-i", m, "-filter_complex", "[1:a][2:a]amix=inputs=2[a]", "-map", "0:v", "-map", "[a]");
-    } else {
-      args.push("-map", "0:v", "-map", "1:a");
-    }
+  const voiceFile = compositorAudioFile(voice, {
+    pathKey: "voicePath", urlKey: "voiceUrl", target: path.join(tmp, "voice.audio"), fs,
+  });
+  const musicFile = compositorAudioFile(music, {
+    pathKey: "musicPath", urlKey: "musicUrl", target: path.join(tmp, "music.audio"), fs,
+  });
+  if (voiceFile) args.push("-i", voiceFile);
+  if (musicFile) args.push("-i", musicFile);
+  if (voiceFile && musicFile) {
+    args.push("-filter_complex", "[1:a][2:a]amix=inputs=2[a]", "-map", "0:v", "-map", "[a]");
+  } else if (voiceFile || musicFile) {
+    args.push("-map", "0:v", "-map", "1:a");
   }
   // 以画面总时长为准（真实配乐常长于画面，须截断；voice 不足尾部静音）
   const totalSec = scenes.reduce((a, s) => a + (s.durationSec || 5), 0).toFixed(2);

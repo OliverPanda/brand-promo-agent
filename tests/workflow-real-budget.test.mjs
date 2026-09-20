@@ -36,6 +36,14 @@ function silentWav(durationSec = 0.25) {
 }
 
 const AUDIO_FIXTURE = silentWav();
+const BROKEN_WAV = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVE")]);
+let scriptVoiceover = [
+  { timecode: "00:00:00.000", text: "第一句" },
+  { timecode: "00:00:00.000", text: "第二句" },
+];
+let workflowSpeechCall = 0;
+let workflowFailSpeechAt = 0;
+let workflowInvalidMusic = false;
 
 // ── fetch mock（与 providers-real 同形）──
 function makeRes({ ok = true, status = 200, json, text, bytes } = {}) {
@@ -59,7 +67,7 @@ function route(path, body) {
     const sys = body.messages?.[0]?.content || "";
     if (sys.includes("资深品牌文案")) {
       return makeRes({ json: { choices: [{ message: { content: JSON.stringify({
-        title: "T", voiceover: [{ timecode: "00:00:00.000", text: "hi" }], structure: ["a"], moodCurve: ["x"],
+        title: "T", voiceover: scriptVoiceover, structure: ["a"], moodCurve: ["x"],
       }) } }], usage: { total_tokens: 120 } } });
     }
     return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ scenes: [
@@ -68,8 +76,15 @@ function route(path, body) {
     ] }) } }], usage: { total_tokens: 200 } } });
   }
   if (path.endsWith("/images/generations")) return makeRes({ json: { data: [{ url: "https://cdn.example/scene.png" }] } });
-  if (path.endsWith("/audio/speech")) return makeRes({ bytes: AUDIO_FIXTURE });
-  if (path.endsWith("/audio/music")) return makeRes({ json: { data: [{ b64_json: AUDIO_FIXTURE.toString("base64") }] } });
+  if (path.endsWith("/audio/speech")) {
+    workflowSpeechCall += 1;
+    if (workflowSpeechCall === workflowFailSpeechAt) return makeRes({ ok: false, status: 500, text: "line failed" });
+    return makeRes({ bytes: AUDIO_FIXTURE });
+  }
+  if (path.endsWith("/audio/music")) {
+    const bytes = workflowInvalidMusic ? BROKEN_WAV : AUDIO_FIXTURE;
+    return makeRes({ json: { data: [{ b64_json: bytes.toString("base64") }] } });
+  }
   return makeRes({ ok: false, status: 404, text: "not found" });
 }
 // 关键：只把 one-api 域名的请求路由到 mock；localhost（测试用 HTTP 客户端 / SSE）走真实 fetch。
@@ -83,6 +98,7 @@ globalThis.fetch = async (url, opts = {}) => {
 };
 
 const { app } = await import("../src/server.js");
+const { applyVoiceTimelineToStoryboard } = await import("../src/mastra/workflow.js");
 app.locals.generationPreflightDependencies = {
   verifyMediaToolchain: async () => {},
   artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
@@ -114,6 +130,7 @@ const baseBrief = {
 };
 
 test("真实模式 + 充足预算：端到端成功并归集 cost（≥5 步）", async () => {
+  workflowSpeechCall = 0;
   const server = app.listen(0);
   const port = server.address().port;
   try {
@@ -127,6 +144,9 @@ test("真实模式 + 充足预算：端到端成功并归集 cost（≥5 步）"
     assert.equal(run.status, "success", `应成功，实际=${run.status}，note=${run.note}`);
     assert.ok(Array.isArray(run.storyboardGallery) && run.storyboardGallery.length >= 2, "应产出分镜画廊");
     assert.ok(run.cost && run.cost.length >= 5, `应归集 ≥5 步成本，实际=${run.cost?.length}`);
+    assert.deepEqual(run.storyboard.map((scene) => scene.durationSec), [0.37, 0.25]);
+    assert.equal(run.cost.filter((entry) => entry.step === "voiceover").length, 1, "成功配音只归集一次");
+    assert.equal(run.cost.filter((entry) => entry.step === "music").length, 1, "成功配乐只归集一次");
     // 各步金额计算正确
     const byStep = Object.fromEntries(run.cost.map((c) => [c.step, c.amount]));
     assert.ok(byStep.writeScript > 0, "writeScript 应计成本");
@@ -134,6 +154,88 @@ test("真实模式 + 充足预算：端到端成功并归集 cost（≥5 步）"
     assert.ok(byStep.music > 0, "music 应计成本（曲目）");
     assert.equal(typeof byStep.composite, "undefined", "无 ffmpeg 时 composite 不计成本（降级）");
   } finally {
+    server.close();
+  }
+});
+
+test("voice timeline 严格校验旁白/分镜数量并传播权威场景时长", () => {
+  const storyboard = [{ index: 1, durationSec: 9 }, { index: 2, durationSec: 9 }];
+  const updated = applyVoiceTimelineToStoryboard(
+    { voiceover: [{ text: "一" }, { text: "二" }] },
+    storyboard,
+    { sceneDurationsMs: [1520, 2100] },
+  );
+  assert.deepEqual(updated.map((scene) => scene.durationSec), [1.52, 2.1]);
+  assert.throws(
+    () => applyVoiceTimelineToStoryboard({ voiceover: [{ text: "一" }] }, storyboard, { sceneDurationsMs: [1000] }),
+    /旁白.*分镜.*数量|数量.*不一致/,
+  );
+});
+
+test("voice step 数量不一致会失败且不调用 TTS", async () => {
+  scriptVoiceover = [{ timecode: "00:00:00.000", text: "只有一句" }];
+  workflowSpeechCall = 0;
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const response = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
+    });
+    const { runId } = await response.json();
+    const run = await waitStatus(port, runId, ["failed"]);
+    assert.equal(run.steps.voiceover.status, "failed");
+    assert.match(run.steps.voiceover.error, /旁白.*分镜.*数量|数量.*不一致/);
+    assert.equal(workflowSpeechCall, 0);
+  } finally {
+    scriptVoiceover = [
+      { timecode: "00:00:00.000", text: "第一句" },
+      { timecode: "00:00:00.000", text: "第二句" },
+    ];
+    server.close();
+  }
+});
+
+test("逐句 TTS 第 N 次失败仍归集已付 voiceover 成本", async () => {
+  workflowSpeechCall = 0;
+  workflowFailSpeechAt = 2;
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const response = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
+    });
+    const { runId } = await response.json();
+    const run = await waitStatus(port, runId, ["failed"]);
+    const voiceCosts = run.cost.filter((entry) => entry.step === "voiceover");
+    assert.equal(voiceCosts.length, 1);
+    assert.ok(voiceCosts[0].amount > 0);
+    assert.equal(run.steps.voiceover.status, "failed");
+  } finally {
+    workflowFailSpeechAt = 0;
+    server.close();
+  }
+});
+
+test("配乐付费响应探测失败仍归集一次 music 成本", async () => {
+  workflowSpeechCall = 0;
+  workflowInvalidMusic = true;
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const response = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
+    });
+    const { runId } = await response.json();
+    const run = await waitStatus(port, runId, ["failed"]);
+    const musicCosts = run.cost.filter((entry) => entry.step === "music");
+    assert.equal(musicCosts.length, 1);
+    assert.equal(musicCosts[0].amount, 0.5);
+    assert.equal(run.steps.music.status, "failed");
+  } finally {
+    workflowInvalidMusic = false;
     server.close();
   }
 });

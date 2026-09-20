@@ -282,10 +282,19 @@ async function withStep(runId, step, fn) {
     emitProgress(runId, step, "step-done", { output: out });
     return out;
   } catch (err) {
-    setStep(runId, step, { status: "failed", doneAt: Date.now(), error: String(err?.message || err) });
-    emitProgress(runId, step, "step-failed", { error: String(err?.message || err) });
+    let failure = err;
+    if (err?._usage) {
+      try {
+        recordCost(runId, step, { _usage: err._usage });
+      } catch (costError) {
+        failure = costError;
+        if (failure instanceof Error && failure.cause === undefined) failure.cause = err;
+      }
+    }
+    setStep(runId, step, { status: "failed", doneAt: Date.now(), error: String(failure?.message || failure) });
+    emitProgress(runId, step, "step-failed", { error: String(failure?.message || failure) });
     // 说明：步骤失败仍由 Mastra 决定是否重试，阶段边界统一发布最终失败。
-    throw err;
+    throw failure;
   }
 }
 
@@ -436,22 +445,47 @@ const generateScenes = createStep({
   },
 });
 
+function assertVoiceoverMatchesStoryboard(script, storyboard) {
+  const voiceoverCount = Array.isArray(script?.voiceover) ? script.voiceover.length : 0;
+  const sceneCount = Array.isArray(storyboard) ? storyboard.length : 0;
+  if (voiceoverCount === 0 || voiceoverCount !== sceneCount) {
+    throw new Error(`确认旁白与分镜数量不一致：旁白 ${voiceoverCount} 句，分镜 ${sceneCount} 个`);
+  }
+}
+
+/**
+ * 将真实配音时间轴的逐场景毫秒数写回分镜。
+ * @param {{voiceover?: Array}} script 已确认脚本。
+ * @param {Array<Record<string, unknown>>} storyboard 当前分镜。
+ * @param {{sceneDurationsMs?: number[]}} voice 真实配音时间轴。
+ * @returns {Array<Record<string, unknown>>} 带权威 `durationSec` 的新分镜数组。
+ * @throws {Error} 旁白、分镜和时长数量不一致或时长非法时抛出。
+ * @example applyVoiceTimelineToStoryboard(script, scenes, voice);
+ */
+export function applyVoiceTimelineToStoryboard(script, storyboard, voice) {
+  assertVoiceoverMatchesStoryboard(script, storyboard);
+  const durations = voice?.sceneDurationsMs;
+  if (!Array.isArray(durations) || durations.length !== storyboard.length) {
+    throw new Error(`配音场景时长与分镜数量不一致：时长 ${durations?.length || 0} 个，分镜 ${storyboard.length} 个`);
+  }
+  return storyboard.map((scene, index) => {
+    const durationMs = durations[index];
+    if (!Number.isInteger(durationMs) || durationMs <= 0) throw new Error(`第 ${index + 1} 个配音场景时长非法`);
+    return { ...scene, durationSec: durationMs / 1000 };
+  });
+}
+
 const voiceover = createStep({
   id: STEP.VOICE,
   execute: async ({ runId, inputData }) => {
     const rid = inputData.runId || runId;
     const { brief, script, storyboard } = inputData;
     return withStep(rid, STEP.VOICE, async () => {
-      // 配音渠道缺失/调用失败不阻断成片：置 voice=null 降级（合成可出静音片），把原因挂到 run.note。
-      try {
-        const voice = await generateVoiceover(script, brief, { workspace: artifactPaths(rid).audio });
-        updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt });
-        return { brief, script, storyboard, voice, runId: rid, _usage: voice._usage };
-      } catch (e) {
-        updateRun(rid, { note: `配音未生成（已降级静音）：${String(e?.message || e).slice(0, 160)}` });
-        console.warn(`[workflow] voiceover 降级: ${String(e?.message || e).slice(0, 200)}`);
-        return { brief, script, storyboard, voice: null, runId: rid };
-      }
+      assertVoiceoverMatchesStoryboard(script, storyboard);
+      const voice = await generateVoiceover(script, brief, { workspace: artifactPaths(rid).audio });
+      const timedStoryboard = applyVoiceTimelineToStoryboard(script, storyboard, voice);
+      updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt, storyboard: timedStoryboard });
+      return { brief, script, storyboard: timedStoryboard, voice, runId: rid, _usage: voice._usage };
     });
   },
 });
@@ -462,15 +496,9 @@ const music = createStep({
     const rid = inputData.runId || runId;
     const { brief, script, storyboard, voice } = inputData;
     return withStep(rid, STEP.MUSIC, async () => {
-      try {
-        const music = await generateMusic(brief, storyboard, { workspace: artifactPaths(rid).audio });
-        updateRun(rid, { musicUrl: music.musicUrl });
-        return { brief, script, storyboard, voice, music, runId: rid, _usage: music._usage };
-      } catch (e) {
-        updateRun(rid, { note: `配乐未生成（已降级）：${String(e?.message || e).slice(0, 160)}` });
-        console.warn(`[workflow] music 降级: ${String(e?.message || e).slice(0, 200)}`);
-        return { brief, script, storyboard, voice, music: null, runId: rid };
-      }
+      const music = await generateMusic(brief, storyboard, { workspace: artifactPaths(rid).audio });
+      updateRun(rid, { musicUrl: music.musicUrl });
+      return { brief, script, storyboard, voice, music, runId: rid, _usage: music._usage };
     });
   },
 });

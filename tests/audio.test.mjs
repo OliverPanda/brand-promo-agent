@@ -134,3 +134,83 @@ test("ffprobe 失败与畸形 duration 都拒绝", async () => {
     /duration|时长/,
   );
 });
+
+test("拼接失败或最终探测失败会清理部分输出", async () => {
+  const ffmpegWorkspace = workspace();
+  const segment = path.join(ffmpegWorkspace, "segment.wav");
+  fs.writeFileSync(segment, Buffer.from("segment"));
+  await assert.rejects(
+    concatenateVoiceSegments([segment], {
+      workspace: ffmpegWorkspace,
+      execFile: async (_command, args) => {
+        fs.writeFileSync(args.at(-1), Buffer.from("partial"));
+        throw new Error("ffmpeg failed");
+      },
+    }),
+    /ffmpeg.*失败/,
+  );
+  assert.deepEqual(fs.readdirSync(ffmpegWorkspace).sort(), ["segment.wav"]);
+
+  const probeWorkspace = workspace();
+  const probeSegment = path.join(probeWorkspace, "segment.wav");
+  fs.writeFileSync(probeSegment, Buffer.from("segment"));
+  let call = 0;
+  await assert.rejects(
+    concatenateVoiceSegments([probeSegment], {
+      workspace: probeWorkspace,
+      execFile: async (_command, args) => {
+        call += 1;
+        if (call === 1) {
+          fs.writeFileSync(args.at(-1), Buffer.from("partial"));
+          return { stdout: "" };
+        }
+        return { stdout: "N/A\n" };
+      },
+    }),
+    /duration|时长/,
+  );
+  assert.deepEqual(fs.readdirSync(probeWorkspace).sort(), ["segment.wav"]);
+});
+
+test("拼接与最终探测共用注入 execFile，并传递有界超时", async () => {
+  const audioWorkspace = workspace();
+  const segment = path.join(audioWorkspace, "segment.wav");
+  fs.writeFileSync(segment, Buffer.from("segment"));
+  const calls = [];
+  const output = await concatenateVoiceSegments([segment], {
+    workspace: audioWorkspace,
+    processTimeoutMs: 4321,
+    execFile: async (command, args, options) => {
+      calls.push({ command, args, options });
+      if (calls.length === 1) fs.writeFileSync(args.at(-1), Buffer.from("output"));
+      return { stdout: calls.length === 2 ? "0.250\n" : "" };
+    },
+  });
+  assert.ok(fs.existsSync(output));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((item) => item.command), ["ffmpeg", "ffprobe"]);
+  assert.ok(calls.every((item) => item.options.timeout === 4321));
+});
+
+test("拼接进程超时会抛错并清理输出", async () => {
+  const audioWorkspace = workspace();
+  const segment = path.join(audioWorkspace, "segment.wav");
+  fs.writeFileSync(segment, Buffer.from("segment"));
+  let observedTimeout;
+  await assert.rejects(
+    concatenateVoiceSegments([segment], {
+      workspace: audioWorkspace,
+      processTimeoutMs: 25,
+      execFile: async (_command, args, options) => {
+        observedTimeout = options.timeout;
+        fs.writeFileSync(args.at(-1), Buffer.from("partial"));
+        const error = new Error("timed out");
+        error.code = "ETIMEDOUT";
+        throw error;
+      },
+    }),
+    /ffmpeg.*失败|timed out/,
+  );
+  assert.equal(observedTimeout, 25);
+  assert.deepEqual(fs.readdirSync(audioWorkspace).sort(), ["segment.wav"]);
+});

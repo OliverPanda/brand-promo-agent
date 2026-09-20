@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { artifactPaths } from "../src/media/artifacts.js";
 
 const { test, after } = await import("node:test");
@@ -52,6 +53,9 @@ function makeWav(durationSec, frequency) {
 const DEFAULT_SPEECH = makeWav(0.25, 440);
 const DEFAULT_MUSIC = makeWav(1, 220);
 let speechResponses = [];
+let failSpeechAt = 0;
+let speechCallIndex = 0;
+let invalidMusicResponse = false;
 after(() => fs.rmSync(mediaRoot, { recursive: true, force: true }));
 
 // ── fetch mock 基础设施 ──
@@ -101,9 +105,12 @@ function route(path, body) {
     return makeRes({ json: { data: [{ url: "https://cdn.example/scene.png" }] } });
   }
   if (path.endsWith("/audio/speech")) {
+    speechCallIndex += 1;
+    if (speechCallIndex === failSpeechAt) return makeRes({ ok: false, status: 500, text: "tts failed" });
     return makeRes({ bytes: speechResponses.length ? speechResponses.shift() : DEFAULT_SPEECH });
   }
   if (path.endsWith("/audio/music")) {
+    if (invalidMusicResponse) return makeRes({ json: { data: [{ b64_json: Buffer.from("invalid").toString("base64") }] } });
     return makeRes({ json: { data: [{ b64_json: DEFAULT_MUSIC.toString("base64") }] } });
   }
   return makeRes({ ok: false, status: 404, text: "not found" });
@@ -339,6 +346,54 @@ test("generateVoiceover OpenAI TTS 才携带 response_format，空文本与空�
   );
 });
 
+test("逐句 TTS 第 N 次失败时异常保留此前已付费用量", async () => {
+  speechCallIndex = 0;
+  failSpeechAt = 2;
+  try {
+    await assert.rejects(
+      generateVoiceover(
+        { voiceover: [{ text: "已成功" }, { text: "此句失败" }, { text: "不会调用" }] },
+        baseBrief,
+        { workspace: audioWorkspace() },
+      ),
+      (error) => {
+        assert.match(error.message, /500|failed/);
+        assert.equal(error._usage.requests, 1);
+        assert.ok(error._usage.minutes > 0);
+        return true;
+      },
+    );
+  } finally {
+    failSpeechAt = 0;
+  }
+});
+
+test("TTS 与配乐付费响应在物化失败时把部分用量附到异常", async () => {
+  speechCallIndex = 0;
+  speechResponses = [Buffer.from("invalid audio")];
+  await assert.rejects(
+    generateVoiceover({ voiceover: [{ text: "已付费但坏音频" }] }, baseBrief, { workspace: audioWorkspace() }),
+    (error) => {
+      assert.equal(error._usage.requests, 1);
+      assert.ok(error._usage.minutes > 0);
+      return true;
+    },
+  );
+
+  invalidMusicResponse = true;
+  try {
+    await assert.rejects(
+      generateMusic(baseBrief, [], { workspace: audioWorkspace() }),
+      (error) => {
+        assert.equal(error._usage.tracks, 1);
+        return true;
+      },
+    );
+  } finally {
+    invalidMusicResponse = false;
+  }
+});
+
 test("generateStoryboard 真实模式：prompt 注入全局语言（en → Output in English）", async () => {
   calls = [];
   const script = await generateScript({ ...baseBrief, language: "en" });
@@ -419,6 +474,34 @@ test("composite 真实模式无 FFmpeg：优雅降级为分镜包（含 reason�
   assert.equal(comp.model, "demo-composite");
   assert.match(comp.note, /未配置 PROMO_FFMPEG_BIN/);
   assert.ok(Array.isArray(comp.storyboardGallery) && comp.storyboardGallery.length === 2);
+});
+
+test("provider 产出的 file:// 配音与配乐进入现有 compositor 音频流", async () => {
+  const previousFfmpeg = process.env.PROMO_FFMPEG_BIN;
+  process.env.PROMO_FFMPEG_BIN = "ffmpeg";
+  const pngFile = path.join(mediaRoot, "provider-composite.png");
+  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180", "-frames:v", "1", pngFile], { stdio: "pipe" });
+  const scenes = [{
+    index: 1,
+    subtitle: "真实音频",
+    mediaUrl: `data:image/png;base64,${fs.readFileSync(pngFile).toString("base64")}`,
+    durationSec: 1,
+  }];
+  try {
+    const audioDir = audioWorkspace();
+    const voice = await generateVoiceover({ voiceover: [{ text: "真实音频" }] }, baseBrief, { workspace: audioDir });
+    const music = await generateMusic(baseBrief, scenes, { workspace: audioDir });
+    const out = await composite(scenes, voice, music, baseBrief);
+    assert.equal(out.model, "ffmpeg", out.note);
+    const outputFile = fileURLToPath(out.videoUrl);
+    const stream = execFileSync("ffprobe", [
+      "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", outputFile,
+    ], { stdio: "pipe" }).toString().trim();
+    assert.equal(stream, "audio");
+  } finally {
+    if (previousFfmpeg === undefined) delete process.env.PROMO_FFMPEG_BIN;
+    else process.env.PROMO_FFMPEG_BIN = previousFfmpeg;
+  }
 });
 
 test("one-api 未配置时真实 Provider 抛错（缺 base/key）", async () => {

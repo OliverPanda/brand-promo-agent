@@ -2,6 +2,7 @@
  * @file 真实音频探测、拼接与字幕时间轴。
  * @description 以 ffprobe 实测语音时长生成权威场景时长和 UTF-8 SRT。
  */
+import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
@@ -11,6 +12,7 @@ import { MEDIA_LIMITS, validateManagedDirectory } from "./artifacts.js";
 
 const execFileAsync = promisify(execFileCallback);
 const ILLEGAL_CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu;
+const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
 
 function cleanSubtitleText(value) {
   return String(value ?? "").replace(ILLEGAL_CONTROL_CHARACTERS, "").replace(/\r\n?/gu, "\n");
@@ -64,7 +66,7 @@ function allocateCueDurations(durationMs, characterCounts, lineIndex) {
 /**
  * 使用 ffprobe 读取真实音频容器时长。
  * @param {string} filePath 本地音频绝对路径。
- * @param {{ffprobeBin?: string, execFile?: Function}} [options] 可执行文件与测试边界。
+ * @param {{ffprobeBin?: string, execFile?: Function, processTimeoutMs?: number}} [options] 可执行文件、超时与测试边界。
  * @returns {Promise<number>} 精确到 ffprobe 输出能力的秒数。
  * @throws {Error} ffprobe 失败或返回无效 duration 时抛出。
  * @example await probeAudioDuration("D:/outputs/run/audio/voice.wav");
@@ -72,6 +74,9 @@ function allocateCueDurations(durationMs, characterCounts, lineIndex) {
 export async function probeAudioDuration(filePath, options = {}) {
   const ffprobeBin = options.ffprobeBin || process.env.PROMO_FFPROBE_BIN || "ffprobe";
   const execute = options.execFile || execFileAsync;
+  const processTimeoutMs = options.processTimeoutMs
+    ?? Number(process.env.PROMO_MEDIA_PROCESS_TIMEOUT_MS || DEFAULT_PROCESS_TIMEOUT_MS);
+  if (!Number.isFinite(processTimeoutMs) || processTimeoutMs <= 0) throw new Error("媒体进程超时必须是正数毫秒");
   let result;
   try {
     result = await execute(ffprobeBin, [
@@ -79,7 +84,7 @@ export async function probeAudioDuration(filePath, options = {}) {
       "-show_entries", "format=duration",
       "-of", "default=noprint_wrappers=1:nokey=1",
       filePath,
-    ], { encoding: "utf8", windowsHide: true, maxBuffer: 1024 * 1024 });
+    ], { encoding: "utf8", windowsHide: true, maxBuffer: 1024 * 1024, timeout: processTimeoutMs, killSignal: "SIGKILL" });
   } catch (error) {
     throw new Error(`ffprobe 音频探测失败：${error?.message || error}`, { cause: error });
   }
@@ -91,7 +96,7 @@ export async function probeAudioDuration(filePath, options = {}) {
 /**
  * 依序拼接语音片段，并在相邻片段之间插入固定静音。
  * @param {string[]} segmentPaths 已物化且已探测的本地语音片段。
- * @param {{workspace: string, ffmpegBin?: string, ffprobeBin?: string, execFile?: Function}} options 受管音频目录与媒体工具边界。
+ * @param {{workspace: string, ffmpegBin?: string, ffprobeBin?: string, execFile?: Function, processTimeoutMs?: number}} options 受管音频目录与媒体工具边界。
  * @returns {Promise<string>} 已再次通过 ffprobe 的本地 WAV 路径。
  * @throws {Error} 输入为空、工作区不可信或 ffmpeg/ffprobe 失败时抛出。
  * @example await concatenateVoiceSegments(paths, { workspace: artifactPaths("run-1").audio });
@@ -101,6 +106,9 @@ export async function concatenateVoiceSegments(segmentPaths, options) {
   const workspace = validateManagedDirectory(options?.workspace);
   const ffmpegBin = options.ffmpegBin || process.env.PROMO_FFMPEG_BIN || "ffmpeg";
   const execute = options.execFile || execFileAsync;
+  const processTimeoutMs = options.processTimeoutMs
+    ?? Number(process.env.PROMO_MEDIA_PROCESS_TIMEOUT_MS || DEFAULT_PROCESS_TIMEOUT_MS);
+  if (!Number.isFinite(processTimeoutMs) || processTimeoutMs <= 0) throw new Error("媒体进程超时必须是正数毫秒");
   const target = path.join(workspace, `voice-${randomUUID()}.wav`);
   const args = ["-y"];
   for (const segmentPath of segmentPaths) args.push("-i", segmentPath);
@@ -119,12 +127,24 @@ export async function concatenateVoiceSegments(segmentPaths, options) {
   filters.push(`${concatInputs.join("")}concat=n=${concatInputs.length}:v=0:a=1[out]`);
   args.push("-filter_complex", filters.join(";"), "-map", "[out]", "-c:a", "pcm_s16le", target);
   try {
-    await execute(ffmpegBin, args, { encoding: "utf8", windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+    await execute(ffmpegBin, args, {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: processTimeoutMs,
+      killSignal: "SIGKILL",
+    });
+    await probeAudioDuration(target, {
+      ffprobeBin: options.ffprobeBin,
+      execFile: execute,
+      processTimeoutMs,
+    });
+    return target;
   } catch (error) {
+    await fs.promises.rm(target, { force: true });
+    if (/^ffprobe /u.test(String(error?.message || ""))) throw error;
     throw new Error(`ffmpeg 语音拼接失败：${error?.message || error}`, { cause: error });
   }
-  await probeAudioDuration(target, { ffprobeBin: options.ffprobeBin });
-  return target;
 }
 
 /**

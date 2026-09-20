@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import { composite } from "../src/mastra/providers.js";
 
@@ -96,7 +97,8 @@ test("composite 真实合成 B：全镜动态片段 concat 直拼 + 配音 → M
     { index: 2, subtitle: "动态镜2", mediaUrl: svgDataUrl(2, "#dc2626"), videoUrl: genTestMp4(2, "0xdc2626", v2), durationSec: 2 },
   ];
   try {
-    const voice = { voiceUrl: genSilentMp3(4, voiceMp3), srt: "", voiceTone: "男声" };
+    genSilentMp3(4, voiceMp3);
+    const voice = { voicePath: voiceMp3, srt: "", voiceTone: "男声" };
     const out = await composite(scenes, voice, undefined, brief);
     assert.equal(out.model, "ffmpeg", "real + ffmpeg 应走真实合成");
     assert.ok(out.videoUrl?.startsWith("file://"), `应产出 file:// 视频（实际 ${out.videoUrl}）`);
@@ -105,6 +107,8 @@ test("composite 真实合成 B：全镜动态片段 concat 直拼 + 配音 → M
     const { dur, fmt } = probe(file);
     assert.match(fmt, /mp4|mov/);
     assert.ok(parseFloat(dur) >= 3.5, `两段 2s 片段拼接应≈4s（实际 ${dur}s）`);
+    const audioStream = execFileSync("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file], { stdio: "pipe" }).toString().trim();
+    assert.equal(audioStream, "audio");
   } finally {
     process.env.PROMO_PROVIDER_MODE = prevMode;
     process.env.PROMO_FFMPEG_BIN = prevFfmpeg;
@@ -117,8 +121,10 @@ test("composite 真实合成 C：动态片段 + 超长配乐 → 成片以画面
   const v1 = path.join(tmp, "c1.mp4");
   const scenes = [{ index: 1, subtitle: "动态镜1", mediaUrl: svgDataUrl(1, "#6366f1"), videoUrl: genTestMp4(2, "0x6366f1", v1), durationSec: 2 }];
   try {
-    const voice = { voiceUrl: genSilentMp3(2, voiceMp3), srt: "", voiceTone: "男声" };
-    const music = { musicUrl: genSilentMp3(20, musicMp3), mood: "科技感" }; // 配乐 20s ≫ 画面 2s
+    genSilentMp3(2, voiceMp3);
+    genSilentMp3(20, musicMp3);
+    const voice = { voiceUrl: pathToFileURL(voiceMp3).href, srt: "", voiceTone: "男声" };
+    const music = { musicUrl: pathToFileURL(musicMp3).href, mood: "科技感" }; // 配乐 20s ≫ 画面 2s
     const out = await composite(scenes, voice, music, brief);
     assert.equal(out.model, "ffmpeg", "real + ffmpeg 应走真实合成");
     const file = out.videoUrl.slice(7);
