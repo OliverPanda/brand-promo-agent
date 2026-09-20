@@ -15,8 +15,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { artifactPaths } from "../src/media/artifacts.js";
 
-const { test } = await import("node:test");
+const { test, after } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
 const providers = await import("../src/mastra/providers.js");
 const {
@@ -28,6 +29,30 @@ const {
   generateMusic,
   composite,
 } = providers;
+
+const mediaRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-provider-audio-"));
+let audioRunIndex = 0;
+function audioWorkspace() {
+  const previous = process.env.PROMO_DATA_DIR;
+  process.env.PROMO_DATA_DIR = mediaRoot;
+  try {
+    return artifactPaths(`provider-audio-${audioRunIndex += 1}`).audio;
+  } finally {
+    if (previous === undefined) delete process.env.PROMO_DATA_DIR;
+    else process.env.PROMO_DATA_DIR = previous;
+  }
+}
+
+function makeWav(durationSec, frequency) {
+  const file = path.join(mediaRoot, `fixture-${durationSec}-${frequency}.wav`);
+  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", `sine=frequency=${frequency}:duration=${durationSec}`, "-c:a", "pcm_s16le", file], { stdio: "pipe" });
+  return fs.readFileSync(file);
+}
+
+const DEFAULT_SPEECH = makeWav(0.25, 440);
+const DEFAULT_MUSIC = makeWav(1, 220);
+let speechResponses = [];
+after(() => fs.rmSync(mediaRoot, { recursive: true, force: true }));
 
 // ── fetch mock 基础设施 ──
 let calls = [];
@@ -76,10 +101,10 @@ function route(path, body) {
     return makeRes({ json: { data: [{ url: "https://cdn.example/scene.png" }] } });
   }
   if (path.endsWith("/audio/speech")) {
-    return makeRes({ bytes: [0x49, 0x44, 0x33, 0x03] }); // 伪造 mp3 字节
+    return makeRes({ bytes: speechResponses.length ? speechResponses.shift() : DEFAULT_SPEECH });
   }
   if (path.endsWith("/audio/music")) {
-    return makeRes({ json: { data: [{ url: "https://cdn.example/bgm.mp3" }] } });
+    return makeRes({ json: { data: [{ b64_json: DEFAULT_MUSIC.toString("base64") }] } });
   }
   return makeRes({ ok: false, status: 404, text: "not found" });
 }
@@ -255,26 +280,63 @@ test("generateSceneMedia 参考图为纯关键词 → 追加到 prompt（M2 行�
   assert.match(calls[calls.length - 1].body.prompt, /赛博朋克/, "关键词应拼入 prompt");
 });
 
-test("generateVoiceover 真实模式：POST /audio/speech 二进制 + data URI + _usage.minutes", async () => {
+test("generateVoiceover 真实模式：每句调用 TTS、物化探测、拼接并聚合真实用量", async () => {
   calls = [];
-  const script = await generateScript(baseBrief);
-  const v = await generateVoiceover(script, baseBrief);
-  assert.match(calls[calls.length - 1].url, /\/audio\/speech$/);
-  assert.equal(calls[calls.length - 1].body.voice, "onyx"); // 男声 → onyx（OpenAI 标准名，MiniMax 兼容渠道可识别）
-  assert.equal(calls[calls.length - 1].body.response_format, undefined, "非 OpenAI 原生 TTS 不应带 response_format（MiniMax 会 406）");
-  assert.match(v.voiceUrl, /^data:audio\/mp3;base64,/);
-  assert.ok(v.srt.includes("-->"));
-  assert.ok(v._usage.minutes > 0);
+  speechResponses = [makeWav(1.4, 440), makeWav(2.1, 660)];
+  const script = { voiceover: [
+    { timecode: "错误时间", text: "第一句" },
+    { timecode: "99:99:99.999", text: "第二句" },
+  ] };
+  const v = await generateVoiceover(script, { ...baseBrief, ttsModel: "speech-02-hd" }, { workspace: audioWorkspace() });
+  const ttsCalls = calls.filter((call) => call.url.endsWith("/audio/speech"));
+  assert.equal(ttsCalls.length, 2);
+  assert.deepEqual(ttsCalls.map((call) => call.body.input), ["第一句", "第二句"]);
+  assert.ok(ttsCalls.every((call) => call.body.model === "speech-02-hd"));
+  assert.ok(ttsCalls.every((call) => call.body.voice === "onyx"));
+  assert.ok(ttsCalls.every((call) => call.body.response_format === undefined), "非 OpenAI 原生 TTS 不应带 response_format");
+  assert.ok(fs.existsSync(v.voicePath));
+  assert.deepEqual(v.sceneDurationsMs, [1520, 2100]);
+  assert.equal(v.durationSec, 3.62);
+  assert.match(v.srt, /00:00:01,520 --> 00:00:03,620/);
+  assert.equal(v.model, "speech-02-hd");
+  assert.equal(v._usage.requests, 2);
+  assert.ok(Math.abs(v._usage.minutes - 3.5 / 60) < 0.001);
 });
 
 test("generateVoiceover 真实模式：TTS 请求体携带 language（多语言 FR-12）", async () => {
   calls = [];
   const script = await generateScript({ ...baseBrief, language: "en" });
-  const v = await generateVoiceover(script, { ...baseBrief, language: "en" });
+  const v = await generateVoiceover(script, { ...baseBrief, language: "en" }, { workspace: audioWorkspace() });
   const last = calls[calls.length - 1];
   assert.match(last.url, /\/audio\/speech$/);
   assert.equal(last.body.language, "en");
-  assert.match(v.voiceUrl, /^data:audio\/mp3;base64,/);
+  assert.ok(fs.existsSync(v.voicePath));
+});
+
+test("generateVoiceover OpenAI TTS 才携带 response_format，空文本与空响应失败", async () => {
+  calls = [];
+  await generateVoiceover(
+    { voiceover: [{ text: "OpenAI" }] },
+    { ...baseBrief, ttsModel: "tts-1-hd" },
+    { workspace: audioWorkspace() },
+  );
+  assert.equal(calls.find((call) => call.url.endsWith("/audio/speech")).body.response_format, "mp3");
+  calls = [];
+  await generateVoiceover(
+    { voiceover: [{ text: "非 OpenAI 名称" }] },
+    { ...baseBrief, ttsModel: "proxy-gpt-4o-mini-tts-clone" },
+    { workspace: audioWorkspace() },
+  );
+  assert.equal(calls.find((call) => call.url.endsWith("/audio/speech")).body.response_format, undefined);
+  await assert.rejects(
+    generateVoiceover({ voiceover: [{ text: "" }] }, baseBrief, { workspace: audioWorkspace() }),
+    /空|文本/,
+  );
+  speechResponses = [Buffer.alloc(0)];
+  await assert.rejects(
+    generateVoiceover({ voiceover: [{ text: "有文本" }] }, baseBrief, { workspace: audioWorkspace() }),
+    /空|音频|媒体/,
+  );
 });
 
 test("generateStoryboard 真实模式：prompt 注入全局语言（en → Output in English）", async () => {
@@ -339,10 +401,11 @@ test("generateMusic 真实模式：POST /audio/music + 返回 url + _usage.track
   calls = [];
   const script = await generateScript(baseBrief);
   const scenes = await generateStoryboard(baseBrief, script);
-  const m = await generateMusic(baseBrief, scenes);
+  const m = await generateMusic({ ...baseBrief, musicModel: "mureka-v1" }, scenes, { workspace: audioWorkspace() });
   assert.match(calls[calls.length - 1].url, /\/audio\/music$/);
   assert.equal(calls[calls.length - 1].body.model, "mureka-v1");
-  assert.equal(m.musicUrl, "https://cdn.example/bgm.mp3");
+  assert.ok(fs.existsSync(m.musicPath));
+  assert.ok(m.durationSec > 0.9);
   assert.equal(m._usage.tracks, 1);
 });
 
@@ -350,8 +413,8 @@ test("composite 真实模式无 FFmpeg：优雅降级为分镜包（含 reason�
   delete process.env.PROMO_FFMPEG_BIN;
   const script = await generateScript(baseBrief);
   const scenes = await generateStoryboard(baseBrief, script);
-  const v = await generateVoiceover(script, baseBrief);
-  const m = await generateMusic(baseBrief, scenes);
+  const v = await generateVoiceover(script, baseBrief, { workspace: audioWorkspace() });
+  const m = await generateMusic(baseBrief, scenes, { workspace: audioWorkspace() });
   const comp = await composite(scenes, v, m, baseBrief);
   assert.equal(comp.model, "demo-composite");
   assert.match(comp.note, /未配置 PROMO_FFMPEG_BIN/);

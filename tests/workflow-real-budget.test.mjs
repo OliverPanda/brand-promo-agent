@@ -15,6 +15,28 @@ process.env.PROMO_BUDGET_CAP = "100"; // 充足预算，确保成功路径
 const { test } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
 
+function silentWav(durationSec = 0.25) {
+  const sampleRate = 8_000;
+  const samples = Math.round(sampleRate * durationSec);
+  const dataBytes = samples * 2;
+  const buffer = Buffer.alloc(44 + dataBytes);
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataBytes, 4);
+  buffer.write("WAVEfmt ", 8);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataBytes, 40);
+  return buffer;
+}
+
+const AUDIO_FIXTURE = silentWav();
+
 // ── fetch mock（与 providers-real 同形）──
 function makeRes({ ok = true, status = 200, json, text, bytes } = {}) {
   return {
@@ -46,8 +68,8 @@ function route(path, body) {
     ] }) } }], usage: { total_tokens: 200 } } });
   }
   if (path.endsWith("/images/generations")) return makeRes({ json: { data: [{ url: "https://cdn.example/scene.png" }] } });
-  if (path.endsWith("/audio/speech")) return makeRes({ bytes: [0x49, 0x44, 0x33, 0x03] });
-  if (path.endsWith("/audio/music")) return makeRes({ json: { data: [{ url: "https://cdn.example/bgm.mp3" }] } });
+  if (path.endsWith("/audio/speech")) return makeRes({ bytes: AUDIO_FIXTURE });
+  if (path.endsWith("/audio/music")) return makeRes({ json: { data: [{ b64_json: AUDIO_FIXTURE.toString("base64") }] } });
   return makeRes({ ok: false, status: 404, text: "not found" });
 }
 // 关键：只把 one-api 域名的请求路由到 mock；localhost（测试用 HTTP 客户端 / SSE）走真实 fetch。

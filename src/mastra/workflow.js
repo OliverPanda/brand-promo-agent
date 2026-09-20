@@ -444,7 +444,7 @@ const voiceover = createStep({
     return withStep(rid, STEP.VOICE, async () => {
       // 配音渠道缺失/调用失败不阻断成片：置 voice=null 降级（合成可出静音片），把原因挂到 run.note。
       try {
-        const voice = await generateVoiceover(script, brief);
+        const voice = await generateVoiceover(script, brief, { workspace: artifactPaths(rid).audio });
         updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt });
         return { brief, script, storyboard, voice, runId: rid, _usage: voice._usage };
       } catch (e) {
@@ -463,7 +463,7 @@ const music = createStep({
     const { brief, script, storyboard, voice } = inputData;
     return withStep(rid, STEP.MUSIC, async () => {
       try {
-        const music = await generateMusic(brief, storyboard);
+        const music = await generateMusic(brief, storyboard, { workspace: artifactPaths(rid).audio });
         updateRun(rid, { musicUrl: music.musicUrl });
         return { brief, script, storyboard, voice, music, runId: rid, _usage: music._usage };
       } catch (e) {

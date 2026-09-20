@@ -11,6 +11,9 @@ import { encodeSVG } from "./svg.js";
 import { withGlobalLanguage } from "../i18n.js";
 import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey } from "../runtime-config.js";
 import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
+import { materializeMedia } from "../media/materialize.js";
+import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration } from "../media/audio.js";
+import { pathToFileURL } from "node:url";
 
 // ───────────────────────── 模式判定 ─────────────────────────
 // 生效顺序：运行时配置（页面「模型与服务」保存的 providerMode）> env（PROMO_PROVIDER_MODE=real）；
@@ -498,22 +501,59 @@ function demoSceneVideo(scene, brief) {
 }
 
 // ───────────────────────── 4) TTS 配音 ─────────────────────────
-export async function generateVoiceover(script, brief) {
+/**
+ * 按确认脚本逐句生成真实配音，并用实测时长生成权威字幕时间轴。
+ * @param {{voiceover?: Array<{text?: string}>}} script 已确认脚本。
+ * @param {Record<string, any>} brief 已解析 Brief，优先消费 ttsModel 与画布配置。
+ * @param {{workspace?: string}} [options] `artifactPaths(runId).audio` 受管音频目录。
+ * @returns {Promise<{voicePath?: string, voiceUrl: string|null, cues?: Array, srt: string, durationSec?: number, sceneDurationsMs?: number[], voiceTone: string, model: string, _usage?: object}>} 配音及权威时间轴。
+ * @throws {Error} 真实模式缺少工作区、文本为空、响应为空或音频不可解码时抛出。
+ * @example await generateVoiceover(script, brief, { workspace: paths.audio });
+ */
+export async function generateVoiceover(script, brief, options = {}) {
   if (getProviderMode() !== "real") return demoVoiceover(script, brief);
-  const model = process.env.PROMO_TTS_MODEL || "tiny-iceberg";
-  const text = (script?.voiceover || []).map((v) => v.text).join("\n");
+  const model = brief.ttsModel || process.env.PROMO_TTS_MODEL || "speech-02-hd";
+  const lines = (script?.voiceover || []).map((item) => String(item?.text ?? ""));
+  if (lines.length === 0 || lines.some((line) => line.replace(/[\u0000-\u0020\u007F]/gu, "").length === 0)) {
+    throw new Error("确认脚本的逐句旁白文本不能为空");
+  }
+  if (!options.workspace) throw new Error("真实配音必须提供受管 audio workspace");
   // response_format 是 OpenAI 专属字段：MiniMax speech 系上游只认自己的 output_format(hex|url)，带它会 406。
   // 仅在 OpenAI 原生系模型名（tts-1*/gpt-4o-mini-tts）时携带，其余（speech-* 等）不带，网关默认 mp3。
-  const openaiTts = /^tts-|gpt-4o-mini-tts/.test(model);
-  const body = { model, input: text, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN" };
-  if (openaiTts) body.response_format = "mp3";
-  const audio = await oneApiPost("/audio/speech", body, { isBinary: true });
-  const voiceUrl = `data:audio/mp3;base64,${audio.toString("base64")}`;
-  const srt = (script?.voiceover || [])
-    .map((v, i) => `${i + 1}\n${v.timecode} --> ${fmtTC((i + 1) * 3)}\n${v.text}\n`)
-    .join("\n");
-  const minutes = (script?.voiceover?.length || 1) * 3 / 60;
-  return { voiceUrl, srt, voiceTone: brief.voiceTone || "男声", model, _usage: { minutes } };
+  const openaiTts = /^(?:tts-|gpt-4o-mini-tts(?:$|-))/i.test(model);
+  const segmentPaths = [];
+  const speechDurationsSec = [];
+  for (const input of lines) {
+    const body = { model, input, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN" };
+    if (openaiTts) body.response_format = "mp3";
+    const audio = await oneApiPost("/audio/speech", body, { isBinary: true });
+    if (!Buffer.isBuffer(audio) || audio.length === 0) throw new Error("TTS 返回空音频响应");
+    const source = `data:audio/mpeg;base64,${audio.toString("base64")}`;
+    const segmentPath = await materializeMedia({ source, kind: "audio", workspace: options.workspace });
+    const durationSec = await probeAudioDuration(segmentPath);
+    segmentPaths.push(segmentPath);
+    speechDurationsSec.push(durationSec);
+  }
+  const voicePath = await concatenateVoiceSegments(segmentPaths, { workspace: options.workspace });
+  const concatenatedDuration = await probeAudioDuration(voicePath);
+  const canvas = resolveCanvas(brief.canvasPreset);
+  const timeline = buildVoiceTimeline(lines, speechDurationsSec, { maxCharsPerLine: canvas.subtitle.maxCharsPerLine });
+  if (Math.abs(concatenatedDuration - timeline.durationSec) > 0.08) {
+    throw new Error(`拼接语音时长与权威时间轴不一致：${concatenatedDuration}s / ${timeline.durationSec}s`);
+  }
+  const srt = formatSrt(timeline.cues, timeline.durationSec);
+  const speechSeconds = speechDurationsSec.reduce((sum, value) => sum + value, 0);
+  return {
+    voicePath,
+    voiceUrl: pathToFileURL(voicePath).href,
+    cues: timeline.cues,
+    srt,
+    durationSec: timeline.durationSec,
+    sceneDurationsMs: timeline.sceneDurationsMs,
+    voiceTone: brief.voiceTone || "男声",
+    model,
+    _usage: { minutes: speechSeconds / 60, audioSeconds: speechSeconds, requests: lines.length },
+  };
 }
 
 function demoVoiceover(script, brief) {
@@ -524,15 +564,35 @@ function demoVoiceover(script, brief) {
 }
 
 // ───────────────────────── 5) 音乐（Mureka 桥 / one-api 音乐通道） ─────────────────────────
-export async function generateMusic(brief, storyboard) {
+/**
+ * 生成配乐并物化、探测真实音频文件；本阶段不执行最终混音。
+ * @param {Record<string, any>} brief 已解析 Brief，优先消费 musicModel。
+ * @param {Array} storyboard 分镜上下文。
+ * @param {{workspace?: string}} [options] `artifactPaths(runId).audio` 受管音频目录。
+ * @returns {Promise<{musicPath?: string, musicUrl: string|null, durationSec?: number, mood: string, model: string, _usage?: object}>} 配乐素材。
+ * @throws {Error} 真实模式响应无音频或不可解码时抛出。
+ * @example await generateMusic(brief, scenes, { workspace: paths.audio });
+ */
+export async function generateMusic(brief, storyboard, options = {}) {
   if (getProviderMode() !== "real") return demoMusic(brief);
-  const model = process.env.PROMO_MUSIC_MODEL || "mureka-v1";
+  if (!options.workspace) throw new Error("真实配乐必须提供受管 audio workspace");
+  const model = brief.musicModel || process.env.PROMO_MUSIC_MODEL || "mureka-v1";
   const path = process.env.PROMO_MUSIC_PATH || "/audio/music";
   const prompt = `背景音乐：${(brief.tones || ["专业"]).join("/")}风格，匹配宣传片情绪曲线`;
   const data = await oneApiPost(path, { model, prompt, lyrics: "", instrumental: true });
   const item = data.data?.[0] || {};
   const musicUrl = item.url || (item.b64_json ? `data:audio/mp3;base64,${item.b64_json}` : null);
-  return { musicUrl, mood: (brief.tones || ["专业"]).join("/"), model, _usage: { tracks: 1 } };
+  if (!musicUrl) throw new Error("配乐服务返回空音频响应");
+  const musicPath = await materializeMedia({ source: musicUrl, kind: "audio", workspace: options.workspace });
+  const durationSec = await probeAudioDuration(musicPath);
+  return {
+    musicPath,
+    musicUrl: pathToFileURL(musicPath).href,
+    durationSec,
+    mood: (brief.tones || ["专业"]).join("/"),
+    model,
+    _usage: { tracks: 1, audioSeconds: durationSec },
+  };
 }
 
 function demoMusic(brief) {
