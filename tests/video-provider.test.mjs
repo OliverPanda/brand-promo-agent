@@ -73,6 +73,10 @@ test("generateSceneVideo：同步返回 {data:[{url}]}（图生视频 image 已�
     assert.deepEqual(out._usage, { videos: 1 });
     assert.equal(gotBody.model, "kling-v1-6");
     assert.equal(gotBody.image, "https://cdn.example.com/s1.png", "应带场景图 URL 走图生视频");
+    assert.equal(gotBody.aspect_ratio, "9:16");
+    assert.equal(gotBody.width, 1080);
+    assert.equal(gotBody.height, 1920);
+    assert.equal(gotBody.size, "1080x1920");
     assert.match(gotBody.prompt, /#6366f1/, "logoColor 应注入 prompt");
   } finally {
     stub.close();
@@ -282,5 +286,31 @@ test("generateSceneVideo：DEMO 模式返回 stub（不产生网络调用）", a
   } finally {
     if (before === undefined) delete process.env.PROMO_PROVIDER_MODE;
     else process.env.PROMO_PROVIDER_MODE = before;
+  }
+});
+
+test("generateSceneVideo：横屏画布尺寸与比例进入 provider payload", async () => {
+  let gotBody = null;
+  const stub = await listen(async (req, res) => {
+    if (req.method === "POST" && req.url === "/videos/generations") {
+      gotBody = await readBody(req);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ url: "https://cdn.example.com/landscape.mp4" }));
+    } else {
+      res.statusCode = 404; res.end();
+    }
+  });
+  try {
+    await withReal(stub, () => generateSceneVideo(scene, {
+      ...brief,
+      videoModel: "kling-v1-6",
+      canvasPreset: "social-landscape",
+    }));
+    assert.equal(gotBody.aspect_ratio, "16:9");
+    assert.equal(gotBody.width, 1920);
+    assert.equal(gotBody.height, 1080);
+    assert.equal(gotBody.size, "1920x1080");
+  } finally {
+    stub.close();
   }
 });

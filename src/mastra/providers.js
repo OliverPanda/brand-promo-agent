@@ -12,8 +12,10 @@ import { withGlobalLanguage } from "../i18n.js";
 import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey } from "../runtime-config.js";
 import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
 import { materializeMedia } from "../media/materialize.js";
+import { normalizeSceneImage, normalizeSceneVideo } from "../media/ffmpeg.js";
 import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration } from "../media/audio.js";
 import { MEDIA_LIMITS } from "../media/artifacts.js";
+import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // ───────────────────────── 模式判定 ─────────────────────────
@@ -334,7 +336,15 @@ function demoStoryboard(brief, script) {
 }
 
 // ───────────────────────── 3) 图像/视频素材 ─────────────────────────
-export async function generateSceneMedia(scene, brief) {
+/**
+ * 生成场景图；传入受管目录时立即物化并归一化为所选画布。
+ * @param {Record<string, any>} scene 场景描述，归一化成功后写入 `mediaPath`。
+ * @param {Record<string, any>} brief 已解析 Brief。
+ * @param {{inputsWorkspace?: string, scenesWorkspace?: string}} [options] `artifactPaths(runId)` 提供的受管目录。
+ * @returns {Promise<{mediaPath?: string, mediaUrl: string, kind: string, model: string, _usage?: object}>} 标准场景图或 DEMO 媒体。
+ * @example await generateSceneMedia(scene, brief, { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes });
+ */
+export async function generateSceneMedia(scene, brief, options = {}) {
   if (getProviderMode() !== "real") return demoSceneMedia(scene, brief);
   const model = brief.imageModel || process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
   const canvas = resolveCanvas(brief.canvasPreset);
@@ -367,6 +377,17 @@ export async function generateSceneMedia(scene, brief) {
   const data = await oneApiPost("/images/generations", body);
   const item = data.data?.[0] || {};
   const mediaUrl = item.url || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null);
+  if (!mediaUrl) throw new Error("图像服务返回空媒体响应");
+  if (options.inputsWorkspace && options.scenesWorkspace) {
+    const mediaPath = await normalizeSceneImage({
+      source: mediaUrl,
+      inputsWorkspace: options.inputsWorkspace,
+      scenesWorkspace: options.scenesWorkspace,
+      canvasPreset: brief.canvasPreset,
+    });
+    scene.mediaPath = mediaPath;
+    return { mediaPath, mediaUrl: pathToFileURL(mediaPath).href, kind: "image", model, _usage: { images: 1 } };
+  }
   return { mediaUrl, kind: "image", model, _usage: { images: 1 } };
 }
 
@@ -393,15 +414,38 @@ function demoSceneMedia(scene, brief) {
 const VIDEO_SUBMIT_PATHS = ["/videos/generations", "/video/generations"];
 const VIDEO_POLL_PATHS = (id) => [`/videos/${id}`, `/videos/generations/${id}`, `/video/generations/${id}`];
 
-export async function generateSceneVideo(scene, brief) {
+/**
+ * 提交并轮询场景视频；传入受管目录时立即物化、按权威场景时长归一化并写入 `videoPath`。
+ * @param {Record<string, any>} scene 已含标准场景图和权威 `durationSec` 的场景。
+ * @param {Record<string, any>} brief 已解析 Brief。
+ * @param {{inputsWorkspace?: string, scenesWorkspace?: string}} [options] `artifactPaths(runId)` 提供的受管目录。
+ * @returns {Promise<{videoPath?: string, videoUrl: string|null, kind: string, model: string, _usage?: object}>} 标准视频或 DEMO stub。
+ * @example await generateSceneVideo(scene, brief, { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes });
+ */
+export async function generateSceneVideo(scene, brief, options = {}) {
   if (getProviderMode() !== "real") return demoSceneVideo(scene, brief);
   const model = brief.videoModel || process.env.PROMO_VIDEO_MODEL;
   if (!model) throw new Error("未指定视频模型（Brief.videoModel / env PROMO_VIDEO_MODEL）");
   let prompt = scene.visualPrompt || scene.subtitle || "";
   if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
-  const body = { model, prompt, n: 1 };
+  const canvas = resolveCanvas(brief.canvasPreset);
+  const body = {
+    model,
+    prompt,
+    n: 1,
+    aspect_ratio: canvas.aspectRatio,
+    width: canvas.width,
+    height: canvas.height,
+    size: `${canvas.width}x${canvas.height}`,
+  };
   const ref = scene.mediaUrl;
   if (ref && /^https?:\/\//i.test(ref)) body.image = ref; // 图生视频：首帧用本镜场景图
+  else if (ref && /^data:image\//i.test(ref)) body.image = ref;
+  else if (scene.mediaPath && options.scenesWorkspace) {
+    // 先交由共享物化器验证场景图确实位于本次受管目录，再编码为 provider 可消费的 data URL；绝不发送本地路径。
+    const safeImage = await materializeMedia({ source: scene.mediaPath, kind: "image", workspace: options.scenesWorkspace });
+    body.image = `data:image/png;base64,${fs.readFileSync(safeImage).toString("base64")}`;
+  }
   const timeoutMs = Number(process.env.PROMO_VIDEO_SUBMIT_TIMEOUT_MS ?? 30000);
   let data = null, submitErr = null;
   for (const p of VIDEO_SUBMIT_PATHS) {
@@ -416,7 +460,7 @@ export async function generateSceneVideo(scene, brief) {
   }
   if (!data) throw submitErr || new Error("视频提交失败（所有端点均不可用）");
   const videoUrl = extractVideoUrl(data);
-  if (videoUrl) return { videoUrl, kind: "video", model, _usage: { videos: 1 } };
+  if (videoUrl) return finalizeSceneVideo(videoUrl, scene, brief, model, options);
   // 异步任务：轮询直至完成。提交响应也可能是 new-api 包装形态 {code:"success", data:{id,status}}，
   // 先解包再取 id（unwrap 对非包装形态原样返回，数组形态 data.data[] 不会被守卫吞掉）。
   const submitted = unwrapVideoTask(data);
@@ -440,7 +484,7 @@ export async function generateSceneVideo(scene, brief) {
     const body2 = unwrapVideoTask(task);
     const status = String(body2?.status || body2?.state || "").toLowerCase();
     const url = body2?.result_url || extractVideoUrl(body2);
-    if (url) return { videoUrl: url, kind: "video", model, _usage: { videos: 1 }, taskStatus: status };
+    if (url) return finalizeSceneVideo(url, scene, brief, model, options, status);
     if (["failed", "failure", "error", "cancelled", "canceled"].includes(status)) {
       throw new Error(`视频任务 ${id} 失败：${body2?.fail_reason || body2?.error || body2?.message || status}`);
     }
@@ -525,6 +569,28 @@ function attachPartialUsage(error, usage) {
   const failure = error instanceof Error ? error : new Error(String(error));
   failure._usage = usage;
   return failure;
+}
+
+async function finalizeSceneVideo(videoUrl, scene, brief, model, options, taskStatus) {
+  if (options.inputsWorkspace && options.scenesWorkspace) {
+    const videoPath = await normalizeSceneVideo({
+      source: videoUrl,
+      inputsWorkspace: options.inputsWorkspace,
+      scenesWorkspace: options.scenesWorkspace,
+      canvasPreset: brief.canvasPreset,
+      durationSec: Number(scene.durationSec),
+    });
+    scene.videoPath = videoPath;
+    return {
+      videoPath,
+      videoUrl: pathToFileURL(videoPath).href,
+      kind: "video",
+      model,
+      _usage: { videos: 1 },
+      ...(taskStatus ? { taskStatus } : {}),
+    };
+  }
+  return { videoUrl, kind: "video", model, _usage: { videos: 1 }, ...(taskStatus ? { taskStatus } : {}) };
 }
 
 /**
