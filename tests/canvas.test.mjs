@@ -45,6 +45,9 @@ test("画布注册表包含三个不可变社交媒体预设", () => {
 test("resolveCanvas 拒绝任意尺寸和值", () => {
   assert.throws(() => resolveCanvas("4096x4096"), /不支持的画布/);
   assert.throws(() => resolveCanvas({ width: 1080, height: 1920 }), /不支持的画布/);
+  for (const inheritedKey of ["toString", "constructor", "__proto__"]) {
+    assert.throws(() => resolveCanvas(inheritedKey), /不支持的画布/);
+  }
 });
 
 test("canvasPrompt 明确画幅、像素尺寸和居中主体安全构图", () => {

@@ -45,9 +45,8 @@ export const CANVAS_PRESETS = Object.freeze({
  * resolveCanvas("social-square");
  */
 export function resolveCanvas(id = DEFAULT_CANVAS_PRESET) {
-  const canvas = CANVAS_PRESETS[id];
-  if (!canvas) throw new Error(`不支持的画布：${String(id)}`);
-  return canvas;
+  if (!Object.hasOwn(CANVAS_PRESETS, id)) throw new Error(`不支持的画布：${String(id)}`);
+  return CANVAS_PRESETS[id];
 }
 
 /**
