@@ -636,3 +636,5 @@ git commit -m "docs(brand-promo): document strict mp4 delivery"
 Run: `git diff --check HEAD~10..HEAD` and inspect `git status --short` so unrelated workspace files are not committed.
 
 Expected: clean checks; only intended branch changes remain.
+
+> **执行状态（2026-09-21）**：Step 1–3 已完成（契约与配置文档、内联 JS 与 `git diff --check` 静态检查、`npm test` 246/246 全绿）。Step 4/5 的浏览器验收用例（`tests/ui-delivery-smoke.spec.mjs` + `playwright.config.mjs`）与 REAL 验收脚本（`tools/verify-real-delivery.mjs`）已就绪并通过静态与启动校验；本地 6777 服务以 `mode=real` 运行、共享预检通过、动态视频自动解析到 `minimax-h3`。但唯一付费 run `85b46cee-81fa-476f-9c97-dfe43095b6f4` 在 `voiceover` 步被 one-api 渠道 `apilio` 以 403 `insufficient_user_quota`（上游账户余额为负）拒绝，属外部额度阻断，故 Step 4 的成片三视口截图留证与 Step 5 的付费成片产物证据仍待额度恢复后补跑；失败 run 的严格失败语义（无 videoUrl、三件产物 409、`/api/video` 404）已验证符合设计。Step 6 提交与 Step 7 分支复审的结论见最后一次 commit。

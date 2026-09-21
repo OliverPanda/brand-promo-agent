@@ -138,6 +138,8 @@
 - **FR-5.1** 依据旁白文案 + 选定音色生成音频。
 - **FR-5.2** 支持字幕时间轴对齐（SRT 产出）。
 - **FR-5.3** 多语言配音（与 FR-1 语言一致）。
+- **FR-5.4** 按每条旁白分别合成语音，逐段用 ffprobe 实测时长并累加（含 120ms 句间缓冲）得到权威时间轴；SRT 与成片共用该时间轴，不得按 Brief 秒数截断尾部配音。
+- **FR-5.5** REAL 模式配音失败即整条运行失败，不生成静音片、不降级交付；DEMO 模式保留占位音频。
 
 ### FR-6 配乐生成/选取（Music Provider）
 - **FR-6.1** 依据情绪曲线生成或选取背景音乐。
@@ -145,14 +147,16 @@
 - **FR-6.3** 淡入淡出与情绪点对齐。
 
 ### FR-7 合成（Video Provider）
-- **FR-7.1** 将场景素材 + 配音 + 配乐 + 字幕合成为最终视频。
-- **FR-7.2** 输出 MP4（H.264）+ 封面图 + 时长。
-- **FR-7.3** 失败回退：若合成服务不可用，至少交付「分镜幻灯片 + 音频」可下载包。
+- **FR-7.1** 将场景素材 + 配音 + 配乐 + 字幕合成为最终视频；台词字幕按画布尺寸烧录进画面（ASS + libass），同时另存 UTF-8 SRT 供二次编辑。
+- **FR-7.2** 输出 MP4（H.264/yuv420p，分辨率等于所选画布）+ 封面图 + 时长；音轨为 AAC 48kHz 双声道，配音响度约 -16 LUFS、配乐约降至 18% 混入。
+- **FR-7.3** 失败语义按模式分离：REAL 模式任意环节（动态视频、配音、配乐、字幕、FFmpeg、成片校验）失败即整条运行失败，不得把分镜包或静态占位物标记为成功成片；DEMO 模式保留「分镜幻灯片 + 音频」分镜包，并在页面明确标注为演示结果。
+- **FR-7.4** 成片校验门：进入 `awaiting_delivery` 前必须确认文件大小、容器与编码（MP4/MOV + H.264 + AAC）、分辨率与像素格式、时长偏差、字幕区域像素差异和持久化路径，全部通过才可交付。
 
 ### FR-8 交付
-- **FR-8.1** 成片页展示：视频播放器、分镜故事板画廊、可下载资源（MP4 / SRT / 分镜 JSON / 脚本）。
+- **FR-8.1** 成片页展示：视频播放器、分镜故事板画廊、可下载资源（MP4 / SRT / 分镜 JSON / 脚本）。MP4、SRT 与封面三个下载入口只在成片通过校验门后出现。
 - **FR-8.2** 生成分享链接（短期有效）。
 - **FR-8.3** 历史记录列表（我的宣传片）。
+- **FR-8.4** 未产出校验通过的 MP4 时，页面不得出现「成片已交付」表述，只展示分镜故事板并标注为演示结果或历史降级产物。
 
 ### FR-9 人工审核门（HITL）
 - **FR-9.1** 脚本门：脚本生成后 suspend，用户确认/修改后再继续 costly 的素材生成。
@@ -312,7 +316,7 @@ interface PromoRun {
 | LLM（脚本/分镜） | 模板化确定性生成 | one-api → `deepseek-v4-flash` 等 |
 | 图像/视频素材 | SVG 占位图（按 Scene 描述生成） | MingStar ai-core `/api/v1/ai/...`（Seedream 图生图、`doubao-seedream-4-0-250828`） |
 | TTS 配音 | 静音/占位音频 + SRT | one-api 音频通道（Mureka 桥） |
-| 配乐 | 占位音轨 | one-api 音乐通道 |
+| 配乐 | 占位音轨 | one-api 音乐通道（Mureka 桥 `mureka-song` 提交 + `mureka-query` 轮询） |
 | 合成 | 分镜幻灯片打包 | 服务端 FFmpeg / MingStar 合成服务 |
 
 > 切换只需实现对应 Provider 接口并设置环境变量，**工作流代码不变**。
@@ -471,7 +475,7 @@ ingestBrief(Zod BrandBrief)
 > M2 把 §10 选定的「one-api（OpenAI 兼容统一网关）」真实通道接通，并补齐 §15 决议中推迟到 M2 的 **FR-10 成本配额与预算上限**、FR-9.2 成片门（成片阶段已纳入预算闸门）、参考图图生图透传、成本报表（复用 ai-core 计费埋点结构）。**DEMO 路径完全保留、零回归**；真实路径仅在 `PROMO_PROVIDER_MODE=real` 时启用。
 
 #### 16.9.1 M2 范围锁定（相对 §16.1 的增量）
-- ✅ **真实 Provider 接入（one-api）**：脚本/分镜（LLM `/chat/completions`）、场景图（`/images/generations`，Seedream `doubao-seedream-4-0-250828`）、配音（`/audio/speech` TTS）、配乐（`/audio/music`，Mureka 桥），均经 `globalThis.fetch` 调 one-api，请求/响应严格按 OpenAI 兼容协议解析。
+- ✅ **真实 Provider 接入（one-api）**：脚本/分镜（LLM `/chat/completions`）、场景图（`/images/generations`，Seedream `doubao-seedream-4-0-250828`）、配音（`/audio/speech` TTS）、配乐（Mureka 桥 `mureka-song` / `mureka-query` 经 `/chat/completions`），均经 `globalThis.fetch` 调 one-api，请求/响应严格按 OpenAI 兼容协议解析。
 - ✅ **真实 MP4 合成**：服务端 FFmpeg（`PROMO_FFMPEG_BIN`）将场景图 + 配音 + 配乐合流为 MP4；未配置 FFmpeg 或合成失败时优雅降级为分镜包（DEMO 同款），不阻断交付。
 - ✅ **真实链路全打通（2026-09 真机验证，new-api 网关 :3501 + 本机 ffmpeg 8.0）**：① seedream/doubao 渠道 `size` 用词汇 `1K|2K|4K` 并带 `aspect_ratio:"16:9"`（像素写法如 1024x576 该渠道拒绝，按 model 前缀自动归一）；② seedream 对 aspect 是 best-effort——同批 5 镜实测混出 1152×864 / 864×1152 竖图 / 1312×736，而 concat 要求同几何 → 合成层每镜 `scale+pad` 归一到 1280×720(16:9) 黑边画布再 concat，异源尺寸免疫；③ voiceover/music 渠道缺失（如 `tiny-iceberg` 无对应 TTS channel → 网关报 `No available channel`）时置 null **降级继续**，不再中断整链，成片仍产出（静音片）；④ 成片 `file://` 路径在 server API 边界统一映射为 `GET /api/video/:runId`（sendFile 带 Range 支持拖动），SSE（run-done/final-review）与 `GET /api/runs` 均经 `toPublicRun` 序列化，浏览器可播可下载。
 - ✅ **FR-10 成本配额与预算上限**：真实 Provider 回传 `_usage`（tokens / images / minutes / tracks / videos），经 `cost.js` 单价表预估 → 归集到 `PromoRun.cost` → `checkBudget` 对 `PROMO_BUDGET_CAP`（默认 ¥20）闸门，超限抛 `BudgetExceededError` 中止并提示。
@@ -506,7 +510,7 @@ generateScript(brief)          -> /chat/completions (response_format=json_object
 generateStoryboard(brief,script)-> /chat/completions                              -> Scene[] 每镜 {..., _usage:{tokens}}
 generateSceneMedia(scene,brief)-> /images/generations (model=PROMO_IMAGE_MODEL)    -> {mediaUrl, kind, _usage:{images:1}}
 generateVoiceover(script,brief)-> /audio/speech (isBinary)                        -> {voiceUrl:data:audio/mp3;base64, srt, _usage:{minutes}}
-generateMusic(brief,storyboard)-> /audio/music (model=PROMO_MUSIC_MODEL)          -> {musicUrl, mood, _usage:{tracks:1}}
+generateMusic(brief,storyboard)-> /chat/completions (model=mureka-song 提交 → mureka-query 轮询 audioUrl) -> {musicPath, musicUrl, durationSec, mood, _usage:{tracks:1}}
 composite(scenes,voice,music,brief) -> ffmpegAssemble() (PROMO_FFMPEG_BIN)        -> {videoUrl:file://...mp4, ..., _usage:{videos:1}}
 // 合成实现（2026-09 真机修复后）：全镜有 videoUrl → ffmpegAssembleVideo（concat demuxer 直拼，保留编码）；
 //   否则静态图幻灯 ffmpegAssemble —— 每图 -loop 1 -t <dur> 独立输入 + concat filter 拼接（不用 concat demuxer 的 duration 行：
@@ -702,6 +706,66 @@ tests/
 - **新能力须验「UI → 提交 → Provider 生效」全链路**，不能只验后端单元。F1 的后端用例全是绿的，但前端根本没接线。
 - **服务端必须剥离客户端可控的权限/标志位字段**（`id`、`isPreset`、`role` 一类），不可直接透传 `req.body`。
 - **交付前对新增用例做变异测试**：逐个回退修复，确认对应用例转红。本次 4 项变异（F2/F3、F4、F5、F6）全部被捕获。
+
+---
+
+## 16.12 REAL MP4 成片交付基线（v0.6 新增，社交媒体画布 + 烧录字幕 + 严格失败）
+
+> 设计依据：[REAL 模式社交媒体 MP4 成片交付设计](../docs/superpowers/specs/2026-09-20-real-mp4-delivery-design.md)。本节是成片语义的当前事实来源；与 §16.9.1 ③「音频渠道缺失时置 null 降级继续」冲突时以本节为准。
+
+### 16.12.1 画布与规格
+
+- `Brief.canvasPreset` 为受控枚举，默认 `social-portrait`：
+
+| 预设 | 分辨率 | 比例 | 典型渠道 |
+| :--- | :--- | :--- | :--- |
+| `social-portrait`（默认） | 1080×1920 | 9:16 | 抖音、视频号、快手、小红书 |
+| `social-landscape` | 1920×1080 | 16:9 | B 站、YouTube、官网 |
+| `social-square` | 1080×1080 | 1:1 | 方形信息流 |
+
+- 非法枚举值在 `POST /api/generate` 返回 400。
+- 分镜构图、场景图、动态视频、封面、字幕安全区与最终 MP4 使用同一画布；供应商原始响应允许尺寸不一致，但进入工作区前必须归一到目标画布（25fps、H.264、yuv420p、方形像素）。
+
+### 16.12.2 权威时间轴
+
+- REAL 按每条 `script.voiceover` 分别合成语音，逐段 ffprobe 实测时长，累加并计入 120ms 句间缓冲，得到权威时间轴。
+- 分镜数量必须与 voiceover 一一对应；每镜时长等于对应语音实测时长加缓冲，数量不一致视为分镜失败。
+- 成片总时长由权威时间轴决定，禁止按 Brief 秒数截断尾部配音；配乐过长则截断，画面不足则末帧延展。
+
+### 16.12.3 字幕烧录
+
+- 字幕走 libass 管线：先用权威 cues 生成显式声明 `PlayResX`/`PlayResY` 为目标画布尺寸的临时 ASS（UTF-8 无 BOM），再用 FFmpeg `ass` 滤镜烧录。
+- 禁止 `subtitles` 滤镜直接读 SRT：该滤镜按默认 PlayRes 384×288 解析，会把底部安全边距错误映射到画面上部。
+- 字体由 `PROMO_SUBTITLE_FONT` 配置（默认 `Microsoft YaHei`），预检校验中文字形覆盖，拒绝静默回退；样式为白字黑描边，最多两行，按画布设置字号与底部安全边距。
+- 同时输出 UTF-8 SRT（`HH:MM:SS,mmm`、单调不重叠、不超过成片时长）供二次编辑。
+
+### 16.12.4 严格失败语义
+
+REAL 模式删除全部「成功降级」行为：单镜动态视频失败、TTS 失败、配乐失败、FFmpeg 失败、输出缺音轨/缺字幕、产物落在临时目录，任一命中即 `failed`，不得进入验收门。DEMO 模式仍输出分镜故事板，页面必须标注为演示结果。
+
+### 16.12.5 成片校验门与交付契约
+
+- 进入 `awaiting_delivery` 前校验：文件存在且大于下限、容器为 MP4/MOV、视频 H.264、音频 AAC 且声道非空、分辨率与像素格式等于画布、时长偏差在容差内、SRT 含全部确认台词、首末字幕区域像素差异超阈值、产物位于持久化目录。
+- 产物落盘：`data/outputs/<runId>/{final.mp4,subtitles.srt,poster.jpg,manifest.json}`；`manifest.json` 记录画布、模型、各镜时长、音频参数、FFmpeg 版本与摘要，不含密钥。
+- 下载契约：`GET /api/video/:runId` 为 `video/mp4` 且支持 Range 在线播放；`GET /api/runs/:runId/artifacts/{video|subtitles|poster}` 为附件下载，仅 `success`/`awaiting_delivery` 且 REAL 下 `artifactManifest.validated===true` 时可下载，否则 409。
+- 输出目录生命周期与 run 一致：store 淘汰最旧 run 时只删除该 runId 在 `data/outputs` 下的目录，应用重启不清理有效 run。
+
+### 16.12.6 配乐接入
+
+- 配乐不走 OpenAI 音频端点（网关 `new-api` 无 `/audio/music` 路由，调用必然 404）。
+- 采用 MingStar 既有 Mureka 协议桥，经 `/chat/completions` 同渠道同密钥：`mureka-song` 提交任务（返回 `taskId`/`kind`），`mureka-query` 轮询取 `audioUrl`，再落盘物化。
+- 预检要求 `mureka-song` 与 `mureka-query` 同时存在于网关实时清单；缺任一即拒绝创建运行。
+
+### 16.12.7 动态视频模型默认优先级
+
+自动选择按 `minimax-h3` → `7zhe-seedance` → `seedance-2.0` → 其他兼容 Seedance 2.0 型号解析，与 `src/media/model-selection.js` 一致；手动选择覆盖自动，且必须存在于实时清单，否则提交前报错。
+
+### 16.12.8 前端行为
+
+- 「成片规格」提供画布下拉，默认竖屏 1080×1920。
+- 动态视频模型下拉首项为「自动（当前：<解析结果>）」，空值交服务端解析。
+- 交付区以最终 MP4 播放器为主，提供「下载 MP4」「下载字幕 SRT」「下载封面」；未通过校验时只展示分镜故事板并标注降级原因。
+- 覆盖 1440、768、375px 三个视口，无横向溢出、无 pageerror。
 
 ---
 

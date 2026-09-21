@@ -4,6 +4,9 @@
 
 > 2026-09-05 后续更新：按用户截图，将模板移到中栏简报上方，以小标签点击套用；保存与删除收进「管理模板」。当前 DOM 契约为 `tplCard ∈ .layout > .main`，`cfgCard ∈ .layout > .side`，下文原模板位置描述已过时。新增设计记录见 `prd/template-tags.md`。真实浏览器验证 1440 / 1104 / 768 / 375px：模板在表单上方、卡片高度正常、无横向页面溢出、pageerror 为 0；验证套用、管理展开、预设删除禁用及请求失败重试、空态。截图：`test/template-tags-*.png`。本次未重跑后端测试，下面 123/123 为此前快照。
 
+> 2026-09-20 成片交付改版：前端新增「成片规格 → 画布尺寸」下拉（默认竖屏 1080×1920，可切 1920×1080 / 1080×1080），动态视频模型下拉首项改为「自动（当前：<网关解析结果>）」；REAL 模式改为严格失败——动态视频、配音、配乐、字幕烧录、FFmpeg 或成片校验任一失败即 run=`failed`，页面不得出现「成片已交付」，只展示分镜故事板并标注原因；交付区只在 `artifactManifest.validated === true` 时展示 MP4 播放器与「下载 MP4 / 下载字幕 SRT / 下载封面」三个入口。设计依据 [REAL MP4 成片交付设计](docs/superpowers/specs/2026-09-20-real-mp4-delivery-design.md) 与 PRD §16.12。
+> 2026-09-21 端到端验收记录：REAL 服务已在 6777 启动，`GET /api/config` 返回 `mode=real`，共享预检（FFmpeg 8.0 + libass 的 `subtitles`/`ass` 滤镜、`Microsoft YaHei` 中文 cmap、输出目录可写、网关实时清单）全部通过，动态视频按优先级自动解析为 `minimax-h3`（`modelSelectionSource=automatic`）。付费验收 run `85b46cee-81fa-476f-9c97-dfe43095b6f4` 在 `voiceover` 步失败：one-api 渠道 `apilio` 返回 403 `insufficient_user_quota`（上游账户余额为负 ⚡-2.192116），属外部额度阻断，本地链路未发现问题；脚本步已真实完成并计费 ¥0.0258。严格失败语义按设计生效：失败 run 的 `videoUrl` 为空，三件产物下载入口全部 409，`/api/video/<runId>` 返回 404，界面不会出现「成片已交付」。浏览器验收用例已就绪（`tests/ui-delivery-smoke.spec.mjs`，1440×900 / 768×900 / 375×812 三视口，缺 `REAL_RUN_ID` 时自动跳过），待上游额度恢复后按实施计划 Step 5 与 Step 4 重跑即可补齐成片与截图留证。
+
 > 写给下一位接手的 agent / 工程师。目标：10 分钟内建立完整上下文，直接继续实施，不踩已踩过的坑。
 > 项目：`D:\My-Project\aigc-platform\MingStar\brand-promo-agent`（铭星链自动化品宣机器人）
 > 文档基准：2026-09-05 15:10，基线 commit 前的最后状态见文末「验证快照」。

@@ -18,5 +18,8 @@
     "express": "^4.21.2",
     "fontkit": "^2.0.4",
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.45.0"
   }
 }
