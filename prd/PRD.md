@@ -127,12 +127,15 @@
   - 时长
   - 是否需要配乐高潮点
 - **FR-3.3** 全片视觉风格统一（色彩/光线/主体一致性约束）。
+- **FR-3.4** 分镜请求启用 JSON 对象响应模式，解析层须容忍数组键名漂移（`scenes`/`array`/`storyboard` 及一层嵌套）与文本包裹，`musicClimax` 数值按 ≥0.8 归一为高潮；分镜数量仍须与确认旁白严格相等，否则该步失败。
 
 ### FR-4 场景素材生成（Provider）
 - **FR-4.1** 对每个 Scene 生成画面素材（图或短视频片段）。
 - **FR-4.2** 支持参考图输入（图生图，复用 Seedream 参考图免费能力）。
 - **FR-4.3** 失败重试与降级：单场景失败不阻断全片，标记后跳过/用占位。
 - **FR-4.4** 并行生成（Mastra `.parallel()` 或 Provider 批量），控制并发与配额。
+- **FR-4.5** 图生视频首帧只接受图像渠道返回的公网 http(s) URL。上游自行下载首帧，`data:`/裸 base64/本机地址（含 `localhost`、`host.docker.internal`）一律拒绝；图像渠道不可用时该片段降级为文生并记录可审计原因。首帧是否生效以任务响应 `usage.input_image_count` 为准（纯文生为 0）。`first_frame_image` 对 `minimax-h3` 无效。 **首帧被上游内容审核拒绝时（`InputImageSensitiveContentDetected.PrivacyInformation`：图中疑似真人），必须去掉首帧、退化为文生视频后在同一模型内重试一次，仍失败才进入候选降级链**：各候选渠道都会下载同一张首帧并被同样拒绝，换模型无效，换输入形态才是唯一活路；该退化只改变输入形态，不改变画面诉求与 prompt。
+- **FR-4.6** 动态视频提交体携带模型硬校验字段：`duration` 取 4~30 整数秒（场景权威时长向上取整后夹取，归一化阶段再裁到权威时长），`ratio` 显式取画布白名单比例（`21:9/16:9/4:3/1:1/3:4/9:16`，不接受 `adaptive`）。成功地址解析须覆盖 `metadata.url`；失败原因须从对象 `error:{code,message}` 抽取 `message`，不得输出 `[object Object]`。轮询必须在同一轮内遍历候选端点并择优（`/video/generations/{id}` 优先，`/videos/{id}` 返回 200 的空壳响应不得遮蔽权威失败信息），`result_url` 只有通过可物化地址形态校验（`http(s):`/`data:`/`file:`）才能当成成片地址，`status:"unknown"` 带 `fail_reason` 时按失败终止。**成片地址择优**：网关容器内回环地址（实测 `result_url=http://localhost:3000/v1/videos/{id}/content`，宿主机 `ECONNREFUSED`）与公网 `metadata.url`（`https://ark-*.tos-*.volces.com/*.mp4` 签名地址）同时出现时，必须优先取公网可达地址；解析层先收集全部候选，再按「公网可达 > 其他可物化形态」择优，不得按首次命中返回，否则已出片的付费任务会在下载阶段失败。单镜视频对上游瞬时故障（如 `upstream returned unrecognized message`）有限重试：默认 2 次尝试、上限 3 次（`PROMO_VIDEO_ATTEMPTS`），同一模型内退避为指数 `PROMO_VIDEO_RETRY_BACKOFF_MS × 2^(n-1)`（默认 2000ms，`PROMO_VIDEO_RETRY_MAX_BACKOFF_MS` 默认封顶 30000ms）；契约类错误（4xx、字段缺失、首帧不合法）立即失败，不重试；**例外**为首帧图内容审核拒绝（`InputImageSensitiveContentDetected.PrivacyInformation`），按 FR-4.5 去掉首帧退文生重试一次。**模型级降级**：单个候选模型尝试耗尽后，按交付优先级 `minimax-h3 → 7zhe-seedance → seedance-2.0`（`Brief.videoModelFallbacks`，与 `VIDEO_MODEL_PRIORITY` 同源）换下一渠道重试整镜，手选/env 只决定「先试哪个」而不关闭降级链；失败任务由网关自动冲正，换渠道不产生额外净费用；全部候选失败才判定整镜失败。**渠道级不可用**（余额不足 `insufficient_user_quota`/`预扣费额度失败`、分组未开通、无可用渠道 `No available channel`/`model_not_found`）与请求契约无关：重发同一模型必然同样失败，但换下一个候选仍可能出片，必须跳过本模型剩余尝试直接降级，仅最后一个候选不可用时才失败。成本按每镜真实生效模型（`scene.videoModel`）计价。重试边界必须区分生成与物化：只有提交/轮询失败才重试生成；成片下载或归一化失败只对同一成片 URL 重试下载（`PROMO_MEDIA_DOWNLOAD_ATTEMPTS` 默认 4、上限 6，退避为指数 `PROMO_MEDIA_DOWNLOAD_BACKOFF_MS × 2^(n-1)`，默认 1500ms、`PROMO_MEDIA_DOWNLOAD_MAX_BACKOFF_MS` 默认封顶 15000ms），不得因下载失败重新提交已付费的生成任务。HTTP 下载错误必须携带底层 cause（如 `ECONNRESET`/`EAI_AGAIN`），供排障定位。
 
 ### FR-5 配音生成（TTS Provider）
 - **FR-5.1** 依据旁白文案 + 选定音色生成音频。
@@ -140,17 +143,20 @@
 - **FR-5.3** 多语言配音（与 FR-1 语言一致）。
 - **FR-5.4** 按每条旁白分别合成语音，逐段用 ffprobe 实测时长并累加（含 120ms 句间缓冲）得到权威时间轴；SRT 与成片共用该时间轴，不得按 Brief 秒数截断尾部配音。
 - **FR-5.5** REAL 模式配音失败即整条运行失败，不生成静音片、不降级交付；DEMO 模式保留占位音频。
+- **FR-5.6** TTS 回退链：主通道 `POST /audio/speech`（默认 `speech-02-hd`）逐句失败时，在同一 one-api 网关上回退到 Qwen-Omni 多模态流式语音（`/chat/completions` + `modalities:[text,audio]` + SSE base64 PCM），无需更换供应商或密钥。裸 PCM 按 24000Hz/单声道/s16le 封装为 WAV 后进入既有受管链路。备用模型由预检解析写入 `brief.ttsFallbackModel`，默认 `qwen3.5-omni-flash-2026-03-15`（`PROMO_TTS_FALLBACK_MODEL` 可覆盖）。回退链仅在候选确实存在于实时清单时才允许，且两条通道都失败仍按 FR-5.5 严格失败。
 
 ### FR-6 配乐生成/选取（Music Provider）
 - **FR-6.1** 依据情绪曲线生成或选取背景音乐。
 - **FR-6.2** 支持用户上传/从曲库选取（后续）。
 - **FR-6.3** 淡入淡出与情绪点对齐。
+- **FR-6.4** 配乐桥的提交与轮询调用各自对上游瞬时故障有限重试：默认 2 次尝试、上限 3 次（`PROMO_MUSIC_ATTEMPTS`），退避 `PROMO_MUSIC_RETRY_BACKOFF_MS`（默认 2000ms × 第几次）。只重试网关 5xx 与网络类故障（`bridge_upstream_unavailable`/`UND_ERR_*`/`ECONNRESET`/`ETIMEDOUT`/`socket hang up`/`fetch failed`）；契约类错误（4xx、缺少 `taskId`、content 非 JSON）立即失败。重试范围仅限单次桥调用，不得包住整个配乐流程，避免下载失败触发重复提交付费任务。
 
 ### FR-7 合成（Video Provider）
 - **FR-7.1** 将场景素材 + 配音 + 配乐 + 字幕合成为最终视频；台词字幕按画布尺寸烧录进画面（ASS + libass），同时另存 UTF-8 SRT 供二次编辑。
 - **FR-7.2** 输出 MP4（H.264/yuv420p，分辨率等于所选画布）+ 封面图 + 时长；音轨为 AAC 48kHz 双声道，配音响度约 -16 LUFS、配乐约降至 18% 混入。
 - **FR-7.3** 失败语义按模式分离：REAL 模式任意环节（动态视频、配音、配乐、字幕、FFmpeg、成片校验）失败即整条运行失败，不得把分镜包或静态占位物标记为成功成片；DEMO 模式保留「分镜幻灯片 + 音频」分镜包，并在页面明确标注为演示结果。
 - **FR-7.4** 成片校验门：进入 `awaiting_delivery` 前必须确认文件大小、容器与编码（MP4/MOV + H.264 + AAC）、分辨率与像素格式、时长偏差、字幕区域像素差异和持久化路径，全部通过才可交付。
+- **FR-7.5** 步骤间载荷完整透传：视频阶段 `voiceover → music → storyboard → generateScenes → composite` 的每个步骤必须把下游需要的字段原样带下去，尤其 `voice` 与 `music` 必须抵达 `composite`。任一中间步骤漏传配乐都会让已完成付费调用的 run 在合成阶段以「配乐缺失」失败。
 
 ### FR-8 交付
 - **FR-8.1** 成片页展示：视频播放器、分镜故事板画廊、可下载资源（MP4 / SRT / 分镜 JSON / 脚本）。MP4、SRT 与封面三个下载入口只在成片通过校验门后出现。
@@ -661,7 +667,7 @@ tests/
   - **模型清单动态化**：新增 `GET /api/models?refresh=1`（`src/models-gateway.js`）——从**当前生效供应商网关**拉 `GET {base}/models`（Bearer、5s 超时、60s TTL），按条目 `type` 字段优先、缺失按模型 id 关键词分类（`video > audio > image > llm`）。`real` 且网关可达 → `source=gateway` 返回真实清单；`real` 但网关失败 → 503（**不返回占位，避免误导**）；DEMO → `source=fallback`（llm/image 内置清单 + video 占位候选，仅声明路由演示）。
   - **右侧面板增「动态视频模型」下拉**（首项「不启用」）：数据源 = `/api/models` 的 video 分类；页面加载与「保存供应商地址」后自动拉取（地址变了强刷 `refresh=1`），llm/image 下拉并入网关真实条目。「从网关刷新模型清单」按钮手动强刷。
   - **Brief 增 `videoModel`**（请求级覆盖，语义同 `llmModel`/`imageModel`）；`GET /api/config.models.video` 回显 `current`（env `PROMO_VIDEO_MODEL`，可空 = 不启用）。
-  - **生成链路（仅 `real` + `brief.videoModel` 生效）**：`providers.generateSceneVideo` 走 OpenAI 兼容 `POST {base}/videos/generations`（`image` = 本镜场景图 URL → 图生视频，无图退化为文生；兼容同步返回与异步任务轮询 `GET /videos/{id}` / `/videos/generations/{id}`，`PROMO_VIDEO_TIMEOUT_MS` 默认 180s）。workflow `generateScenes` 每镜图后动态化，**单镜失败降级为静态图不阻断全片**（FR-4.3）；产出落 `scene.videoUrl`/`scene.videoModel`。合成：全部镜为动态片段 → FFmpeg concat 直拼 + 音频混流；否则走原静态图路径。交付页模型行显示「动态视频 xxx（静态降级）」如实标注。
+  - **生成链路（仅 `real` + `brief.videoModel` 生效）**：`providers.generateSceneVideo` 走 OpenAI 兼容 `POST {base}/videos/generations`（`image` = 本镜场景图的公网 URL → 图生视频；无公网 URL 退化为文生，见 FR-4.5；兼容同步返回与异步任务轮询（按 `/video/generations/{id}` → `/videos/generations/{id}` → `/videos/{id}` 择优，见 FR-4.6），`PROMO_VIDEO_TIMEOUT_MS` 默认 600s），提交体带 `duration`/`ratio`/尺寸，成功地址兼容 `metadata.url`（FR-4.6）。workflow `generateScenes` 每镜图后动态化，产出落 `scene.videoUrl`/`scene.videoModel`；**REAL 模式下任一镜动态片段失败即整步失败，不再降级为静态图**（设计文档 §7）。合成：FFmpeg concat 直拼 + 音频混流 + 中文硬字幕。
   - **成本**：`generateScenes` 视频计价已接**真实单价**（2026-09-04 自中转站 new-api `/api/pricing` 实抓，非估算）：按次模型（quota_type=1）CNY/镜 = `model_price × 7.3`（站内 `usd_exchange_rate=7.3`、default 分组 ×1）——`sora-2-pro` $0.5/次 = **¥3.65/镜**、`sora-2` $0.3/次 = **¥2.19/镜**（`cost.js` 内 `VIDEO_PER_CALL_CNY` 表，渠道加价只需补表）；其余视频模型（kling/seedance/veo/wan 等站内均为兜底倍率 37.5，new-api 按上游回报 tokens 差额结算、无固定每镜价）回落 `PROMO_VIDEO_COST_FALLBACK`（默认 ¥1/镜）。`workflow.generateScenes` 归集 `_usage` 时携带 `videoModel` 以命中对应单价。
   - **交付预览**：交付页与成片门分镜画廊——有 `scene.videoUrl` 的镜渲染 `<video controls>`（可播放动态片段，带「⦿动态」徽标），否则静态图；成片门 preview 的 gallery 取完整 storyboard（含 videoUrl）。
   - **调用骨架回归保障**：`tests/video-provider.test.mjs` 以本地 stub 网关锁定 7 条路径——同步返回 / 异步轮询至 succeeded（output 对象）/ GET 404 → 备选 `/videos/generations/{id}` / 任务失败 / 轮询超时（`PROMO_VIDEO_TIMEOUT_MS`）/ 未指定模型 / DEMO stub。`extractVideoUrl` 兼容 `{url|video_url}`、`data/output/results/videos` 数组、`output` 对象、`content` 对象/数组等形态。
@@ -755,6 +761,7 @@ REAL 模式删除全部「成功降级」行为：单镜动态视频失败、TTS
 - 配乐不走 OpenAI 音频端点（网关 `new-api` 无 `/audio/music` 路由，调用必然 404）。
 - 采用 MingStar 既有 Mureka 协议桥，经 `/chat/completions` 同渠道同密钥：`mureka-song` 提交任务（返回 `taskId`/`kind`），`mureka-query` 轮询取 `audioUrl`，再落盘物化。
 - 预检要求 `mureka-song` 与 `mureka-query` 同时存在于网关实时清单；缺任一即拒绝创建运行。
+- 提交与轮询调用对上游瞬时故障有限重试（`PROMO_MUSIC_ATTEMPTS` 默认 2、上限 3；`PROMO_MUSIC_RETRY_BACKOFF_MS` 默认 2000ms × 第几次），只重试 5xx 与网络类故障；契约类 4xx 与解析类错误立即失败。重试不跨越「提交」边界：下载物化失败只重试同一 URL，绝不重新提交已付费的配乐任务。
 
 ### 16.12.7 动态视频模型默认优先级
 

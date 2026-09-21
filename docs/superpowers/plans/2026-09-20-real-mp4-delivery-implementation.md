@@ -148,7 +148,7 @@ Expected: FAIL because the resolver is missing and `minimax-h3` is currently cla
 
 - [ ] **Step 3: Implement pure model selectors**
 
-Use exact IDs before normalized regex fallbacks. Manual `brief.videoModel` always overrides auto-selection but must appear in the live video set. Return `{ videoModel, ttsModel, source }` for audit.
+Use exact IDs before normalized regex fallbacks. Manual `brief.videoModel` always overrides auto-selection but must appear in the live video set. Return `{ videoModel, videoModelFallbacks, ttsModel, source }` for audit: `videoModelFallbacks` preserves the `minimax-h3 → 7zhe-seedance → seedance-2.0` order (minus the primary) so `generateSceneVideo` can degrade per scene after a candidate exhausts its attempts.
 
 - [ ] **Step 4: Add async REAL preflight to `POST /api/generate`**
 
@@ -638,3 +638,5 @@ Run: `git diff --check HEAD~10..HEAD` and inspect `git status --short` so unrela
 Expected: clean checks; only intended branch changes remain.
 
 > **执行状态（2026-09-21）**：Step 1–3 已完成（契约与配置文档、内联 JS 与 `git diff --check` 静态检查、`npm test` 246/246 全绿）。Step 4/5 的浏览器验收用例（`tests/ui-delivery-smoke.spec.mjs` + `playwright.config.mjs`）与 REAL 验收脚本（`tools/verify-real-delivery.mjs`）已就绪并通过静态与启动校验；本地 6777 服务以 `mode=real` 运行、共享预检通过、动态视频自动解析到 `minimax-h3`。但唯一付费 run `85b46cee-81fa-476f-9c97-dfe43095b6f4` 在 `voiceover` 步被 one-api 渠道 `apilio` 以 403 `insufficient_user_quota`（上游账户余额为负）拒绝，属外部额度阻断，故 Step 4 的成片三视口截图留证与 Step 5 的付费成片产物证据仍待额度恢复后补跑；失败 run 的严格失败语义（无 videoUrl、三件产物 409、`/api/video` 404）已验证符合设计。Step 6 提交与 Step 7 分支复审的结论见最后一次 commit。
+
+> **执行状态（2026-09-21 续）**：诊断确认 TTS 主通道不是模型清单问题，而是上游 apilio 渠道账户余额为负，`speech-02-hd` / `speech-02-turbo` / `gpt-4o-mini-tts` / `tts-1` 对 `/audio/speech` 一律返回 403 `insufficient_user_quota`，本地 one-api 无法为该上游渠道充值。已按「文档先行」把 TTS 回退链写入设计文档 §6.7、PRD FR-5.6 与 `.env.example`（新增 `PROMO_TTS_FALLBACK_MODEL`），并实现 `src/media/audio.js` 的 24kHz 单声道 s16le 裸 PCM → WAV 封装、`src/mastra/providers.js` 的 Omni 流式 SSE 语音调用与逐句回退、`src/media/model-selection.js` 的备用模型解析（写入 `brief.ttsFallbackModel`）。回退通道的真实可用性已用付费探针验证（`qwen3.5-omni-flash-2026-03-15` 经同一网关返回可解码 PCM，实测 24000Hz/单声道/s16le；`Ethan`/`Dylan`/`Serena` 可用，`Chelsie` 返回 0 字节不列入候选）。
