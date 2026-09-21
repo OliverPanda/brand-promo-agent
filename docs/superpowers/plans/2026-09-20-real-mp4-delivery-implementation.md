@@ -344,7 +344,7 @@ git commit -m "feat(brand-promo): normalize social video assets"
 - Modify: `src/mastra/providers.js`
 - Replace/extend: `tests/composite-real.test.mjs`
 
-- [ ] **Step 1: Write failing end-to-end compositor tests**
+- [x] **Step 1: Write failing end-to-end compositor tests**
 
 For each canvas preset, generate two normalized clips, voiced Chinese cues, and background music. Assert:
 
@@ -360,39 +360,39 @@ For each canvas preset, generate two normalized clips, voiced Chinese cues, and 
 - FFmpeg EBU analysis reports integrated voice-first mix near `-16 LUFS` and true peak no higher than `-1.5 dBTP` (allow 0.2dB measurement tolerance);
 - missing video/voice/music/font/subtitles filter or malformed output rejects instead of returning a fallback.
 
-- [ ] **Step 2: Run compositor tests and verify RED**
+- [x] **Step 2: Run compositor tests and verify RED**
 
 Run: `node --import ./tests/setup.mjs --test tests/composite-real.test.mjs`
 
 Expected: FAIL because subtitles are not burned, outputs are temporary, and REAL still falls back.
 
-- [ ] **Step 3: Implement filter-concat video assembly**
+- [x] **Step 3: Implement filter-concat video assembly**
 
 Use already-normalized clips as inputs, apply a defensive parameter check, and concatenate with the filter graph rather than concat demuxer assumptions.
 
-- [ ] **Step 4: Implement voice-first audio mixing**
+- [x] **Step 4: Implement voice-first audio mixing**
 
 Normalize voice to `-16 LUFS` with `TP=-1.5`, lower music to `0.18`, mix to AAC stereo/48kHz, trim music at the authoritative duration, and never truncate voice. After encoding, run FFmpeg EBU/loudnorm analysis and reject a measured true peak above `-1.3 dBTP` (the 0.2dB tolerance around the `-1.5` target).
 
-- [ ] **Step 5: Burn Chinese subtitles**
+- [x] **Step 5: Burn Chinese subtitles**
 
 Write UTF-8 SRT plus an explicit `PlayResX`/`PlayResY` ASS in the workspace; burn the ASS with the FFmpeg `ass` filter using a relative filename and the workspace as process `cwd`. Do not feed the SRT to `subtitles` directly (default PlayRes 384x288 misplaces the bottom margin). Apply preset-derived styling (white text, outline, `Alignment=2`, `WrapStyle: 2`) using `PROMO_SUBTITLE_FONT` or verified `Microsoft YaHei` fallback. Preflight known Chinese font files, render a Chinese glyph probe and a tofu-square control, and require a non-identical pixel signature. Fail if the filter, font file or Chinese glyph coverage is unavailable.
 
-- [ ] **Step 6: Validate and atomically promote output**
+- [x] **Step 6: Validate and atomically promote output**
 
 Require file size ≥ `MEDIA_LIMITS.minFinalVideoBytes`; probe container, streams, codec, dimensions, pixel format, duration, audio presence and true peak; verify reconstructed SRT text contains every confirmed line without truncation; perform fixed subtitle frame comparisons; extract the first valid frame as poster; write all required manifest fields and SHA-256 checksums; require MP4/SRT/manifest to resolve inside the persistent run directory after atomic promotion. Missing or mismatched artifacts fail validation.
 
-- [ ] **Step 7: Remove REAL fallback from `composite`**
+- [x] **Step 7: Remove REAL fallback from `composite`**
 
 DEMO may return a labeled storyboard result. REAL catches no compositor error; it propagates failure to the workflow boundary.
 
-- [ ] **Step 8: Run compositor tests**
+- [x] **Step 8: Run compositor tests**
 
 Run: `node --import ./tests/setup.mjs --test tests/composite-real.test.mjs`
 
 Expected: PASS on the installed FFmpeg build; do not skip missing libass/font cases in the configured development environment.
 
-- [ ] **Step 9: Commit final compositor**
+- [x] **Step 9: Commit final compositor**
 
 ```powershell
 git add src/media/ffmpeg.js src/mastra/providers.js tests/composite-real.test.mjs

@@ -1,137 +1,366 @@
-// 真实 FFmpeg 合成冒烟测试（本机需有 ffmpeg 在 PATH，如 choco 版 8.0）。
-// 直接驱动 providers.composite（不经 workflow 的 one-api 调用），验证 M4 以来未真机验证的两条合成路径：
-//   A) 静态图序列 + 配音/配乐 → MP4（ffmpegAssemble：concat demuxer Duration 指令）
-//   B) 全镜动态片段（mp4）→ concat 直拼 + 音频混流（ffmpegAssembleVideo）
-// 若本机无 ffmpeg，自动 skip（不误报失败）。
-import { test } from "node:test";
+/**
+ * @file 真实成片合成测试。
+ * @description 用本机 FFmpeg/libass 验证 filter concat、响度混合、中文硬字幕烧录、持久化产物校验与缺失输入的硬失败。
+ */
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { execFileSync } from "node:child_process";
-import { composite } from "../src/mastra/providers.js";
+import { resolveCanvas } from "../src/media/canvas.js";
+import { artifactPaths, MEDIA_LIMITS, resolveRunArtifact } from "../src/media/artifacts.js";
+import { buildVoiceTimeline, concatenateVoiceSegments, probeAudioDuration } from "../src/media/audio.js";
+import { configuredFontPath, fontSupportsChinese } from "../src/media/font-readiness.js";
+import {
+  CHINESE_RENDER_PROBE,
+  TOFU_RENDER_PROBE,
+  assertSubtitleFilters,
+  composeFinalVideo,
+  normalizeSceneVideo,
+  verifyChineseSubtitleRendering,
+} from "../src/media/ffmpeg.js";
 
-function hasFfmpeg() {
-  try {
-    execFileSync("ffmpeg", ["-version"], { stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
+// 静止纯色素材：字幕区域差异只能来自烧录的字幕，避免画面运动污染像素判定。
+const SUBTITLE_LINES = ["铭星科技开场", "真实成片交付"];
+// 与实现一致的底部安全区比例，用于独立复算字幕像素差异。
+const SUBTITLE_REGION_FRACTION = 0.3;
+const FRAME_DIFF_THRESHOLD = 8;
+const FONT_PATH = configuredFontPath("Microsoft YaHei");
+
+const originalOutputRoot = process.env.PROMO_OUTPUT_ROOT;
+const originalFfmpegBin = process.env.PROMO_FFMPEG_BIN;
+const outputRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-composite-"));
+process.env.PROMO_OUTPUT_ROOT = outputRoot;
+process.env.PROMO_FFMPEG_BIN = "ffmpeg";
+
+before(() => {
+  execFileSync("ffmpeg", ["-version"], { stdio: "pipe" });
+  execFileSync("ffprobe", ["-version"], { stdio: "pipe" });
+  assert.ok(FONT_PATH && fs.existsSync(FONT_PATH), `缺少中文字幕字体：${FONT_PATH}`);
+  assert.ok(fontSupportsChinese(FONT_PATH), "中文字幕字体缺少中文字形");
+});
+
+after(() => {
+  if (originalOutputRoot === undefined) delete process.env.PROMO_OUTPUT_ROOT;
+  else process.env.PROMO_OUTPUT_ROOT = originalOutputRoot;
+  if (originalFfmpegBin === undefined) delete process.env.PROMO_FFMPEG_BIN;
+  else process.env.PROMO_FFMPEG_BIN = originalFfmpegBin;
+  fs.rmSync(outputRoot, { recursive: true, force: true });
+});
+
+function synthTone(target, { durationSec, frequency }) {
+  execFileSync("ffmpeg", [
+    "-y", "-v", "error", "-f", "lavfi", "-i", `sine=frequency=${frequency}:duration=${durationSec}`,
+    "-c:a", "pcm_s16le", target,
+  ], { stdio: "pipe" });
+}
+
+function synthClip(target, { color, durationSec }) {
+  execFileSync("ffmpeg", [
+    "-y", "-v", "error", "-f", "lavfi", "-i", `color=c=${color}:s=640x360:d=${durationSec}:r=24`,
+    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", target,
+  ], { stdio: "pipe" });
+}
+
+function probeFinal(file) {
+  const parsed = JSON.parse(execFileSync("ffprobe", [
+    "-v", "error",
+    "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt,channels,sample_rate:format=duration,format_name,size",
+    "-of", "json",
+    file,
+  ], { stdio: "pipe" }).toString());
+  return {
+    format: parsed.format,
+    video: (parsed.streams || []).find((stream) => stream.codec_type === "video"),
+    audio: (parsed.streams || []).find((stream) => stream.codec_type === "audio"),
+  };
+}
+
+/** 独立复算 EBU 响度：不接受 composeFinalVideo 自报的 checks。 */
+function measureLoudness(file) {
+  const run = spawnSync("ffmpeg", [
+    "-nostdin", "-v", "info", "-i", file,
+    "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+    "-f", "null", "-",
+  ], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  const match = /\{[\s\S]*\}/u.exec(String(run.stderr || ""));
+  assert.ok(match, `无法解析 loudnorm 输出：${String(run.stderr || "").slice(-400)}`);
+  return JSON.parse(match[0]);
+}
+
+function cropBottomGray(file, seekSec, canvas) {
+  const cropHeight = Math.max(2, Math.round((canvas.height * SUBTITLE_REGION_FRACTION) / 2) * 2);
+  const offsetY = canvas.height - cropHeight;
+  const args = ["-v", "error", "-nostdin", "-i", file];
+  if (seekSec > 0) args.push("-ss", Number(seekSec).toFixed(3));
+  args.push(
+    "-frames:v", "1",
+    "-vf", `crop=${canvas.width}:${cropHeight}:0:${offsetY},format=gray`,
+    "-f", "rawvideo", "-pix_fmt", "gray", "-",
+  );
+  return execFileSync("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
+}
+
+function pixelDiffRatio(left, right) {
+  const length = Math.min(left.length, right.length);
+  assert.ok(length > 0, "字幕像素校验无法读取帧数据");
+  let changed = 0;
+  for (let index = 0; index < length; index += 1) {
+    if (Math.abs(left[index] - right[index]) > FRAME_DIFF_THRESHOLD) changed += 1;
+  }
+  return changed / length;
+}
+
+function sceneAt(scenes, timeSec) {
+  let cursor = 0;
+  for (let index = 0; index < scenes.length; index += 1) {
+    const durationSec = scenes[index].durationSec;
+    if (timeSec < cursor + durationSec) return { index, localSec: Math.max(0, timeSec - cursor) };
+    cursor += durationSec;
+  }
+  const last = scenes.length - 1;
+  return { index: last, localSec: Math.max(0, scenes[last].durationSec - 0.04) };
+}
+
+let scenarioIndex = 0;
+
+/**
+ * 构造与真实工作流一致的一次运行：受管目录内的标准化片段 + 逐句配音 + 权威时间轴 + 配乐。
+ * @param {{preset: string, speechDurationsSec?: number[], tag?: string}} options 画布预设与逐句语音时长。
+ * @returns {Promise<object>} 合成所需的分镜、音轨、时间轴与受管路径。
+ */
+async function buildScenario({ preset, speechDurationsSec = [1.2, 1.3], tag = "compose" }) {
+  const runId = `${tag}-${scenarioIndex += 1}`;
+  const paths = artifactPaths(runId);
+  const canvas = resolveCanvas(preset);
+  const segments = speechDurationsSec.map((durationSec, index) => {
+    const target = path.join(paths.audio, `voice-segment-${index + 1}.wav`);
+    synthTone(target, { durationSec, frequency: 420 + index * 140 });
+    return target;
+  });
+  const measuredSec = [];
+  for (const segment of segments) measuredSec.push(await probeAudioDuration(segment));
+  const voicePath = await concatenateVoiceSegments(segments, { workspace: paths.audio });
+  const timeline = buildVoiceTimeline(SUBTITLE_LINES, measuredSec, { maxCharsPerLine: canvas.subtitle.maxCharsPerLine });
+
+  const scenes = [];
+  for (let index = 0; index < timeline.sceneDurationsMs.length; index += 1) {
+    const durationSec = timeline.sceneDurationsMs[index] / 1000;
+    const raw = path.join(paths.inputs, `scene-${index + 1}.mp4`);
+    synthClip(raw, { color: index % 2 === 0 ? "0x101010" : "0x181818", durationSec });
+    const videoPath = await normalizeSceneVideo({
+      source: raw,
+      inputsWorkspace: paths.inputs,
+      scenesWorkspace: paths.scenes,
+      canvasPreset: preset,
+      durationSec,
+    });
+    scenes.push({ index: index + 1, videoPath, durationSec });
+  }
+
+  const musicPath = path.join(paths.audio, "music.wav");
+  synthTone(musicPath, { durationSec: timeline.durationSec + 1.5, frequency: 220 });
+  return { runId, paths, canvas, timeline, scenes, voicePath, musicPath };
+}
+
+function composeOptions(scenario, overrides = {}) {
+  return {
+    scenes: scenario.scenes,
+    voice: {
+      voicePath: scenario.voicePath,
+      cues: scenario.timeline.cues,
+      durationSec: scenario.timeline.durationSec,
+    },
+    music: { musicPath: scenario.musicPath },
+    paths: scenario.paths,
+    canvasPreset: scenario.canvas.id,
+    fontPath: FONT_PATH,
+    ...overrides,
+  };
+}
+
+function dataUrl(file, mime) {
+  return `data:${mime};base64,${fs.readFileSync(file).toString("base64")}`;
+}
+
+function listen(handler) {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer(handler);
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve(server));
+  });
+}
+
+/** 断言成片与四件产物同时满足画布、编码、时长、响度、字幕与清单契约。 */
+function assertDeliverable(scenario, result) {
+  const { paths, canvas, timeline } = scenario;
+  assert.equal(result.validated, true, "应返回通过校验的成片结果");
+
+  for (const [key, target] of Object.entries({
+    finalVideo: paths.finalVideo,
+    subtitles: paths.subtitles,
+    poster: paths.poster,
+    manifest: paths.manifest,
+  })) {
+    assert.ok(fs.existsSync(target), `${key} 应提升到持久 run 目录`);
+    assert.equal(path.dirname(fs.realpathSync(target)), fs.realpathSync(paths.runRoot), `${key} 必须位于本次运行根目录`);
+  }
+  assert.equal(result.finalVideoPath, resolveRunArtifact(scenario.runId, paths.finalVideo));
+  assert.equal(result.subtitlesPath, paths.subtitles);
+  assert.equal(result.posterPath, paths.poster);
+  assert.equal(result.manifestPath, resolveRunArtifact(scenario.runId, paths.manifest));
+
+  const bytes = fs.statSync(paths.finalVideo).size;
+  assert.ok(bytes >= MEDIA_LIMITS.minFinalVideoBytes, `成片体积 ${bytes} 应不低于 ${MEDIA_LIMITS.minFinalVideoBytes}`);
+
+  const probed = probeFinal(paths.finalVideo);
+  assert.equal(probed.video.codec_name, "h264");
+  assert.equal(probed.video.pix_fmt, "yuv420p");
+  assert.equal(Number(probed.video.width), canvas.width);
+  assert.equal(Number(probed.video.height), canvas.height);
+  assert.match(String(probed.format.format_name), /mp4|mov/);
+  assert.ok(
+    Math.abs(Number(probed.format.duration) - timeline.durationSec) <= MEDIA_LIMITS.durationToleranceSec,
+    `时长 ${probed.format.duration}s 应≈${timeline.durationSec}s`,
+  );
+  assert.equal(probed.audio.codec_name, "aac");
+  assert.equal(Number(probed.audio.channels), 2);
+  assert.equal(Number(probed.audio.sample_rate), 48_000);
+
+  const srt = fs.readFileSync(paths.subtitles, "utf8");
+  assert.equal(srt, result.srt);
+  for (const line of SUBTITLE_LINES) {
+    assert.equal(srt.split(line).length - 1, 1, `SRT 应恰好包含一次「${line}」`);
+  }
+  assert.equal((srt.match(/-->/gu) || []).length, timeline.cues.length);
+
+  const manifest = JSON.parse(fs.readFileSync(paths.manifest, "utf8"));
+  assert.deepEqual(manifest, result.manifest);
+  assert.equal(manifest.validated, true);
+  assert.equal(manifest.runId, scenario.runId);
+  assert.deepEqual(manifest.canvas, {
+    id: canvas.id,
+    width: canvas.width,
+    height: canvas.height,
+    aspectRatio: canvas.aspectRatio,
+  });
+  assert.deepEqual(manifest.timeline.sceneDurationsSec, scenario.scenes.map((scene) => scene.durationSec));
+  assert.deepEqual(
+    manifest.timeline.cues.map((cue) => [cue.startMs, cue.endMs]),
+    timeline.cues.map((cue) => [cue.startMs, cue.endMs]),
+  );
+  assert.equal(manifest.audio.sampleRate, 48_000);
+  assert.equal(manifest.audio.channels, 2);
+  assert.match(String(manifest.ffmpeg.version), /ffmpeg/i);
+  assert.equal(manifest.subtitles.fontFile, path.basename(FONT_PATH));
+  assert.ok(manifest.subtitles.glyphProbeRatio > MEDIA_LIMITS.subtitlePixelDiffRatio);
+  for (const [key, target] of Object.entries({
+    finalVideo: paths.finalVideo,
+    subtitles: paths.subtitles,
+    poster: paths.poster,
+  })) {
+    assert.equal(manifest.artifacts[key].sha256, createHash("sha256").update(fs.readFileSync(target)).digest("hex"), `${key} 摘要应匹配`);
+    assert.equal(manifest.artifacts[key].bytes, fs.statSync(target).size, `${key} 体积应匹配`);
+    assert.equal(manifest.artifacts[key].path, path.basename(target));
+  }
+
+  const loudness = measureLoudness(paths.finalVideo);
+  assert.ok(Math.abs(Number(loudness.output_i) + 16) <= 0.5, `整体响度应为 -16±0.5 LUFS（实际 ${loudness.output_i}）`);
+  assert.ok(Number(loudness.output_tp) <= -1.3, `真峰值应不高于 -1.3 dBTP（实际 ${loudness.output_tp}）`);
+
+  for (const cue of [timeline.cues[0], timeline.cues[timeline.cues.length - 1]]) {
+    const midpointSec = (cue.startMs + cue.endMs) / 2_000;
+    const { index, localSec } = sceneAt(scenario.scenes, midpointSec);
+    const withSubtitles = cropBottomGray(paths.finalVideo, midpointSec, canvas);
+    const baseline = cropBottomGray(scenario.scenes[index].videoPath, localSec, canvas);
+    const ratio = pixelDiffRatio(withSubtitles, baseline);
+    assert.ok(
+      ratio > MEDIA_LIMITS.subtitlePixelDiffRatio,
+      `${midpointSec.toFixed(2)}s 字幕区域像素差异 ${ratio.toFixed(5)} 应超过 ${MEDIA_LIMITS.subtitlePixelDiffRatio}`,
+    );
   }
 }
-const FF = hasFfmpeg();
-// ffprobe 按 key 输出再解析：default 输出按字母序(format_name 在 duration 前)，且 format_name 自带逗号，只能按行+key 取
-const probe = (file) => {
-  const out = execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration,format_name", "-of", "default=noprint_wrappers=1", file], { stdio: "pipe" }).toString();
-  const kv = Object.fromEntries(out.split("\n").filter(Boolean).map((l) => l.split("=", 2)));
-  return { dur: kv.duration || "", fmt: kv.format_name || "" };
-};
 
-const prevMode = process.env.PROMO_PROVIDER_MODE;
-const prevFfmpeg = process.env.PROMO_FFMPEG_BIN;
-
-function svgDataUrl(i, color) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="320" height="180" fill="${color}"/><text x="160" y="96" fill="#fff" font-size="40" text-anchor="middle">镜 ${i}</text></svg>`;
-  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+for (const preset of ["social-portrait", "social-landscape", "social-square"]) {
+  test(`${preset}：真实合成产出带中文硬字幕的可交付 MP4`, async () => {
+    const scenario = await buildScenario({ preset });
+    const result = await composeFinalVideo(composeOptions(scenario));
+    assertDeliverable(scenario, result);
+  });
 }
 
-// 真实 PNG dataURL：ffmpeg 此构建无 librsvg，SVG 素材会解码失败 → 用 lavfi 生成纯色 PNG 模拟真实场景图
-function pngDataUrl(color, outFile) {
-  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=${color}:s=320x180`, "-frames:v", "1", outFile], { stdio: "pipe" });
-  return `data:image/png;base64,${fs.readFileSync(outFile).toString("base64")}`;
-}
-
-function genSilentMp3(sec, out) {
-  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", String(sec), "-b:a", "64k", out], { stdio: "pipe" });
-  return `data:audio/mp3;base64,${fs.readFileSync(out).toString("base64")}`;
-}
-
-function genTestMp4(sec, color, out) {
-  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=${color}:s=320x180:d=${sec}:r=24`, "-c:v", "libx264", "-pix_fmt", "yuv420p", out], { stdio: "pipe" });
-  return `file://${out}`;
-}
-
-const brief = { tones: ["科技感"] };
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "promo-test-"));
-const voiceMp3 = path.join(tmp, "voice.mp3");
-const musicMp3 = path.join(tmp, "music.mp3");
-
-test("composite 真实合成 A：静态图序列 + 配音 + 配乐 → MP4（ffmpeg 可用时）", { skip: !FF && "本机无 ffmpeg，跳过真实合成" }, async () => {
-  process.env.PROMO_PROVIDER_MODE = "real";
-  process.env.PROMO_FFMPEG_BIN = "ffmpeg";
-  const pngs = [1, 2, 3, 4].map((i) => path.join(tmp, `img${i}.png`));
-  const scenes = [1, 2, 3, 4].map((i) => ({
-    index: i,
-    subtitle: `场景 ${i}`,
-    mediaUrl: pngDataUrl(i % 2 ? "0x6366f1" : "0x0ea5e9", pngs[i - 1]),
-    durationSec: 2,
-  }));
+test("配音与配乐可从 file / data / HTTP 来源进入合成", async () => {
+  const scenario = await buildScenario({ preset: "social-square", speechDurationsSec: [0.8, 0.8], tag: "source" });
+  const server = await listen((request, response) => {
+    const file = request.url === "/music.wav" ? scenario.musicPath : scenario.voicePath;
+    response.writeHead(200, { "content-type": "audio/wav" });
+    fs.createReadStream(file).pipe(response);
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const { cues, durationSec } = scenario.timeline;
   try {
-    const voice = { voiceUrl: genSilentMp3(5, voiceMp3), srt: "1\n00:00:00,000 --> 00:00:02,000\n你好\n", voiceTone: "男声" };
-    const music = { musicUrl: genSilentMp3(5, musicMp3), mood: "科技感" };
-    const out = await composite(scenes, voice, music, brief);
-    assert.equal(out.model, "ffmpeg", "real + ffmpeg 应走真实合成而非降级");
-    assert.ok(out.videoUrl?.startsWith("file://"), `应产出 file:// MP4（实际 ${out.videoUrl}）`);
-    const file = out.videoUrl.slice(7);
-    assert.ok(fs.existsSync(file) && fs.statSync(file).size > 2000, "MP4 应存在且非空");
-    const { dur, fmt } = probe(file);
-    assert.match(fmt, /mp4|mov/, `格式应为 mp4（实际 ${fmt}）`);
-    const total = scenes.reduce((a, s) => a + (s.durationSec || 0), 0);
-    assert.ok(Math.abs(parseFloat(dur) - total) < 1.5, `时长应≈${total}s（实际 ${dur}s）`);
-    assert.equal(out.storyboardGallery.length, 4);
-    assert.ok(out.srt.includes("-->"));
+    const variants = [
+      { name: "file://", voice: pathToFileURL(scenario.voicePath).href, music: pathToFileURL(scenario.musicPath).href },
+      { name: "data:", voice: dataUrl(scenario.voicePath, "audio/wav"), music: dataUrl(scenario.musicPath, "audio/wav") },
+      { name: "http:", voice: `${base}/voice.wav`, music: `${base}/music.wav` },
+    ];
+    for (const variant of variants) {
+      const result = await composeFinalVideo(composeOptions(scenario, {
+        voice: { voiceUrl: variant.voice, cues, durationSec },
+        music: { musicUrl: variant.music },
+      }));
+      assert.ok(result.validated, `${variant.name} 来源应通过成片校验`);
+      assert.ok(fs.existsSync(scenario.paths.finalVideo), `${variant.name} 来源应提升最终成片`);
+      assert.equal(probeFinal(scenario.paths.finalVideo).audio.codec_name, "aac");
+    }
   } finally {
-    process.env.PROMO_PROVIDER_MODE = prevMode;
-    process.env.PROMO_FFMPEG_BIN = prevFfmpeg;
+    server.close();
   }
 });
 
-test("composite 真实合成 B：全镜动态片段 concat 直拼 + 配音 → MP4（ffmpeg 可用时）", { skip: !FF && "本机无 ffmpeg，跳过真实合成" }, async () => {
-  process.env.PROMO_PROVIDER_MODE = "real";
-  process.env.PROMO_FFMPEG_BIN = "ffmpeg";
-  const v1 = path.join(tmp, "v1.mp4");
-  const v2 = path.join(tmp, "v2.mp4");
-  const scenes = [
-    { index: 1, subtitle: "动态镜1", mediaUrl: svgDataUrl(1, "#7c3aed"), videoUrl: genTestMp4(2, "0x7c3aed", v1), durationSec: 2 },
-    { index: 2, subtitle: "动态镜2", mediaUrl: svgDataUrl(2, "#dc2626"), videoUrl: genTestMp4(2, "0xdc2626", v2), durationSec: 2 },
-  ];
-  try {
-    genSilentMp3(4, voiceMp3);
-    const voice = { voicePath: voiceMp3, srt: "", voiceTone: "男声" };
-    const out = await composite(scenes, voice, undefined, brief);
-    assert.equal(out.model, "ffmpeg", "real + ffmpeg 应走真实合成");
-    assert.ok(out.videoUrl?.startsWith("file://"), `应产出 file:// 视频（实际 ${out.videoUrl}）`);
-    const file = out.videoUrl.slice(7);
-    assert.ok(fs.existsSync(file) && fs.statSync(file).size > 2000, "拼接产物应存在且非空");
-    const { dur, fmt } = probe(file);
-    assert.match(fmt, /mp4|mov/);
-    assert.ok(parseFloat(dur) >= 3.5, `两段 2s 片段拼接应≈4s（实际 ${dur}s）`);
-    const audioStream = execFileSync("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file], { stdio: "pipe" }).toString().trim();
-    assert.equal(audioStream, "audio");
-  } finally {
-    process.env.PROMO_PROVIDER_MODE = prevMode;
-    process.env.PROMO_FFMPEG_BIN = prevFfmpeg;
-  }
+test("中文渲染探针通过真字体并拒绝缺字形/缺字体", async () => {
+  assert.notEqual(CHINESE_RENDER_PROBE, TOFU_RENDER_PROBE);
+  const paths = artifactPaths("glyph-probe-1");
+  const ratio = await verifyChineseSubtitleRendering({
+    canvasPreset: "social-square",
+    fontPath: FONT_PATH,
+    workspace: paths.temp,
+  });
+  assert.ok(ratio > MEDIA_LIMITS.subtitlePixelDiffRatio, `中文探针像素差异 ${ratio} 应超过阈值`);
+  await assert.rejects(
+    verifyChineseSubtitleRendering({
+      canvasPreset: "social-square",
+      fontPath: path.join(outputRoot, "missing-font.ttf"),
+      workspace: paths.temp,
+    }),
+    /字体/,
+  );
+  const filters = await assertSubtitleFilters("ffmpeg");
+  assert.match(filters, /(?:^|\s)ass(?:\s|$)/mu);
+  await assert.rejects(
+    assertSubtitleFilters("ffmpeg", { execFile: async () => ({ stdout: "Filters:\n ... scale  V->V  Scale\n", stderr: "" }) }),
+    /缺少 ass|缺少 subtitles/u,
+  );
 });
 
-test("composite 真实合成 C：动态片段 + 超长配乐 → 成片以画面总长截断（ffmpeg 可用时）", { skip: !FF && "本机无 ffmpeg，跳过真实合成" }, async () => {
-  process.env.PROMO_PROVIDER_MODE = "real";
-  process.env.PROMO_FFMPEG_BIN = "ffmpeg";
-  const v1 = path.join(tmp, "c1.mp4");
-  const scenes = [{ index: 1, subtitle: "动态镜1", mediaUrl: svgDataUrl(1, "#6366f1"), videoUrl: genTestMp4(2, "0x6366f1", v1), durationSec: 2 }];
-  try {
-    genSilentMp3(2, voiceMp3);
-    genSilentMp3(20, musicMp3);
-    const voice = { voiceUrl: pathToFileURL(voiceMp3).href, srt: "", voiceTone: "男声" };
-    const music = { musicUrl: pathToFileURL(musicMp3).href, mood: "科技感" }; // 配乐 20s ≫ 画面 2s
-    const out = await composite(scenes, voice, music, brief);
-    assert.equal(out.model, "ffmpeg", "real + ffmpeg 应走真实合成");
-    const file = out.videoUrl.slice(7);
-    const { dur } = probe(file);
-    assert.ok(Math.abs(parseFloat(dur) - 2) < 1.0, `配乐超长应截断到画面时长 2s（实际 ${dur}s）`);
-  } finally {
-    process.env.PROMO_PROVIDER_MODE = prevMode;
-    process.env.PROMO_FFMPEG_BIN = prevFfmpeg;
-  }
+test("缺失视频/配音/配乐/字体/字幕滤镜时真实合成直接拒绝，不留下降级产物", async () => {
+  const scenario = await buildScenario({ preset: "social-square", speechDurationsSec: [0.6, 0.6], tag: "reject" });
+  const base = composeOptions(scenario);
+
+  await assert.rejects(composeFinalVideo({ ...base, scenes: [{ index: 1, durationSec: 0.6 }] }), /动态片段|标准化/u);
+  await assert.rejects(composeFinalVideo({ ...base, scenes: [] }), /至少需要一个/u);
+  await assert.rejects(composeFinalVideo({ ...base, voice: { voicePath: scenario.voicePath, durationSec: scenario.timeline.durationSec } }), /字幕 cue|cue/u);
+  await assert.rejects(composeFinalVideo({ ...base, music: {} }), /配乐/u);
+  await assert.rejects(composeFinalVideo({ ...base, fontPath: path.join(outputRoot, "missing-font.ttf") }), /字体/u);
+  await assert.rejects(composeFinalVideo({ ...base, paths: undefined }), /artifactPaths|产物目录/u);
+  await assert.rejects(
+    composeFinalVideo({ ...base, execFile: async () => ({ stdout: "Filters:\n ... subtitles  V->V  x\n", stderr: "" }) }),
+    /缺少 ass/u,
+  );
+  assert.equal(fs.existsSync(scenario.paths.finalVideo), false, "拒绝路径不得产出 final.mp4");
+  assert.equal(fs.existsSync(scenario.paths.manifest), false, "拒绝路径不得产出 manifest.json");
 });

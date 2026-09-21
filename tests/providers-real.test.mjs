@@ -20,6 +20,7 @@ import { artifactPaths } from "../src/media/artifacts.js";
 
 const { test, after } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
+const { normalizeSceneVideo } = await import("../src/media/ffmpeg.js");
 const providers = await import("../src/mastra/providers.js");
 const {
   getProviderMode,
@@ -516,43 +517,107 @@ test("generateMusic 真实模式：POST /audio/music + 返回 url + _usage.track
   assert.equal(m._usage.tracks, 1);
 });
 
-test("composite 真实模式无 FFmpeg：优雅降级为分镜包（含 reason）", async () => {
-  delete process.env.PROMO_FFMPEG_BIN;
+test("composite 真实模式缺少受管产物目录或 FFmpeg：直接拒绝，不再降级为分镜包", async () => {
   const script = await generateScript(baseBrief);
   const scenes = await generateStoryboard(baseBrief, script);
   const v = await generateVoiceover(script, baseBrief, { workspace: audioWorkspace() });
   const m = await generateMusic(baseBrief, scenes, { workspace: audioWorkspace() });
-  const comp = await composite(scenes, v, m, baseBrief);
-  assert.equal(comp.model, "demo-composite");
-  assert.match(comp.note, /未配置 PROMO_FFMPEG_BIN/);
-  assert.ok(Array.isArray(comp.storyboardGallery) && comp.storyboardGallery.length === 2);
+  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-provider-reject-"));
+  const previousOutputRoot = process.env.PROMO_OUTPUT_ROOT;
+  process.env.PROMO_OUTPUT_ROOT = probeRoot;
+  try {
+    // 缺少受管产物目录：必须直接失败，不得回落为分镜包
+    await assert.rejects(() => composite(scenes, v, m, baseBrief), /受管产物目录|artifactPaths/u);
+    const paths = artifactPaths("provider-composite-reject");
+    const previousFfmpeg = process.env.PROMO_FFMPEG_BIN;
+    delete process.env.PROMO_FFMPEG_BIN;
+    try {
+      await assert.rejects(
+        () => composite(scenes, v, m, baseBrief, { paths }),
+        /PROMO_FFMPEG_BIN/u,
+      );
+    } finally {
+      if (previousFfmpeg === undefined) delete process.env.PROMO_FFMPEG_BIN;
+      else process.env.PROMO_FFMPEG_BIN = previousFfmpeg;
+    }
+    assert.equal(fs.existsSync(paths.finalVideo), false, "拒绝路径不得遗留 final.mp4");
+    assert.equal(fs.existsSync(paths.manifest), false, "拒绝路径不得遗留 manifest.json");
+  } finally {
+    if (previousOutputRoot === undefined) delete process.env.PROMO_OUTPUT_ROOT;
+    else process.env.PROMO_OUTPUT_ROOT = previousOutputRoot;
+    fs.rmSync(probeRoot, { recursive: true, force: true });
+  }
 });
 
-test("provider 产出的 file:// 配音与配乐进入现有 compositor 音频流", async () => {
+test("provider 产出的受管配音与配乐进入真实合成并烧录字幕", async () => {
   const previousFfmpeg = process.env.PROMO_FFMPEG_BIN;
+  const previousOutputRoot = process.env.PROMO_OUTPUT_ROOT;
+  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-provider-mix-"));
   process.env.PROMO_FFMPEG_BIN = "ffmpeg";
-  const pngFile = path.join(mediaRoot, "provider-composite.png");
-  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180", "-frames:v", "1", pngFile], { stdio: "pipe" });
-  const scenes = [{
-    index: 1,
-    subtitle: "真实音频",
-    mediaUrl: `data:image/png;base64,${fs.readFileSync(pngFile).toString("base64")}`,
-    durationSec: 1,
-  }];
+  process.env.PROMO_OUTPUT_ROOT = probeRoot;
   try {
-    const audioDir = audioWorkspace();
-    const voice = await generateVoiceover({ voiceover: [{ text: "真实音频" }] }, baseBrief, { workspace: audioDir });
-    const music = await generateMusic(baseBrief, scenes, { workspace: audioDir });
-    const out = await composite(scenes, voice, music, baseBrief);
+    const brief = { ...baseBrief, canvasPreset: "social-portrait" };
+    const scripted = await generateScript(brief);
+    // 字幕像素校验要求真实字形覆盖：mock 脚本返回的拉丁短语覆盖不足，改用真实中文台词。
+    const script = {
+      ...scripted,
+      voiceover: [
+        { timecode: "00:00:00.000", text: "铭星科技开场" },
+        { timecode: "00:00:01.000", text: "真实成片交付" },
+      ],
+    };
+    const proposed = await generateStoryboard(brief, script);
+    const paths = artifactPaths("provider-composite-mix");
+    const voice = await generateVoiceover(script, brief, { workspace: paths.audio });
+    const music = await generateMusic(brief, proposed, { workspace: paths.audio });
+
+    // 真实合成只消费受管工作区内的标准化动态片段：逐镜按权威时长归一化。
+    const scenes = [];
+    for (let index = 0; index < proposed.length; index += 1) {
+      const durationSec = voice.sceneDurationsMs[index] / 1000;
+      const rawClip = path.join(paths.inputs, "raw-" + (index + 1) + ".mp4");
+      execFileSync("ffmpeg", [
+        "-y", "-v", "error", "-f", "lavfi",
+        "-i", "color=c=0x1" + index + "1" + index + "1" + index + ":s=640x360:d=" + durationSec + ":r=24",
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", rawClip,
+      ], { stdio: "pipe" });
+      const videoPath = await normalizeSceneVideo({
+        source: rawClip,
+        inputsWorkspace: paths.inputs,
+        scenesWorkspace: paths.scenes,
+        canvasPreset: brief.canvasPreset,
+        durationSec,
+      });
+      scenes.push({ ...proposed[index], videoPath, durationSec });
+    }
+
+    const out = await composite(scenes, voice, music, brief, { paths });
     assert.equal(out.model, "ffmpeg", out.note);
+    assert.equal(out.validated, true, "真实合成必须标记为已校验");
     const outputFile = fileURLToPath(out.videoUrl);
-    const stream = execFileSync("ffprobe", [
-      "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", outputFile,
-    ], { stdio: "pipe" }).toString().trim();
-    assert.equal(stream, "audio");
+    assert.equal(outputFile, paths.finalVideo);
+    assert.equal(fs.realpathSync(path.dirname(outputFile)), fs.realpathSync(paths.runRoot));
+    assert.ok(fs.existsSync(paths.subtitles) && fs.existsSync(paths.manifest));
+    const streams = execFileSync("ffprobe", [
+      "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:format=duration,format_name",
+      "-of", "json", outputFile,
+    ], { stdio: "pipe" }).toString();
+    const probed = JSON.parse(streams);
+    const video = probed.streams.find((s) => s.codec_type === "video");
+    const audio = probed.streams.find((s) => s.codec_type === "audio");
+    assert.equal(video.codec_name, "h264");
+    assert.equal(Number(video.width), 1080);
+    assert.equal(Number(video.height), 1920);
+    assert.equal(audio.codec_name, "aac");
+    assert.match(String(probed.format.format_name), /mp4/u);
+    assert.ok(Math.abs(Number(probed.format.duration) - voice.durationSec) <= 0.75);
+    assert.ok(fs.readFileSync(paths.subtitles, "utf8").includes("铭星科技开场"), "硬字幕来源 SRT 应保留逐句台词");
   } finally {
     if (previousFfmpeg === undefined) delete process.env.PROMO_FFMPEG_BIN;
     else process.env.PROMO_FFMPEG_BIN = previousFfmpeg;
+    if (previousOutputRoot === undefined) delete process.env.PROMO_OUTPUT_ROOT;
+    else process.env.PROMO_OUTPUT_ROOT = previousOutputRoot;
+    fs.rmSync(probeRoot, { recursive: true, force: true });
   }
 });
 

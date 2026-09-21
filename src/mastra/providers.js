@@ -12,11 +12,13 @@ import { withGlobalLanguage } from "../i18n.js";
 import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey } from "../runtime-config.js";
 import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
 import { materializeMedia } from "../media/materialize.js";
-import { normalizeSceneImage, normalizeSceneVideo } from "../media/ffmpeg.js";
+import { assertSubtitleFilters, composeFinalVideo, normalizeSceneImage, normalizeSceneVideo } from "../media/ffmpeg.js";
 import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration } from "../media/audio.js";
 import { MEDIA_LIMITS } from "../media/artifacts.js";
+import { configuredFontPath, fontSupportsChinese, resolveFontFile } from "../media/font-readiness.js";
 import fs from "node:fs";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 // ───────────────────────── 模式判定 ─────────────────────────
 // 生效顺序：运行时配置（页面「模型与服务」保存的 providerMode）> env（PROMO_PROVIDER_MODE=real）；
@@ -754,197 +756,106 @@ function demoMusic(brief) {
   return { musicUrl: null, mood: (brief.tones || ["专业"]).join("/"), model: "demo-mureka" };
 }
 
-// ───────────────────────── 6) 合成（服务端 FFmpeg） ─────────────────────────
-export async function composite(scenes, voice, music, brief) {
-  if (getProviderMode() !== "real") return demoComposite(scenes, voice, music, brief);
-  const ffmpeg = process.env.PROMO_FFMPEG_BIN;
-  const gallery = scenes.map((s) => ({ index: s.index, mediaUrl: s.mediaUrl, subtitle: s.subtitle }));
-  if (!ffmpeg) {
-    return fallbackComposite(scenes, voice, music, brief, "未配置 PROMO_FFMPEG_BIN，已降级为分镜包");
-  }
-  try {
-    const videoUrl = await ffmpegAssemble(ffmpeg, scenes, voice, music, brief);
-    return {
-      videoUrl,
-      poster: scenes[0]?.mediaUrl || null,
-      storyboardGallery: gallery,
-      srt: voice?.srt || "",
-      note: "已合成为 MP4（服务端 FFmpeg）。",
-      model: "ffmpeg",
-      _usage: { videos: 1 },
-    };
-  } catch (e) {
-    return fallbackComposite(scenes, voice, music, brief, `合成失败已降级：${String(e?.message || e)}`);
-  }
+// ───────────────────────── 6) 成片合成（服务端 FFmpeg，硬字幕 + 配音 + 配乐） ─────────────────────────
+// REAL：必须产出持久化 final.mp4 / subtitles.srt / poster.jpg / manifest.json，任一缺失或校验失败即抛错，
+//       不再有"分镜包降级"这一成功路径；失败由工作流边界统一置 run=failed。
+// DEMO：返回带 DEMO 标记的分镜故事板，页面据此明确区分为演示结果。
+
+async function resolveSubtitleFont(font) {
+  const knownPath = configuredFontPath(font);
+  if (knownPath) return knownPath;
+  return resolveFontFile(font);
 }
 
-function fallbackComposite(scenes, voice, music, brief, reason) {
+async function resolveCompositeFont() {
+  const configured = String(process.env.PROMO_SUBTITLE_FONT || "Microsoft YaHei").trim();
+  if (!configured) throw new Error("真实合成缺少中文字幕字体配置 PROMO_SUBTITLE_FONT");
+  let fontPath;
+  try {
+    fontPath = await resolveSubtitleFont(configured);
+  } catch (error) {
+    throw new Error(`真实合成无法定位中文字幕字体 ${configured}：${error?.message || error}`, { cause: error });
+  }
+  if (!fs.existsSync(fontPath)) throw new Error(`真实合成的中文字幕字体文件不存在：${path.basename(fontPath)}`);
+  if (!fontSupportsChinese(fontPath)) throw new Error("真实合成的中文字幕字体缺少中文字形（cmap 校验未通过）");
+  return { fontPath, fontName: configured };
+}
+
+function persistentPublicUrl(runId, filePath, route) {
+  if (!fs.existsSync(filePath)) throw new Error(`真实合成产物缺失：${path.basename(filePath)}`);
+  return route ? `/api/runs/${runId}/${route}` : pathToFileURL(filePath).href;
+}
+
+/**
+ * 合成成片。REAL 模式产出带配音、配乐与中文硬字幕的持久化 MP4 及字幕、封面、manifest。
+ *
+ * @param {Array<Record<string, any>>} scenes 已标准化且含 `videoPath`/`durationSec` 的分镜。
+ * @param {Record<string, any>} voice 逐句配音与权威时间轴（`voicePath`/`voiceUrl`/`cues`/`durationSec`）。
+ * @param {Record<string, any>} music 配乐（`musicPath`/`musicUrl`）。
+ * @param {Record<string, any>} brief 已解析 Brief。
+ * @param {{paths?: ReturnType<typeof import("../media/artifacts.js").artifactPaths>, models?: Record<string, unknown>}} [options]
+ *        `artifactPaths(runId)` 返回的受管产物目录；REAL 模式必填。
+ * @returns {Promise<{videoUrl: string|null, poster: string|null, storyboardGallery: Array, srt: string, note: string, model: string, artifacts?: object, artifactManifest?: object, validated?: boolean, _usage?: object}>} 合成结果。
+ * @throws {Error} REAL 模式下任一输入、滤镜、字体或校验缺失时抛出，不再降级。
+ * @example await composite(scenes, voice, music, brief, { paths: artifactPaths(runId) });
+ */
+export async function composite(scenes, voice, music, brief, options = {}) {
+  if (getProviderMode() !== "real") return demoComposite(scenes, voice, music, brief);
+  const gallery = scenes.map((s) => ({ index: s.index, mediaUrl: s.mediaUrl, subtitle: s.subtitle }));
+  const paths = options.paths;
+  if (!paths) throw new Error("真实合成必须提供 artifactPaths(runId) 返回的受管产物目录");
+  const ffmpeg = process.env.PROMO_FFMPEG_BIN;
+  if (!ffmpeg) throw new Error("真实合成缺少 FFmpeg 配置（PROMO_FFMPEG_BIN）");
+  await assertSubtitleFilters(ffmpeg);
+  const missingVideo = scenes.filter((s) => typeof s.videoPath !== "string" || s.videoPath === "");
+  if (missingVideo.length > 0) {
+    throw new Error(`真实合成要求每镜都有标准化动态片段，缺失镜号：${missingVideo.map((s) => s.index ?? "?").join("、")}`);
+  }
+  const { fontPath, fontName } = await resolveCompositeFont();
+  const result = await composeFinalVideo({
+    scenes,
+    voice,
+    music,
+    paths,
+    canvasPreset: brief?.canvasPreset,
+    fontPath,
+    fontFamily: fontName,
+    models: {
+      video: brief?.videoModel || null,
+      tts: voice?.model || null,
+      music: music?.model || null,
+      image: brief?.imageModel || null,
+      ...(options.models || {}),
+    },
+  });
+  const runId = path.basename(paths.runRoot);
+  return {
+    videoUrl: pathToFileURL(result.finalVideoPath).href,
+    poster: pathToFileURL(result.posterPath).href,
+    storyboardGallery: gallery,
+    srt: result.srt,
+    note: "已合成为 MP4（服务端 FFmpeg，含配音、配乐与中文硬字幕）。",
+    model: "ffmpeg",
+    validated: true,
+    artifacts: {
+      finalVideo: persistentPublicUrl(runId, result.finalVideoPath),
+      subtitles: `/api/runs/${runId}/artifacts/subtitles`,
+      poster: `/api/runs/${runId}/artifacts/poster`,
+    },
+    artifactManifest: result.manifest,
+    _usage: { videos: 1 },
+  };
+}
+
+function demoComposite(scenes, voice, music, brief) {
   return {
     videoUrl: null,
     poster: scenes[0]?.mediaUrl || null,
     storyboardGallery: scenes.map((s) => ({ index: s.index, mediaUrl: s.mediaUrl, subtitle: s.subtitle })),
     srt: voice?.srt || "",
-    note: `DEMO/降级模式：${reason}（生产环境将合成为 MP4）。`,
+    note: "DEMO/降级模式：未接入真实合成服务，以下为分镜故事板（生产环境将合成为 MP4）。",
     model: "demo-composite",
   };
-}
-
-function demoComposite(scenes, voice, music, brief) {
-  return fallbackComposite(scenes, voice, music, brief, "未接入真实合成服务，以下为分镜故事板");
-}
-
-function compositorAudioFile(track, { pathKey, urlKey, target, fs }) {
-  const directPath = track?.[pathKey];
-  if (typeof directPath === "string" && directPath) return directPath;
-  const source = track?.[urlKey];
-  if (typeof source !== "string" || !source) return null;
-  if (source.startsWith("file:")) return fileURLToPath(source);
-  if (source.startsWith("data:audio")) {
-    fs.writeFileSync(target, Buffer.from(source.split(",")[1], "base64"));
-    return target;
-  }
-  return null;
-}
-
-// 服务端 FFmpeg 组装：将场景图/动态片段 + 配音 + 配乐合为 MP4。要求 ffmpeg 可用且素材可本地读取。
-async function ffmpegAssemble(ffmpeg, scenes, voice, music, brief) {
-  // 动态视频路径：全部镜均已产出动态片段（scene.videoUrl）→ concat demuxer 直拼 + 音频混流。
-  // 前提：同一渠道同设置产物编码/尺寸一致（concat demuxer 流复制不转码）；不一致或失败由外层 catch 降级。
-  const videoScenes = scenes.filter((s) => s.videoUrl);
-  if (videoScenes.length === scenes.length && videoScenes.length > 0) {
-    return ffmpegAssembleVideo(ffmpeg, scenes, voice, music, brief);
-  }
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const { execFileSync } = await import("node:child_process");
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "promo-"));
-  // 静态图幻灯路径：每张图以 -loop 1 -t <dur> 作为独立输入，concat filter 拼接。
-  // 不用 concat demuxer 的 duration 指令 —— 它对单帧图片的"最后一段时长"不可靠（末图只出 1 帧）。
-  const inputs = [];
-  const imgArgs = [];
-  const n = scenes.length;
-  for (let i = 0; i < n; i++) {
-    const s = scenes[i];
-    const img = path.join(tmp, `s${i}.img`);
-    if (s.mediaUrl?.startsWith("data:image")) {
-      const b64 = s.mediaUrl.split(",")[1];
-      fs.writeFileSync(img, Buffer.from(b64, "base64"));
-    } else if (s.mediaUrl?.startsWith("http")) {
-      // 远程图需可访问；此处用 curl 拉取（生产建议预下载到对象存储）。
-      execFileSync("curl", ["-sL", s.mediaUrl, "-o", img]);
-    } else {
-      throw new Error(`第 ${s.index} 镜场景图缺失，无法合成`);
-    }
-    // 按内容魔数选真实扩展名（JPEG 字节不可当 .png 喂 ffmpeg；seedream 等渠道返回 jpg/webp 常见）。
-    const head = fs.readFileSync(img).subarray(0, 12);
-    let ext = ".png";
-    if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) ext = ".jpg";
-    else if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e) ext = ".png";
-    else if (head.toString("latin1").startsWith("RIFF") && head.subarray(8, 12).toString("latin1") === "WEBP") ext = ".webp";
-    const file = path.join(tmp, `s${i}${ext}`);
-    fs.renameSync(img, file);
-    const dur = (s.durationSec || 5).toFixed(2);
-    imgArgs.push("-loop", "1", "-t", dur, "-framerate", "25", "-i", file);
-  }
-  // 音频输入紧随图像之后：voice 为 n 号、music 为 n+1 号（audioInputs 存 ["-i",file] 对，须用 audioCount 计输入流数）
-  let voiceIdx = -1, musicIdx = -1;
-  const audioInputs = [];
-  let audioCount = 0;
-  const voiceFile = compositorAudioFile(voice, {
-    pathKey: "voicePath", urlKey: "voiceUrl", target: path.join(tmp, "voice.audio"), fs,
-  });
-  if (voiceFile) {
-    voiceIdx = n + audioCount++;
-    audioInputs.push("-i", voiceFile);
-  }
-  const musicFile = compositorAudioFile(music, {
-    pathKey: "musicPath", urlKey: "musicUrl", target: path.join(tmp, "music.audio"), fs,
-  });
-  if (musicFile) {
-    musicIdx = n + audioCount++;
-    audioInputs.push("-i", musicFile);
-  }
-  const out = path.join(tmp, "out.mp4");
-  // 统一画布：seedream/doubao 等渠道对 aspect_ratio 是 best-effort，同一批场景图可能混出不同几何
-  //（实测 5 镜返回 1152×864 / 864×1152 竖图 / 1312×736×3）。concat filter 要求输入几何完全一致 →
-  // 每镜先 scale+pad 归一到 1280×720(16:9) 画布（黑边 letterbox、不裁剪），再 concat，杜绝尺寸不匹配。
-  const CW = 1280, CH = 720;
-  const norm = scenes
-    .map((_, i) => `[${i}:v]scale=${CW}:${CH}:force_original_aspect_ratio=decrease,pad=${CW}:${CH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v${i}]`)
-    .join(";");
-  const joined = scenes.map((_, i) => `[v${i}]`).join("");
-  let fc = `${norm};${joined}concat=n=${n}:v=1:a=0[vout]`;
-  const maps = ["-map", "[vout]"];
-  if (voiceIdx >= 0 && musicIdx >= 0) {
-    fc += `;[${voiceIdx}:a][${musicIdx}:a]amix=inputs=2:duration=longest[aout]`;
-    maps.push("-map", "[aout]");
-  } else if (voiceIdx >= 0) {
-    maps.push("-map", `${voiceIdx}:a`);
-  } else if (musicIdx >= 0) {
-    maps.push("-map", `${musicIdx}:a`);
-  }
-  // 以画面总时长为准（voice/music 短则尾部静音、长则被截）；-shortest 会把画面截到最短音轨，故不用。
-  const totalSec = scenes.reduce((a, s) => a + (s.durationSec || 5), 0).toFixed(2);
-  const args = ["-y", ...imgArgs, ...audioInputs, "-filter_complex", fc, ...maps, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", totalSec, "-y", out];
-  try {
-    execFileSync(ffmpeg, args, { stdio: "pipe" });
-  } catch (e) {
-    const stderr = String(e?.stderr || "");
-    const detail = (stderr.split("\n").filter(Boolean).slice(-6).join("\n")).slice(0, 500);
-    throw new Error(`ffmpeg 合成失败：${String(e?.message || e).slice(0, 100)}${detail ? ` :: ${detail}` : ""}`);
-  }
-  // 返回本地文件路径（生产应上传对象存储并返回直链）
-  return `file://${out}`;
-}
-
-// 动态片段直拼：全部镜为 mp4 片段（本地 file:// 或可下载 http(s)）→ concat demuxer + 音频 amix。
-// 注意：真实渠道产物通常同编码同尺寸可直接流复制；若渠道混用导致失败，会落到 fallbackComposite 提示。
-async function ffmpegAssembleVideo(ffmpeg, scenes, voice, music, brief) {
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const { execFileSync } = await import("node:child_process");
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "promo-vid-"));
-  const list = path.join(tmp, "list.txt");
-  const lines = [];
-  for (let i = 0; i < scenes.length; i++) {
-    const s = scenes[i];
-    const vf = path.join(tmp, `v${i}.mp4`);
-    const url = s.videoUrl;
-    if (url?.startsWith("file://")) {
-      fs.copyFileSync(url.slice(7), vf);
-    } else if (url?.startsWith("http")) {
-      execFileSync("curl", ["-sL", url, "-o", vf]);
-    } else if (url?.startsWith("data:video")) {
-      fs.writeFileSync(vf, Buffer.from(url.split(",")[1], "base64"));
-    } else {
-      throw new Error(`第 ${s.index} 镜视频 URL 无法本地化：${String(url || "空").slice(0, 80)}`);
-    }
-    if (!fs.existsSync(vf) || fs.statSync(vf).size < 100) throw new Error(`第 ${s.index} 镜视频下载失败/为空`);
-    lines.push(`file '${vf.replace(/'/g, "'\\''")}'`);
-  }
-  fs.writeFileSync(list, lines.join("\n"));
-  const out = path.join(tmp, "out.mp4");
-  const args = ["-f", "concat", "-safe", "0", "-i", list];
-  const voiceFile = compositorAudioFile(voice, {
-    pathKey: "voicePath", urlKey: "voiceUrl", target: path.join(tmp, "voice.audio"), fs,
-  });
-  const musicFile = compositorAudioFile(music, {
-    pathKey: "musicPath", urlKey: "musicUrl", target: path.join(tmp, "music.audio"), fs,
-  });
-  if (voiceFile) args.push("-i", voiceFile);
-  if (musicFile) args.push("-i", musicFile);
-  if (voiceFile && musicFile) {
-    args.push("-filter_complex", "[1:a][2:a]amix=inputs=2[a]", "-map", "0:v", "-map", "[a]");
-  } else if (voiceFile || musicFile) {
-    args.push("-map", "0:v", "-map", "1:a");
-  }
-  // 以画面总时长为准（真实配乐常长于画面，须截断；voice 不足尾部静音）
-  const totalSec = scenes.reduce((a, s) => a + (s.durationSec || 5), 0).toFixed(2);
-  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-t", totalSec, "-y", out);
-  execFileSync(ffmpeg, args, { stdio: "pipe" });
-  return `file://${out}`;
 }
 
 // ───────────────────────── 内部工具 ─────────────────────────

@@ -130,6 +130,7 @@ globalThis.fetch = async (url, opts = {}) => {
 
 const { app } = await import("../src/server.js");
 const { applyVoiceTimelineToStoryboard } = await import("../src/mastra/workflow.js");
+const { artifactPaths } = await import("../src/media/artifacts.js");
 app.locals.generationPreflightDependencies = {
   verifyMediaToolchain: async () => {},
   artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
@@ -160,8 +161,10 @@ const baseBrief = {
   voiceTone: "男声",
 };
 
-test("真实模式 + 充足预算：端到端成功并归集 cost（≥5 步）", async () => {
+test("真实模式缺少标准化片段或 FFmpeg：composite 硬失败且不降级交付", async () => {
   workflowSpeechCall = 0;
+  const previousFfmpeg = process.env.PROMO_FFMPEG_BIN;
+  delete process.env.PROMO_FFMPEG_BIN;
   const server = app.listen(0);
   const port = server.address().port;
   try {
@@ -172,20 +175,30 @@ test("真实模式 + 充足预算：端到端成功并归集 cost（≥5 步）"
     assert.equal(r.status, 200);
     const { runId } = await r.json();
     const run = await waitStatus(port, runId, ["success", "failed"]);
-    assert.equal(run.status, "success", `应成功，实际=${run.status}，note=${run.note}`);
-    assert.ok(Array.isArray(run.storyboardGallery) && run.storyboardGallery.length >= 2, "应产出分镜画廊");
-    assert.ok(run.cost && run.cost.length >= 5, `应归集 ≥5 步成本，实际=${run.cost?.length}`);
-    assert.deepEqual(run.storyboard.map((scene) => scene.durationSec), [0.37, 0.25]);
+    // 真实模式不再静默降级为分镜包：成片合成失败必须让整个 run 失败并停在 composite。
+    assert.equal(run.status, "failed", `应严格失败，实际=${run.status}`);
+    assert.equal(run.steps.composite.status, "failed");
+    assert.match(run.steps.composite.error, /标准化动态片段|PROMO_FFMPEG_BIN/);
+    assert.equal(run.videoUrl ?? null, null, "失败运行不得返回成片地址");
+    // 失败之前的上游真实调用（文本/图像/配音/配乐）仍应精确归集成本。
     assert.equal(run.cost.filter((entry) => entry.step === "voiceover").length, 1, "成功配音只归集一次");
     assert.equal(run.cost.filter((entry) => entry.step === "music").length, 1, "成功配乐只归集一次");
-    // 各步金额计算正确
     const byStep = Object.fromEntries(run.cost.map((c) => [c.step, c.amount]));
     assert.ok(byStep.writeScript > 0, "writeScript 应计成本");
     assert.ok(byStep.generateScenes > 0, "generateScenes 应计成本（图像）");
     assert.ok(byStep.music > 0, "music 应计成本（曲目）");
-    assert.equal(typeof byStep.composite, "undefined", "无 ffmpeg 时 composite 不计成本（降级）");
+    assert.equal(typeof byStep.composite, "undefined", "未通过校验的合成不得归集成本");
+    // 硬失败不得留下任何“已交付”产物（无 final.mp4 / subtitles.srt / manifest.json / poster.jpg）。
+    const paths = artifactPaths(runId);
+    for (const key of ["finalVideo", "subtitles", "manifest", "poster"]) {
+      assert.equal(fs.existsSync(paths[key]), false, `失败运行不应产出 ${key}`);
+    }
+    // 真实配音时间轴仍需写回分镜（0.25s 语音 + 非末镜 120ms 间隙）。
+    assert.deepEqual(run.storyboard.map((scene) => scene.durationSec), [0.37, 0.25]);
   } finally {
     server.close();
+    if (previousFfmpeg === undefined) delete process.env.PROMO_FFMPEG_BIN;
+    else process.env.PROMO_FFMPEG_BIN = previousFfmpeg;
   }
 });
 

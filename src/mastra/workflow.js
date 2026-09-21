@@ -43,7 +43,7 @@ import {
 } from "../runtime-config.js";
 import { artifactPaths } from "../media/artifacts.js";
 import { resolveDeliveryModels } from "../media/model-selection.js";
-import { fontSupportsChinese } from "../media/font-readiness.js";
+import { fontSupportsChinese, resolveFontFile } from "../media/font-readiness.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -59,30 +59,9 @@ async function runCommand(bin, args) {
   return execFileAsync(bin, args, { windowsHide: true, timeout: 15_000, maxBuffer: 2 * 1024 * 1024 });
 }
 
-function configuredFontPath(font) {
-  if (path.isAbsolute(font) || /[\\/]/.test(font) || /\.(?:ttf|ttc|otf)$/i.test(font)) return path.resolve(font);
-  if (process.platform === "win32" && /^Microsoft YaHei$/i.test(font)) {
-    return path.join(process.env.WINDIR || "C:\\Windows", "Fonts", "msyh.ttc");
-  }
-  return "";
-}
-
-function normalizeFamily(value) {
-  return String(value || "").toLowerCase().replace(/[\s_-]+/g, "").replace(/["']/g, "");
-}
-
 async function resolveFontPath(font) {
-  const knownPath = configuredFontPath(font);
-  if (knownPath) return knownPath;
   try {
-    const match = await runCommand("fc-match", ["-f", "%{family}\n%{file}", font]);
-    const [family = "", matchedPath = ""] = String(match.stdout || "").trim().split(/\r?\n/);
-    const expected = normalizeFamily(font);
-    const actualFamilies = family.split(",").map(normalizeFamily);
-    if (!expected || !actualFamilies.some((actual) => actual === expected) || !fs.existsSync(matchedPath)) {
-      throw new Error("font fallback detected");
-    }
-    return matchedPath;
+    return await resolveFontFile(font);
   } catch {
     throw new GenerationPreflightError("真实生成预检失败：配置的中文字幕字体无法精确解析；请配置字体文件路径");
   }
@@ -107,8 +86,12 @@ async function verifyMediaToolchain() {
   } catch {
     throw new GenerationPreflightError("真实生成预检失败：无法读取 FFmpeg 滤镜清单");
   }
-  if (!/(?:^|\s)subtitles(?:\s|$)/m.test(`${filters.stdout || ""}\n${filters.stderr || ""}`)) {
+  const filterList = `${filters.stdout || ""}\n${filters.stderr || ""}`;
+  if (!/(?:^|\s)subtitles(?:\s|$)/m.test(filterList)) {
     throw new GenerationPreflightError("真实生成预检失败：FFmpeg 缺少 subtitles/libass 滤镜");
+  }
+  if (!/(?:^|\s)ass(?:\s|$)/m.test(filterList)) {
+    throw new GenerationPreflightError("真实生成预检失败：FFmpeg 缺少 ass/libass 字幕烧录滤镜");
   }
   const font = String(process.env.PROMO_SUBTITLE_FONT || "Microsoft YaHei").trim();
   if (!font) throw new GenerationPreflightError("真实生成预检失败：未配置中文字幕字体 PROMO_SUBTITLE_FONT");
@@ -514,13 +497,21 @@ const compositeStep = createStep({
     const rid = inputData.runId || runId;
     const { brief, script, storyboard, voice, music } = inputData;
     return withStep(rid, STEP.COMPOSITE, async () => {
-      const result = await composite(storyboard, voice, music, brief);
+      const paths = artifactPaths(rid);
+      emitProgress(rid, STEP.COMPOSITE, "step-progress", { phase: "compositing", message: "正在合成成片" });
+      const result = await composite(storyboard, voice, music, brief, { paths });
+      if (getProviderMode() === "real" && result.validated !== true) {
+        throw new Error("真实合成未通过成片校验，禁止进入交付");
+      }
+      emitProgress(rid, STEP.COMPOSITE, "step-progress", { phase: "validating", message: "正在校验成片" });
       updateRun(rid, {
         poster: result.poster,
         storyboardGallery: result.storyboardGallery,
         srt: result.srt,
         videoUrl: result.videoUrl,
         note: result.note,
+        artifacts: result.artifacts,
+        artifactManifest: result.artifactManifest,
       });
       return { brief, script, storyboard, voice, music, composite: result, runId: rid, _usage: result._usage };
     });
