@@ -1,0 +1,436 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Brand Promo Agent Delivery API",
+    "version": "1.0.0",
+    "description": "品牌宣传片生成与交付契约。成片交付为含画面、配音、配乐与烧录中文字幕的持久化 MP4；REAL 模式下未通过成片校验的运行不得进入 awaiting_delivery，也不提供下载。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:6777",
+      "description": "本地默认端口"
+    }
+  ],
+  "tags": [
+    {
+      "name": "generation",
+      "description": "脚本与成片生成"
+    },
+    {
+      "name": "delivery",
+      "description": "成片播放与产物下载"
+    }
+  ],
+  "paths": {
+    "/api/generate": {
+      "post": {
+        "tags": [
+          "generation"
+        ],
+        "summary": "提交 Brief 并创建一次生成运行",
+        "description": "REAL 模式会在创建 run 前完成模型与媒体工具链预检；预检失败返回 503 且不创建 run。响应返回 runId，后端异步推进脚本段与成片段，进度经 SSE 推送。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BrandBrief"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "运行已创建（后续异步执行）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "runId"
+                  ],
+                  "properties": {
+                    "runId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Brief 校验失败",
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "description": "REAL 模式预检失败（模型或媒体工具链不可用）",
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/runs/{runId}/rerun": {
+      "post": {
+        "tags": [
+          "generation"
+        ],
+        "summary": "完整重跑一个 failed 运行",
+        "description": "仅 failed 运行可重跑。服务端克隆旧 run 已解析的 Brief 并完整重跑，不复用失败的中间产物；旧 run 保持 failed 供审计，新 run 单独计费。请求体被忽略，防止篡改审计输入；同一 failed run 已有派生子 run 或请求并发时复用同一新 runId。",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "新运行已创建",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "runId"
+                  ],
+                  "properties": {
+                    "runId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "新运行预检失败",
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "description": "run 不存在",
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "description": "运行不是 failed 状态，不允许重跑",
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "description": "REAL 模式预检失败",
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/video/{runId}": {
+      "get": {
+        "tags": [
+          "delivery"
+        ],
+        "summary": "在线播放本机合成成片",
+        "description": "仅 REAL 合成出的本机 MP4 可播放；支持 HTTP Range，默认 inline 播放，可直接用于成片门预览。",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "完整 MP4 字节流",
+            "headers": {
+              "Content-Type": {
+                "description": "固定为 video/mp4"
+              },
+              "Cache-Control": {
+                "description": "private, max-age=300"
+              }
+            },
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Range 请求命中的字节区间，返回 Content-Range",
+            "headers": {
+              "Content-Range": {
+                "description": "形如 bytes 0-99/123456"
+              }
+            },
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "run 不存在或该 run 没有本机合成成片",
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/runs/{runId}/artifacts/video": {
+      "get": {
+        "tags": [
+          "delivery"
+        ],
+        "summary": "下载已校验成片 MP4",
+        "description": "仅已通过成片校验的运行（success / awaiting_delivery）可下载；支持 Range。",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "带附件下载头的 MP4",
+            "headers": {
+              "Content-Type": {
+                "description": "固定为 video/mp4"
+              },
+              "Content-Disposition": {
+                "description": "attachment；文件名同时提供 ASCII 兜底与 RFC 5987 filename* 中文名"
+              }
+            },
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "Range 请求命中的字节区间",
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "run 或产物不存在",
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "description": "成片尚未通过校验，或运行已失败",
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/runs/{runId}/artifacts/subtitles": {
+      "get": {
+        "tags": [
+          "delivery"
+        ],
+        "summary": "下载烧录字幕源文件（UTF-8 SRT）",
+        "description": "返回与成片硬字幕同源的 UTF-8 SRT，供二次编辑与无障碍使用。",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "UTF-8 编码的 SRT 文本",
+            "headers": {
+              "Content-Type": {
+                "description": "application/x-subrip; charset=utf-8"
+              },
+              "Content-Disposition": {
+                "description": "attachment；扩展名 .srt"
+              }
+            },
+            "content": {
+              "application/x-subrip": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "run 或产物不存在",
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "description": "成片尚未通过校验，或运行已失败",
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/runs/{runId}/artifacts/poster": {
+      "get": {
+        "tags": [
+          "delivery"
+        ],
+        "summary": "下载成片封面",
+        "description": "返回成片首帧导出的封面图，用于分发与列表展示。",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "按实际编码返回封面图片",
+            "headers": {
+              "Content-Type": {
+                "description": "按文件实际类型返回，未识别时回落到 video/mp4 之外的真实图片 MIME"
+              },
+              "Content-Disposition": {
+                "description": "attachment；扩展名 .jpg"
+              }
+            },
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "run 或产物不存在",
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "description": "成片尚未通过校验，或运行已失败",
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "RunId": {
+        "name": "runId",
+        "in": "path",
+        "required": true,
+        "description": "服务端生成的运行 ID，仅接受安全字符集",
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "统一错误响应",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "BrandBrief": {
+        "type": "object",
+        "required": [
+          "brandName",
+          "productName",
+          "coreSellingPoint"
+        ],
+        "properties": {
+          "brandName": {
+            "type": "string",
+            "description": "品牌名，同时用于交付文件名与画面文案"
+          },
+          "productName": {
+            "type": "string"
+          },
+          "coreSellingPoint": {
+            "type": "string"
+          },
+          "tones": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "durationSec": {
+            "type": "number",
+            "description": "目标成片时长，最终以配音权威时间轴为准"
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "zh-CN",
+              "zh-TW",
+              "en",
+              "ja",
+              "ko"
+            ]
+          },
+          "voiceTone": {
+            "type": "string"
+          },
+          "hitlEnabled": {
+            "type": "boolean",
+            "description": "开启脚本人工审核门"
+          },
+          "finalGateEnabled": {
+            "type": "boolean",
+            "description": "开启成片验收门（awaiting_delivery）"
+          },
+          "canvasPreset": {
+            "type": "string",
+            "enum": [
+              "social-portrait",
+              "social-landscape",
+              "social-square"
+            ],
+            "default": "social-portrait",
+            "description": "社交媒体画布：默认 1080x1920 竖版，可切换横版与方形"
+          },
+          "videoModel": {
+            "type": "string",
+            "description": "手选动态视频模型；不传则按 minimax-h3 → 7zhe-seedance → seedance-2.0 优先级自动选择"
+          },
+          "imageModel": {
+            "type": "string"
+          },
+          "llmModel": {
+            "type": "string"
+          },
+          "musicModel": {
+            "type": "string"
+          },
+          "logoColor": {
+            "type": "string"
+          },
+          "bannedWords": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

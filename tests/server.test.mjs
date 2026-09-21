@@ -794,3 +794,122 @@ test("GET /api/models：real + 本地 stub 网关 → source=gateway，type 优�
     stub.close();
   }
 });
+
+// ── Task 8：受控交付产物下载 + 完整重跑 ──
+test("交付产物下载：受控路由、正确 MIME、附件名与越界拒绝", async () => {
+  const previousOutputRoot = process.env.PROMO_OUTPUT_ROOT;
+  const previousMode = process.env.PROMO_PROVIDER_MODE;
+  const outputRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-artifact-routes-"));
+  process.env.PROMO_OUTPUT_ROOT = outputRoot;
+  process.env.PROMO_PROVIDER_MODE = "demo";
+  const { artifactPaths } = await import("../src/media/artifacts.js");
+  const { createRun, updateRun } = await import("../src/store.js");
+  const { app } = await import("../src/server.js");
+  const runId = `delivery-${Date.now()}`;
+  const paths = artifactPaths(runId);
+  execFileSync("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=green:s=1080x1920:r=25:d=1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", paths.finalVideo], { stdio: "pipe" });
+  execFileSync("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=green:s=1080x1920", "-frames:v", "1", paths.poster], { stdio: "pipe" });
+  fs.writeFileSync(paths.subtitles, "1\n00:00:00,000 --> 00:00:01,000\n你好，世界\n", "utf8");
+  createRun(runId, baseBrief);
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    // 尚未通过成片门 / 未成功：拒绝下载，避免把中间态当成交付物。
+    const premature = await fetch(`${BASE(port)}/api/runs/${runId}/artifacts/video`);
+    assert.equal(premature.status, 409);
+
+    updateRun(runId, { status: "success" });
+    const video = await fetch(`${BASE(port)}/api/runs/${runId}/artifacts/video`);
+    assert.equal(video.status, 200);
+    assert.equal(video.headers.get("content-type"), "video/mp4");
+    const disposition = video.headers.get("content-disposition") || "";
+    assert.match(disposition, /^attachment;/);
+    assert.ok(disposition.includes(runId), "附件名应包含 runId");
+    assert.ok(disposition.includes(".mp4"), "附件名应带 mp4 扩展名");
+    const decoded = decodeURIComponent((disposition.match(/filename\*=UTF-8''([^;]+)/) || ["", ""])[1] || "");
+    assert.ok(decoded.includes("铭星科技"), `中文品牌名需 RFC 5987 编码，实际=${disposition}`);
+    await video.arrayBuffer();
+
+    const ranged = await fetch(`${BASE(port)}/api/runs/${runId}/artifacts/video`, { headers: { Range: "bytes=0-99" } });
+    assert.equal(ranged.status, 206);
+    assert.match(ranged.headers.get("content-range") || "", /^bytes 0-99\//u);
+    await ranged.arrayBuffer();
+
+    const subtitles = await fetch(`${BASE(port)}/api/runs/${runId}/artifacts/subtitles`);
+    assert.equal(subtitles.status, 200);
+    assert.match(subtitles.headers.get("content-type") || "", /^application\/x-subrip/);
+    assert.match(subtitles.headers.get("content-disposition") || "", /attachment;.*\.srt/);
+    assert.match(await subtitles.text(), /你好，世界/u);
+
+    const poster = await fetch(`${BASE(port)}/api/runs/${runId}/artifacts/poster`);
+    assert.equal(poster.status, 200);
+    assert.equal(poster.headers.get("content-type"), "image/jpeg");
+    await poster.arrayBuffer();
+
+    const unknownKind = await fetch(`${BASE(port)}/api/runs/${runId}/artifacts/unknown`);
+    assert.equal(unknownKind.status, 404);
+
+    const missing = await fetch(`${BASE(port)}/api/runs/no-such-run/artifacts/video`);
+    assert.equal(missing.status, 404);
+
+    const traversal = await fetch(`${BASE(port)}/api/runs/..%2F..%2Fetc/artifacts/video`);
+    assert.equal(traversal.status, 404);
+    const traversalBody = await traversal.text();
+    assert.equal(traversalBody.includes(outputRoot), false, "不得回显本机路径");
+    assert.equal(traversalBody.includes("outputs"), false, "不得回显本机路径");
+
+    updateRun(runId, { status: "failed" });
+    const failed = await fetch(`${BASE(port)}/api/runs/${runId}/artifacts/video`);
+    assert.equal(failed.status, 409, "失败运行不得提供交付下载");
+  } finally {
+    server.close();
+    if (previousOutputRoot === undefined) delete process.env.PROMO_OUTPUT_ROOT;
+    else process.env.PROMO_OUTPUT_ROOT = previousOutputRoot;
+    if (previousMode === undefined) delete process.env.PROMO_PROVIDER_MODE;
+    else process.env.PROMO_PROVIDER_MODE = previousMode;
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test("POST rerun：仅 failed 可重跑、克隆已解析 Brief、保留旧 run、重复提交只产生一个新 run", async () => {
+  const { createRun, getRun, updateRun } = await import("../src/store.js");
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const created = await (await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(baseBrief),
+    })).json();
+    await waitStatus(port, created.runId, ["success", "suspended", "awaiting_delivery", "failed"]);
+    updateRun(created.runId, { status: "failed", error: "合成失败" });
+
+    const notFound = await fetch(`${BASE(port)}/api/runs/no-such-run/rerun`, { method: "POST" });
+    assert.equal(notFound.status, 404);
+
+    // 说明：请求体不得覆盖服务端已解析的 Brief，重跑只认旧 run 的审计输入。
+    const first = await fetch(`${BASE(port)}/api/runs/${created.runId}/rerun`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ brandName: "被篡改" }),
+    });
+    assert.equal(first.status, 201);
+    const { runId: nextId } = await first.json();
+    assert.notEqual(nextId, created.runId);
+    assert.deepEqual(getRun(nextId).brief, getRun(created.runId).brief);
+    assert.equal(getRun(nextId).brief.brandName, baseBrief.brandName);
+    assert.equal(getRun(created.runId).status, "failed", "旧 run 保持 failed 供审计");
+
+    const [a, b] = await Promise.all([
+      fetch(`${BASE(port)}/api/runs/${created.runId}/rerun`, { method: "POST" }),
+      fetch(`${BASE(port)}/api/runs/${created.runId}/rerun`, { method: "POST" }),
+    ]);
+    assert.equal(a.status, 201);
+    assert.equal(b.status, 201);
+    assert.equal((await a.json()).runId, nextId, "重复提交必须复用同一新 run，避免重复计费");
+    assert.equal((await b.json()).runId, nextId);
+
+    const live = createRun(`rerun-live-${Date.now()}`, baseBrief);
+    const conflicting = await fetch(`${BASE(port)}/api/runs/${live.runId}/rerun`, { method: "POST" });
+    assert.equal(conflicting.status, 409, "运行中的 run 不允许重跑");
+  } finally {
+    server.close();
+  }
+});

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { mastra, prepareGenerationBrief, publishDelivery, STEP } from "./mastra/workflow.js";
 import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
-import { artifactPaths, resolveRunArtifact } from "./media/artifacts.js";
+import { artifactPaths, resolveRunArtifact, safeDownloadName } from "./media/artifacts.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import { listCopyIdeas } from "./copyideas.js";
@@ -238,6 +238,50 @@ app.get("/api/runs/:runId/scenes/:index/:kind", (req, res) => {
   });
 });
 
+// ── GET /api/runs/:runId/artifacts/:kind：受控下载已校验成片产物 ──
+// 说明：路径全部由服务端按 runId 经 artifactPaths 构造，客户端只能选 kind，不能传路径；
+// 仅通过成片校验的运行可下载（REAL 另需 manifest.validated），进行中与失败态一律 409，避免把中间产物当交付物。
+const DELIVERY_ARTIFACTS = {
+  video: { key: "finalVideo", extension: "mp4", mime: "video/mp4" },
+  subtitles: { key: "subtitles", extension: "srt", mime: "application/x-subrip; charset=utf-8" },
+  poster: { key: "poster", extension: "jpg", mime: "" },
+};
+
+app.get("/api/runs/:runId/artifacts/:kind", (req, res) => {
+  const { runId, kind } = req.params;
+  const spec = DELIVERY_ARTIFACTS[kind];
+  if (!spec) return res.status(404).json({ error: "未知产物类型" });
+  const run = getRun(runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  if (run.status !== "success" && run.status !== "awaiting_delivery") {
+    return res.status(409).json({ error: "成片尚未通过校验或运行已失败，暂不可下载" });
+  }
+  if (getProviderMode() === "real" && run.artifactManifest?.validated !== true) {
+    return res.status(409).json({ error: "真实成片缺少已校验产物清单，暂不可下载" });
+  }
+  let file;
+  try {
+    file = resolveRunArtifact(runId, artifactPaths(runId)[spec.key]);
+  } catch {
+    return res.status(404).json({ error: "产物不存在" });
+  }
+  // 说明：中文品牌名只能靠 RFC 5987 的 filename* 传递；filename 保留纯 ASCII 兜底给老客户端。
+  const displayName = safeDownloadName(run.brief?.brandName, runId, spec.extension);
+  const fallbackName = safeDownloadName("media", runId, spec.extension);
+  res.sendFile(file, {
+    headers: {
+      "Content-Type": spec.mime || contentTypeFor(file),
+      "Content-Disposition": `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(displayName)}`,
+      "Cache-Control": "private, max-age=300",
+      "X-Content-Type-Options": "nosniff",
+    },
+  }, (error) => {
+    if (!error) return;
+    if (res.headersSent) return res.destroy();
+    res.status(error.statusCode === 404 || error.code === "ENOENT" ? 404 : 500).json({ error: "产物读取失败" });
+  });
+});
+
 // 第二段：基于已批准脚本冷启动成片工作流（无 suspend，止于 composite）。
 // composite 完成后：若 finalGate 开启 → 置 awaiting_delivery 并推送 final-review 事件（成片门）；否则直接交付。
 // 每次重跑用唯一 Mastra 内部 runId（attempt 后缀），避免复用 runId 冲突；用户态 runId 不变（store 键一致）。
@@ -448,6 +492,50 @@ app.post("/api/generate/:runId/approve", async (req, res) => {
     return res.json({ ok: true, gate: "already-resumed", status: run.status });
   }
   return res.status(409).json({ error: "no pending approval (already resumed or finished)" });
+});
+
+// ── POST /api/runs/:runId/rerun：失败运行完整重跑（新 runId，旧 run 原样保留供审计）──
+// 说明：重跑不恢复失败步骤、不复用可能损坏的中间产物，而是按原已解析 Brief 重新预检并从脚本阶段完整执行；
+// 请求体被忽略，防止调用方篡改审计输入。同一失败 run 已派生过子 run 时复用该子 run，避免双击造成重复计费。
+const rerunsInFlight = new Map();
+
+app.post("/api/runs/:runId/rerun", async (req, res) => {
+  const { runId } = req.params;
+  const run = getRun(runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  if (run.status !== "failed") return res.status(409).json({ error: `仅 failed 运行可重跑，当前为 ${run.status}` });
+  const existing = listRuns().find((item) => item.rerunOf === runId);
+  if (existing) return res.status(201).json({ runId: existing.runId });
+  if (rerunsInFlight.has(runId)) {
+    const shared = await rerunsInFlight.get(runId);
+    return res.status(201).json({ runId: shared });
+  }
+  const creation = (async () => {
+    const nextId = newRunId();
+    const brief = await prepareGenerationBrief(run.brief, {
+      runId: nextId,
+      dependencies: app.locals.generationPreflightDependencies,
+    });
+    // 说明：preflight 已校验原模型的可用性，但会把已解析的 videoModel 重新归类为「手动指定」；
+    // 审计来源必须沿用原 run，否则同一次决策在两次运行里显示成不同来源。
+    if (run.brief?.modelSelectionSource) brief.modelSelectionSource = run.brief.modelSelectionSource;
+    createRun(nextId, brief);
+    updateRun(nextId, { rerunOf: runId });
+    runScriptPhase(nextId, brief).catch((error) => {
+      console.error(`[rerun] ${nextId} unexpected:`, error?.message || error);
+      failRun(nextId, error);
+    });
+    return nextId;
+  })();
+  rerunsInFlight.set(runId, creation);
+  try {
+    const nextId = await creation;
+    res.status(201).json({ runId: nextId });
+  } catch (error) {
+    res.status(error?.statusCode === 503 ? 503 : 400).json({ error: String(error?.message || error) });
+  } finally {
+    if (rerunsInFlight.get(runId) === creation) rerunsInFlight.delete(runId);
+  }
 });
 
 // ── GET /api/runs/:runId：运行态详情 ──

@@ -446,13 +446,12 @@ git commit -m "fix(brand-promo): fail incomplete real deliveries"
 ### Task 8: Artifact APIs and full rerun
 
 **Files:**
-- Modify: `src/server.js`
-- Modify: `src/store.js`
+- Modify: `src/server.js`（含进程内 `rerunsInFlight` 去重 guard，未改动 `src/store.js`）
 - Create: `docs/openapi.json`
 - Test: `tests/server.test.mjs`
 - Test: `tests/openapi.test.mjs`
 
-- [ ] **Step 1: Write failing API tests**
+- [x] **Step 1: Write failing API tests**
 
 Cover Range playback, attachment headers, SRT MIME/UTF-8, poster MIME, missing/failed run 404/409 responses, path traversal rejection, rerun behavior, and two concurrent rerun requests for the same failed run producing only one new run.
 
@@ -467,34 +466,34 @@ assert.deepEqual(getRun(nextId).brief, getRun(failedRunId).brief);
 assert.equal(getRun(failedRunId).status, "failed");
 ```
 
-- [ ] **Step 2: Run API tests and verify RED**
+- [x] **Step 2: Run API tests and verify RED**
 
 Run: `node --import ./tests/setup.mjs --test tests/server.test.mjs tests/openapi.test.mjs`
 
 Expected: FAIL because download and rerun endpoints do not exist.
 
-- [ ] **Step 3: Implement controlled artifact routes**
+- [x] **Step 3: Implement controlled artifact routes**
 
 Resolve files only through `artifactPaths(runId)`. Use `sendFile`/streaming with explicit content types, safe attachment names, existence checks, and status checks.
 
-- [ ] **Step 4: Implement full rerun endpoint with an in-flight guard**
+- [x] **Step 4: Implement full rerun endpoint with an in-flight guard**
 
 Accept only failed run IDs, clone the stored parsed Brief, run the same preflight, create a new run, and invoke the existing script phase. Use an in-memory `rerunsInFlight` map keyed by failed runId so concurrent requests share/return the same newly created run instead of double billing; clear the guard after creation. This is a process-local duplicate guard, not a new external idempotency-key contract. Return 201 with the new runId. Do not mutate or delete the old run.
 
-- [ ] **Step 5: Add and validate the OpenAPI 3.1 contract**
+- [x] **Step 5: Add and validate the OpenAPI 3.1 contract**
 
 Document `POST /api/generate`, `POST /api/runs/{runId}/rerun`, `GET /api/video/{runId}`, and all artifact endpoints with request schemas, status codes, content types and Range/attachment behavior. `tests/openapi.test.mjs` parses JSON, asserts `openapi: "3.1.0"`, and verifies every new route/method exists.
 
-- [ ] **Step 6: Run API tests**
+- [x] **Step 6: Run API tests**
 
 Run: `node --import ./tests/setup.mjs --test tests/server.test.mjs tests/openapi.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit delivery APIs**
+- [x] **Step 7: Commit delivery APIs**
 
 ```powershell
-git add src/server.js src/store.js docs/openapi.json tests/server.test.mjs tests/openapi.test.mjs
+git add src/server.js docs/openapi.json tests/server.test.mjs tests/openapi.test.mjs
 git commit -m "feat(brand-promo): expose validated delivery artifacts"
 ```
 
