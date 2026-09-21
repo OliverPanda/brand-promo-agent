@@ -106,7 +106,9 @@ Brief 新增 `canvasPreset`，采用受控枚举：
 - 文件编码为 UTF-8；
 - 文本保留中文标点，清除非法控制字符。
 
-字幕通过 FFmpeg `subtitles` 滤镜烧录。字体使用可配置 `PROMO_SUBTITLE_FONT`，默认优先 `Microsoft YaHei`，再回退系统可用的中文字体。样式使用白字、黑色描边/半透明底，限制每行长度和最多两行，并按画布预设设置字号及底部安全边距。
+字幕烧录分两步：先由权威 cues 生成一份显式声明 `PlayResX`/`PlayResY` 为目标画布尺寸的临时 ASS 文件（UTF-8 无 BOM，换行用 `\N`），再用 FFmpeg `ass` 滤镜烧录，两者同属 libass 管线。禁止让 `subtitles` 滤镜直接读取 SRT：该滤镜按默认 PlayRes 384x288 解析，会把底部安全边距错误映射到画面上部。
+
+字体使用可配置 `PROMO_SUBTITLE_FONT`，默认优先 `Microsoft YaHei`，再回退系统可用的中文字体。样式使用白字、黑色描边，限制每行长度和最多两行，按画布预设设置字号与底部安全边距（`Alignment=2`、`WrapStyle: 2`）。Windows 下把临时 ASS 写入工作目录，滤镜只引用相对文件名并把进程 `cwd` 设为该目录，避免盘符冒号被当作滤镜参数分隔符。
 
 ### 6.4 视频标准化与拼接
 

@@ -376,7 +376,7 @@ Normalize voice to `-16 LUFS` with `TP=-1.5`, lower music to `0.18`, mix to AAC 
 
 - [ ] **Step 5: Burn Chinese subtitles**
 
-Write UTF-8 SRT in the workspace. Escape the path for the FFmpeg `subtitles` filter and apply preset-derived `force_style` using `PROMO_SUBTITLE_FONT` or verified `Microsoft YaHei` fallback. Preflight known Chinese font files, render a Chinese glyph probe and a tofu-square control, and require a non-identical pixel signature. Fail if the filter, font file or Chinese glyph coverage is unavailable.
+Write UTF-8 SRT plus an explicit `PlayResX`/`PlayResY` ASS in the workspace; burn the ASS with the FFmpeg `ass` filter using a relative filename and the workspace as process `cwd`. Do not feed the SRT to `subtitles` directly (default PlayRes 384x288 misplaces the bottom margin). Apply preset-derived styling (white text, outline, `Alignment=2`, `WrapStyle: 2`) using `PROMO_SUBTITLE_FONT` or verified `Microsoft YaHei` fallback. Preflight known Chinese font files, render a Chinese glyph probe and a tofu-square control, and require a non-identical pixel signature. Fail if the filter, font file or Chinese glyph coverage is unavailable.
 
 - [ ] **Step 6: Validate and atomically promote output**
 
