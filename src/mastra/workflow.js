@@ -400,7 +400,8 @@ const generateScenes = createStep({
       for (const scene of storyboard) {
         const media = await generateSceneMedia(scene, brief, mediaOptions);
         // mediaModel 透传实际使用的图像模型（brief.imageModel 请求级覆盖 > env 默认），供交付页展示
-        const done = { ...scene, mediaUrl: media.mediaUrl, mediaModel: media.model, status: "done" };
+        // frameImageUrl：图像渠道的公网首帧 URL，供图生视频使用；本地 mediaPath 只用于预览与合成。
+        const done = { ...scene, mediaUrl: media.mediaUrl, frameImageUrl: media.frameImageUrl, mediaModel: media.model, status: "done" };
         // 说明：REAL 模式任一动态片段失败即整步失败（不再退回静态图）；DEMO 走 stub 不计费。
         if (getProviderMode() === "real") {
           if (!brief.videoModel) throw new Error("真实成片要求动态视频模型（Brief.videoModel 未解析）");
@@ -428,9 +429,12 @@ const generateScenes = createStep({
       const usage = images ? { images } : undefined;
       if (videos) {
         usage.videos = videos;
-        usage.videoModel = brief.videoModel; // 供 costFor 命中按次真实单价（中转站 /api/pricing，见 cost.js）
+        // 说明：发生渠道降级时真实生效模型可能与 brief.videoModel 不同，计价必须按实际出片模型，
+        // 否则降级到按次计费渠道会漏算（或按错误单价估算）。
+        const usedModels = [...new Set(scenes.map((s) => s.videoModel).filter(Boolean))];
+        usage.videoModel = usedModels.length === 1 ? usedModels[0] : (usedModels.join(",") || brief.videoModel);
       }
-      return { brief, script, voice, storyboard: scenes, runId: rid, _usage: usage };
+      return { brief, script, voice, music, storyboard: scenes, runId: rid, _usage: usage };
     });
   },
 });

@@ -93,7 +93,8 @@ function toPublicStoryboard(runId, storyboard) {
   if (!Array.isArray(storyboard)) return storyboard;
   return storyboard.map((scene, position) => {
     if (!scene || typeof scene !== "object") return scene;
-    const { mediaPath, videoPath, ...rest } = scene;
+    // frameImageUrl 是图像渠道的原始公网地址，仅服务图生视频，按契约不暴露给前端。
+    const { mediaPath, videoPath, frameImageUrl, ...rest } = scene;
     const index = Number.isInteger(scene.index) && scene.index > 0 ? scene.index : position + 1;
     const route = (kind) => `/api/runs/${runId}/scenes/${index}/${kind}`;
     const hasImage = typeof mediaPath === "string" && mediaPath !== "";

@@ -558,7 +558,8 @@ function demoStoryboard(brief, script) {
  * @param {Record<string, any>} scene 场景描述，归一化成功后写入 `mediaPath`。
  * @param {Record<string, any>} brief 已解析 Brief。
  * @param {{inputsWorkspace?: string, scenesWorkspace?: string}} [options] `artifactPaths(runId)` 提供的受管目录。
- * @returns {Promise<{mediaPath?: string, mediaUrl: string, kind: string, model: string, _usage?: object}>} 标准场景图或 DEMO 媒体。
+ * @returns {Promise<{mediaPath?: string, mediaUrl: string, frameImageUrl?: string, kind: string, model: string, _usage?: object}>} 标准场景图或 DEMO 媒体；
+ *   `frameImageUrl` 仅当图像渠道返回公网 http(s) URL 时存在，供图生视频首帧使用（本地标准化文件不能作首帧，见设计文档 §6.2）。
  * @example await generateSceneMedia(scene, brief, { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes });
  */
 export async function generateSceneMedia(scene, brief, options = {}) {
@@ -595,6 +596,10 @@ export async function generateSceneMedia(scene, brief, options = {}) {
   const item = data.data?.[0] || {};
   const mediaUrl = item.url || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null);
   if (!mediaUrl) throw new Error("图像服务返回空媒体响应");
+  // 说明：图生视频的首帧由上游视频渠道自行下载，只接受公网 http(s) URL（data:/本机地址实测被拒），
+  // 因此这里把图像渠道的原始公网 URL 一并透传为 frameImageUrl；本地标准化文件只服务预览与合成。
+  // b64_json 形态没有公网 URL，此时 frameImageUrl 为空，视频层退化为文生（FR-4.5）。
+  const frameImageUrl = isPublicHttpUrl(item.url) ? item.url : undefined;
   if (options.inputsWorkspace && options.scenesWorkspace) {
     const mediaPath = await normalizeSceneImage({
       source: mediaUrl,
@@ -603,9 +608,9 @@ export async function generateSceneMedia(scene, brief, options = {}) {
       canvasPreset: brief.canvasPreset,
     });
     scene.mediaPath = mediaPath;
-    return { mediaPath, mediaUrl: pathToFileURL(mediaPath).href, kind: "image", model, _usage: { images: 1 } };
+    return { mediaPath, mediaUrl: pathToFileURL(mediaPath).href, frameImageUrl, kind: "image", model, _usage: { images: 1 } };
   }
-  return { mediaUrl, kind: "image", model, _usage: { images: 1 } };
+  return { mediaUrl, frameImageUrl, kind: "image", model, _usage: { images: 1 } };
 }
 
 function demoSceneMedia(scene, brief) {
@@ -624,24 +629,342 @@ function demoSceneMedia(scene, brief) {
 //   b) 异步任务：{ id, status } / { data:[{id}] } —— 轮询任务端点。
 // 端点差异（真实对拍，2026-09）：OpenAI 规范为复数 /videos/generations，但 new-api v0.13.2 网关
 //   实测只注册**单数** /v1/video/generations（复数 404 "Invalid URL"）→ 提交 404 自动回退单数；
-//   轮询序列 /videos/{id} → /videos/generations/{id} → /video/generations/{id}。
+//   轮询候选按信息完整度排序为 /video/generations/{id} → /videos/generations/{id} → /videos/{id}，
+//   同一轮内遍历到可判定结果为止（同一任务 id 只有单数端点返回权威任务形态，见 videoTaskInfo）。
 //   new-api 任务查询返回包装 {code:"success", data:{status:"SUCCESS"|"FAILURE", result_url, fail_reason}} →
-//   unwrapTask 解包 data 层。
-// 单镜失败由 workflow 捕获降级为静态图（不阻断全片，FR-4.3）；超时受 PROMO_VIDEO_TIMEOUT_MS 控制（默认 180s）。
+//   unwrapVideoTask 解包 data 层。
+// 失败语义：REAL 模式任一镜失败即整步失败（FR-4.3 已收紧，不再静态降级）；超时受 PROMO_VIDEO_TIMEOUT_MS 控制（默认 600s，minimax-h3 实测单次约 144s，须留足余量）。
+// 提交字段：目标渠道对 duration（4~30 整数秒）与 ratio 有硬校验，缺任一项任务会在上游直接失败（minimax-h3 实测）。
 const VIDEO_SUBMIT_PATHS = ["/videos/generations", "/video/generations"];
-const VIDEO_POLL_PATHS = (id) => [`/videos/${id}`, `/videos/generations/${id}`, `/video/generations/${id}`];
+const VIDEO_POLL_PATHS = (id) => [`/video/generations/${id}`, `/videos/generations/${id}`, `/videos/${id}`];
+// 视频任务提交的 duration 必须是整数秒，且目标渠道白名单下限为 4s（minimax-h3 实测回报 4~30）。
+const VIDEO_DURATION_RANGE = Object.freeze({ min: 4, max: 30 });
 
 /**
- * 提交并轮询场景视频；传入受管目录时立即物化、按权威场景时长归一化并写入 `videoPath`。
- * @param {Record<string, any>} scene 已含标准场景图和权威 `durationSec` 的场景。
+ * 计算视频提交应携带的整数秒 duration。
+ *
+ * 场景时长来自 TTS 实测（如 2.68s），向上取整并夹到渠道允许区间；随后 normalizeSceneVideo 会按权威
+ * 时长裁剪或补帧，因此取整不会改变成片节奏。PROMO_VIDEO_DURATION_SEC 可覆盖，供档位离散的渠道使用。
+ *
+ * @param {{durationSec?: number}} [scene] 含权威语音时长的场景。
+ * @returns {number} 4~30 之间的整数秒。
+ * @example videoRequestDurationSec({ durationSec: 2.68 }); // 4
+ */
+function videoRequestDurationSec(scene) {
+  const override = Number(process.env.PROMO_VIDEO_DURATION_SEC);
+  const measured = Number(scene?.durationSec);
+  const base = Number.isFinite(override) && override > 0
+    ? override
+    : (Number.isFinite(measured) && measured > 0 ? measured : VIDEO_DURATION_RANGE.min);
+  return Math.min(VIDEO_DURATION_RANGE.max, Math.max(VIDEO_DURATION_RANGE.min, Math.ceil(base)));
+}
+
+/**
+ * 归一化视频任务失败原因：优先字符串 fail_reason，其次 error.message，再退 message。
+ * 失败原因可能是对象（minimax-h3 实测 {code,message}），直接拼进模板字符串会渲染成 [object Object]。
+ *
+ * @param {Record<string, any>} task 轮询返回的任务对象。
+ * @returns {string} 可读失败原因；无法识别时返回空串。
+ * @example videoFailureReason({ error: { message: "ratio is required" } }); // "ratio is required"
+ */
+function videoFailureReason(task) {
+  const candidates = [task?.fail_reason, task?.error?.message, task?.error, task?.message];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return "";
+}
+
+/**
+ * 判断一个值是否为上游可自行下载的公网 http(s) 图片地址。
+ *
+ * 上游视频渠道用服务端拉取首帧，因此 `data:`、裸 base64、`file:`、本机回环与容器内主机名都不可用；
+ * 只放行 http(s) 且主机不是回环/内网地址的 URL，避免把必然失败的值提交给付费任务。
+ *
+ * @param {unknown} value 待判定的地址。
+ * @returns {boolean} 可作为图生视频首帧时返回 true。
+ * @example isPublicHttpUrl("https://example.com/s1.png"); // true
+ */
+function isPublicHttpUrl(value) {
+  if (typeof value !== "string" || !/^https?:\/\//i.test(value)) return false;
+  let host;
+  try {
+    host = new URL(value).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === "localhost" || host.endsWith(".localhost")) return false;
+  if (host === "[::1]" || host === "::1" || host === "0.0.0.0") return false;
+  // RFC1918 私网、链路本地与容器内部主机名：上游无法解析或明确拒绝。
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) return false;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host)) return false;
+  if (host.endsWith(".internal") || host.endsWith(".local")) return false;
+  return true;
+}
+
+// 视频任务终态集合：状态枚举大小写各渠道不一（new-api 用大写 SUCCESS/FAILURE，其余多用小写），统一按小写比对。
+const VIDEO_FAILURE_STATUSES = Object.freeze(["failed", "failure", "error", "cancelled", "canceled"]);
+const VIDEO_SUCCESS_STATUSES = Object.freeze(["completed", "succeeded", "success", "finished"]);
+
+/**
+ * 判断值是否为可物化的成片地址。
+ *
+ * 说明：上游失败时会把同一段错误文案填进 result_url（实测 `upstream returned unrecognized message`），不做形态校验
+ * 就会被当成成片地址去下载并报出误导性错误。这里只放行三种可物化来源 —— http(s): 远端、data: 内联字节、
+ * file: 工作区文件（后者仅本地测试与自建存储使用），其余自由文本一律视为无效。
+ *
+ * @param {unknown} value 待判定值。
+ * @returns {boolean} 形如 http(s)://、data: 或 file: 开头时返回 true。
+ * @example isMediaUrl("https://cdn.example.com/a.mp4"); // true
+ * @example isMediaUrl("upstream returned unrecognized message"); // false
+ */
+function isMediaUrl(value) {
+  return typeof value === "string" && /^(?:https?:|data:|file:)/iu.test(value.trim());
+}
+
+/**
+ * 归一化单次轮询响应的可判定信息，供「一轮多端点择优」使用。
+ *
+ * 说明：同一个任务 id 在不同端点的信息完整度不同 —— new-api v0.13.2 实测 /videos/{id} 返回 200 却只有上游原始
+ * 形态 {status:"unknown",metadata:{url:""}}（不含失败原因），权威形态只在 /video/generations/{id}
+ * {code:"success",data:{status,fail_reason,result_url}}。只看首个 200 会一直轮询到默认超时并丢掉真实原因。
+ *
+ * @param {unknown} raw 单个轮询端点的响应体。
+ * @returns {{status: string, url: string|null, urlPublic: boolean, failReason: string, failed: boolean, done: boolean, score: number}} 归一化信息。
+ * @example videoTaskInfo({ code: "success", data: { status: "FAILURE", fail_reason: "boom" } }).failed; // true
+ */
+function videoTaskInfo(raw) {
+  const task = unwrapVideoTask(raw);
+  const status = String(task?.status ?? task?.state ?? "").toLowerCase();
+  const url = extractVideoUrl(task);
+  // 说明：网关会把容器内回环地址填进 result_url（实测 http://localhost:3000/v1/videos/{id}/content），
+  // 该地址在宿主机不可达，不能与真正的成片地址等价看待。只有公网可达地址才允许判定「本轮已命中」，
+  // 这样同一轮里的其余端点才有机用 metadata.url 的公网签名地址把它覆盖掉。
+  const urlPublic = Boolean(url) && isPublicHttpUrl(url);
+  const failReason = videoFailureReason(task);
+  // 说明：状态可能是 unknown，但只要带着 fail_reason / error 就必须按失败处理；不把 message 算进来 —— 部分渠道用
+  // message 表达「排队中」这类正常进度，误判失败等于白扔一次已付费的视频任务。
+  const failed = VIDEO_FAILURE_STATUSES.includes(status) || Boolean(task?.fail_reason) || Boolean(task?.error);
+  const succeeded = VIDEO_SUCCESS_STATUSES.includes(status);
+  return {
+    status,
+    url,
+    urlPublic,
+    failReason,
+    failed,
+    // 说明：有 URL 但不是公网地址时不算命中，继续问同轮其余端点找公网地址；轮次结束仍会退回该地址
+    //（不因此判失败或空等超时，保持旧行为），只有「成功终态且完全没有地址」才立刻报完成未返回 URL。
+    done: urlPublic || failed || (succeeded && !url),
+    // 公网可达地址权重更高：同一轮内权威端点的回环 result_url 不得压过其余端点的公网 metadata.url。
+    score: urlPublic ? 3 : (url || failed || succeeded ? 2 : 0),
+  };
+}
+
+// 单镜视频的瞬时故障重试上限：上游 `unrecognized message` 是偶发故障（2026-09 实测约占 1/3，同一请求重发即可成功），
+// 但重试会放大耗时与费用，因此默认只额外重试 1 次（共 2 次）。
+const VIDEO_MAX_ATTEMPTS = 3;
+
+/**
+ * 解析单镜视频的最大尝试次数。
+ *
+ * 说明：网关对上游失败任务会自动冲正（logs.type=6），所以对偶发故障重试的净成本接近「只付成功那次」；
+ * 上限固定为 3，避免配置错误把一次 run 的费用放大到不可控。
+ *
+ * @returns {number} 1~3 之间的尝试次数。
+ * @example videoAttemptCount(); // 2
+ */
+function videoAttemptCount() {
+  const raw = Number(process.env.PROMO_VIDEO_ATTEMPTS ?? 2);
+  if (!Number.isFinite(raw) || raw < 1) return 1;
+  return Math.min(VIDEO_MAX_ATTEMPTS, Math.floor(raw));
+}
+
+/**
+ * 计算视频生成重试的指数退避毫秒数。
+ *
+ * 说明：上游故障以「成簇时间窗」出现（实测 23:12–23:38 连续失败），线性短退避跑不出窗口，
+ * 因此改为 base × 2^(step-1)，并用 PROMO_VIDEO_RETRY_MAX_BACKOFF_MS 封顶，避免极端配置把 run 挂死。
+ *
+ * @param {number} step 从 1 开始的退避步数（模型内重试用第几次；跨模型降级用「已用尝试数 + 候选序号」）。
+ * @returns {number} 等待毫秒数。
+ * @example videoRetryBackoffMs(1); // 2000
+ */
+function videoRetryBackoffMs(step) {
+  const base = Number(process.env.PROMO_VIDEO_RETRY_BACKOFF_MS ?? 2000);
+  const cap = Number(process.env.PROMO_VIDEO_RETRY_MAX_BACKOFF_MS ?? 30000);
+  const value = Number.isFinite(base) && base > 0 ? base : 2000;
+  const ceiling = Number.isFinite(cap) && cap > 0 ? cap : 30000;
+  return Math.min(ceiling, value * 2 ** Math.max(0, Math.floor(step) - 1));
+}
+
+/**
+ * 解析单镜视频的候选模型链（主模型在前，降级模型按优先级在后，已去重）。
+ *
+ * 说明：候选链来自预检写入 Brief 的 videoModel/videoModelFallbacks（同源于 model-selection 的交付优先级），
+ * 只在「主模型整镜尝试耗尽」后才换下一个，从而把上游整段故障从「整条 run 失败」降为「换渠道重试」。
+ *
+ * @param {Record<string, any>} brief 已解析 Brief。
+ * @returns {string[]} 候选视频模型 ID；为空表示未指定模型。
+ * @example sceneVideoModelCandidates({ videoModel: "minimax-h3", videoModelFallbacks: ["7zhe-seedance"] });
+ */
+function sceneVideoModelCandidates(brief = {}) {
+  const fallbacks = Array.isArray(brief.videoModelFallbacks) ? brief.videoModelFallbacks : [];
+  const list = [brief.videoModel || process.env.PROMO_VIDEO_MODEL, ...fallbacks];
+  return [...new Set(list.filter((id) => typeof id === "string" && id.trim()))];
+}
+
+/**
+ * 判断视频错误是否为可重试的上游瞬时故障。
+ *
+ * 说明：只对上游自身故障重试；请求契约类错误（首帧不合法、字段缺失、参数越界）重发同样会失败，
+ * 重试只会多花钱并掩盖真实问题，必须立即抛出。4xx 属于契约或鉴权问题，只有 5xx 才算服务端故障。
+ *
+ * @param {unknown} error 捕获到的错误。
+ * @returns {boolean} 属于瞬时故障时返回 true。
+ * @example isTransientVideoError(new Error("视频任务 t1 失败：upstream returned unrecognized message")); // true
+ */
+export function isTransientVideoError(error) {
+  const message = String(error?.message || error || "");
+  if (/unrecognized message|upstream returned unrecognized/i.test(message)) return true;
+  if (/ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|fetch failed|aborted|network/i.test(message)) return true;
+  const status = Number(error?.status);
+  return Number.isFinite(status) && status >= 500;
+}
+
+/**
+ * 判断视频错误是否属于「该渠道整体不可用」（余额不足、分组未开通、无可用渠道）。
+ *
+ * 说明：这类错误与请求契约无关——同一模型重发必然同样失败（重试纯属浪费），但换下一个候选渠道仍可能出片。
+ * 2026-09-22 真实验收中 `7zhe-seedance` 上游账户余额不足返回 403，旧逻辑按契约错误立即抛出，候选链里
+ * 本可救场的 `seedance-2.0` 永远没被尝试，整条已付费 run 被判失败。因此这里必须与「契约类错误」区分开。
+ *
+ * @param {unknown} error 捕获到的错误。
+ * @returns {boolean} 属于渠道级不可用时返回 true。
+ * @example isChannelUnavailableVideoError(new Error("one-api /video/generations 403: {\"code\":\"insufficient_user_quota\"}")); // true
+ */
+export function isChannelUnavailableVideoError(error) {
+  const message = String(error?.message || error || "");
+  // 说明：网关把上游额度不足包在 fail_to_fetch_task 里，关键字可能是英文 code 或中文文案，两种都要命中。
+  return /insufficient_user_quota|quota[_ ]?exhausted|预扣费额度失败|额度不足|余额不足|No available channel|model_not_found|无可用渠道|没有可用的.*渠道/i.test(message);
+}
+
+/**
+ * 判断视频错误是否为「首帧图被上游内容审核拒绝」。
+ *
+ * 说明：seedance 系渠道对输入图做真人审核，命中即返回 400
+ * `InputImageSensitiveContentDetected.PrivacyInformation`（`may contain real person`）。这与「首帧不合法」不同——图本身可用，
+ * 只是不能被该渠道当作首帧；同渠道纯文生（usage.input_image_count=0）实测可正常出片（2026-09-22 任务 365）。
+ * 各候选渠道都会下载同一张图并被同样拒绝，因此换模型救不了，唯一活路是去掉首帧退化为文生后重试。
+ *
+ * @param {unknown} error 捕获到的错误。
+ * @returns {boolean} 属于首帧内容审核拒绝时返回 true。
+ * @example isFrameRejectedVideoError(new Error("400: code=***.PrivacyInformation: may contain real person")); // true
+ */
+export function isFrameRejectedVideoError(error) {
+  const message = String(error?.message || error || "");
+  return /InputImageSensitiveContentDetected|PrivacyInformation|may contain real person|输入图.*(敏感|真人)|图片.*疑似真人/i.test(message);
+}
+
+/**
+ * 生成单个场景视频；传入受管目录时立即物化、按权威场景时长归一化并写入 `videoPath`。
+ *
+ * 首帧只接受公网 http(s) URL（`scene.frameImageUrl` 优先，其次 `scene.mediaUrl`）；没有公网 URL 时退化为文生视频，
+ * 绝不发送 `data:`/本机路径/本机地址——上游会直接拒绝（见设计文档 §6.2 第 5 条）。
+ *
+ * 说明：外层按「候选模型降级 × 单模型有限重试」两级编排——同一模型内的瞬时故障重试用指数退避，整镜尝试耗尽后
+ * 按 Brief.videoModelFallbacks 换下一个渠道（上游整段故障时的唯一活路）；所有候选都失败才向上抛出，
+ * 由工作流按 FR-4.3/§7 终止整条 run。契约类错误不换模型，立即抛出；渠道级不可用（余额不足、无可用渠道）
+ * 不重发同一模型，直接换下一个候选。首帧图被内容审核拒绝是独立一类：换模型救不了（各渠道下载同一张图会被同样拒绝），
+ * 必须去掉首帧退化为文生视频后在同一模型内重试，仍失败才进入常规降级链（见设计文档 §6.2 第 5 条、FR-4.5）。
+ *
+ * @param {Record<string, any>} scene 已含标准场景图、公网首帧 URL（可选）和权威 `durationSec` 的场景。
  * @param {Record<string, any>} brief 已解析 Brief。
  * @param {{inputsWorkspace?: string, scenesWorkspace?: string}} [options] `artifactPaths(runId)` 提供的受管目录。
  * @returns {Promise<{videoPath?: string, videoUrl: string|null, kind: string, model: string, _usage?: object}>} 标准视频或 DEMO stub。
+ * @throws {Error} 重试耗尽、或遇到契约类错误时抛出，错误信息含上游真实原因。
  * @example await generateSceneVideo(scene, brief, { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes });
  */
 export async function generateSceneVideo(scene, brief, options = {}) {
   if (getProviderMode() !== "real") return demoSceneVideo(scene, brief);
-  const model = brief.videoModel || process.env.PROMO_VIDEO_MODEL;
+  const attempts = videoAttemptCount();
+  const candidates = sceneVideoModelCandidates(brief);
+  if (!candidates.length) throw new Error("未指定视频模型（Brief.videoModel / env PROMO_VIDEO_MODEL）");
+  let task = null;
+  let lastError = null;
+  // 说明：仅当本镜确实要带首帧时才可能触发「首帧被内容审核拒绝」，否则去掉首帧等于原样重发（白花一次钱）。
+  const canDropFrame = isPublicHttpUrl(scene.frameImageUrl) || isPublicHttpUrl(scene.mediaUrl);
+  // 说明：退化标记按「整镜」而不是按「单模型」记。各候选渠道下载的是同一张首帧、审核口径同源（实测均为
+  // InputImageSensitiveContentDetected.PrivacyInformation），某个渠道已判定该图不可用作首帧后，后续候选再送同一张图
+  // 只会重复被拒并重复产生一次付费提交。退化本身不消耗尝试次数——它与「首帧不合法」不同，是换输入形态而非换参数，
+  // 因此按同一次尝试内的形态切换处理，避免 attempts=1 时根本没机会退化就被判整镜失败。
+  let frameDropped = false;
+  // 说明：外层按候选模型降级，内层按尝试次数重试。上游「整段故障」时同一模型重试再多次也是白等，
+  // 只有换到下一个渠道才可能出片；已付费的失败任务由网关自动冲正（logs.type=6），换模型不产生额外净成本。
+  for (let candidateIndex = 0; candidateIndex < candidates.length && !task; candidateIndex++) {
+    const model = candidates[candidateIndex];
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        // 说明：这里只重试「提交 + 轮询」这段会产生费用的路径。旧实现把 finalizeSceneVideo（含成片下载）
+        // 也包在重试里，下载抖动会让同一镜重新提交一次已付费生成任务（2026-09 真实验收两次付费的根因）。
+        try {
+          task = await requestSceneVideoTask(scene, brief, model, { dropFrame: frameDropped });
+          break;
+        } catch (error) {
+          // 说明：首帧图被上游内容审核拒绝（InputImageSensitiveContentDetected.PrivacyInformation）时，候选链里每个渠道
+          // 都会下载同一张图并被同样拒绝，换模型纯属浪费；去掉首帧退化为文生（仅 prompt）才是唯一活路。
+          if (!canDropFrame || frameDropped || !isFrameRejectedVideoError(error)) throw error;
+          frameDropped = true;
+          console.warn(`[video] 第 ${scene.index ?? "?"} 镜模型 ${model} 首帧图被上游内容审核拒绝（${error?.message}），去掉首帧退化为文生视频后重试`);
+          task = await requestSceneVideoTask(scene, brief, model, { dropFrame: true });
+          break;
+        }
+      } catch (error) {
+        lastError = error;
+        // 渠道级不可用（余额不足、分组未开通、无可用渠道）不是瞬时故障，重发同一模型必然同样失败；
+        // 但它也不代表请求有问题，换下一个候选渠道仍可能出片，因此跳过本模型剩余尝试直接降级。
+        const channelUnavailable = isChannelUnavailableVideoError(error);
+        // 契约类错误（4xx、字段缺失、首帧不合法、内容审核拒绝）换模型同样会失败，必须立即抛出。
+        if (!isTransientVideoError(error) && !channelUnavailable) throw error;
+        const exhaustedModel = channelUnavailable || attempt >= attempts;
+        const hasNextModel = candidateIndex < candidates.length - 1;
+        if (exhaustedModel && !hasNextModel) throw error;
+        // 说明：跨模型降级把「已用尝试数 + 候选序号」作为退避步数，让换渠道前留出更长的观测窗口。
+        const waitMs = videoRetryBackoffMs(exhaustedModel ? attempts + candidateIndex + 1 : attempt);
+        if (channelUnavailable) {
+          console.warn(`[video] 第 ${scene.index ?? "?"} 镜模型 ${model} 渠道不可用（${error?.message}），跳过剩余尝试降级到 ${candidates[candidateIndex + 1]}，${waitMs}ms 后重试`);
+        } else if (exhaustedModel) {
+          console.warn(`[video] 第 ${scene.index ?? "?"} 镜模型 ${model} 尝试 ${attempts} 次仍失败（${error?.message}），降级到 ${candidates[candidateIndex + 1]}，${waitMs}ms 后重试`);
+        } else {
+          console.warn(`[video] 第 ${scene.index ?? "?"} 镜模型 ${model} 第 ${attempt}/${attempts} 次失败（${error?.message}），${waitMs}ms 后重试`);
+        }
+        await new Promise((r) => setTimeout(r, waitMs));
+        if (exhaustedModel) break; // 换下一个候选模型
+      }
+    }
+  }
+  if (!task) throw lastError || new Error("视频生成失败");
+  // 物化与生成重试完全分离：这里失败只会对同一 URL 重试下载/归一化，绝不重新提交付费生成任务。
+  return await finalizeSceneVideoWithRetry(task, scene, brief, options);
+}
+
+/**
+ * 单次尝试：提交视频任务并按候选端点择优轮询到终态，返回成片地址与任务状态。
+ *
+ * 说明：本函数只负责会付费的「提交 + 轮询」，不下载成片；物化由 finalizeSceneVideoWithRetry 承担，
+ * 这样调用方可以只对生成阶段做瞬时故障重试，而下载抖动不会触发重新生成。
+ *
+ * @param {Record<string, any>} scene 目标场景。
+ * @param {Record<string, any>} brief 已解析 Brief。
+ * @param {string} [modelOverride] 本次尝试使用的模型；缺省取 Brief.videoModel / env，供整镜降级链逐级指定。
+ * @param {{dropFrame?: boolean}} [options] `dropFrame` 为 true 时不发送首帧，强制走文生视频
+ *   （首帧图被上游内容审核拒绝后的退化路径，见设计文档 §6.2 第 5 条）。
+ * @returns {Promise<{videoUrl: string, model: string, taskStatus: string|null}>} 成片地址与上游任务终态。
+ * @throws {Error} 提交失败、轮询失败或任务到达失败终态时抛出。
+ * @example await requestSceneVideoTask(scene, { ...brief, videoModel: "minimax-h3" }, "minimax-h3", { dropFrame: true });
+ */
+async function requestSceneVideoTask(scene, brief, modelOverride, { dropFrame = false } = {}) {
+  if (getProviderMode() !== "real") return demoSceneVideo(scene, brief);
+  const model = modelOverride || brief.videoModel || process.env.PROMO_VIDEO_MODEL;
   if (!model) throw new Error("未指定视频模型（Brief.videoModel / env PROMO_VIDEO_MODEL）");
   let prompt = scene.visualPrompt || scene.subtitle || "";
   if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
@@ -650,21 +973,30 @@ export async function generateSceneVideo(scene, brief, options = {}) {
     model,
     prompt,
     n: 1,
+    // 说明：minimax-h3 等渠道把 duration 设为必填（4~30 整数秒并按秒计费），seedance 系同样按该字段取值；
+    // 缺失时上游直接失败 body.duration: Field required。场景时长是小数秒，向上取整后由 normalizeSceneVideo
+    // 裁剪/补帧到权威时长，因此请求时长只会 ≥ 场景时长，不会丢帧。
+    duration: videoRequestDurationSec(scene),
     aspect_ratio: canvas.aspectRatio,
+    // 说明：minimax-h3 的生成请求拒绝 adaptive，必须显式给白名单比例（21:9/16:9/4:3/1:1/3:4/9:16）；
+    // 画布预设比例恰好都落在白名单内，故与 aspect_ratio 同源。
+    ratio: canvas.aspectRatio,
     width: canvas.width,
     height: canvas.height,
     size: `${canvas.width}x${canvas.height}`,
   };
-  // 首帧来源：真实工作流必须传入受管目录，只把已物化、已按画布标准化的本地场景图编码为 data URL 交给渠道，
-  // 既不发送原始 http(s)/data 来源，也不泄露本机路径（provider 侧无本地文件访问权限）。
-  if (options.scenesWorkspace) {
-    if (!scene.mediaPath) throw new Error("真实视频生成缺少已标准化的本机场景图（scene.mediaPath）");
-    const safeImage = await materializeMedia({ source: scene.mediaPath, kind: "image", workspace: options.scenesWorkspace });
-    body.image = `data:image/png;base64,${fs.readFileSync(safeImage).toString("base64")}`;
+  // 首帧来源：上游视频渠道自行下载该图片，只接受公网 http(s) URL。2026-09 实测：data: URL 被上游拒绝
+  // （refusing to download from disallowed scheme 'data'），localhost/host.docker.internal 等本机地址同样不可达，
+  // 因此本地标准化图片（scene.mediaPath）不得作为首帧输入，只用于预览与最终合成。
+  // 图像渠道没给出公网 URL（例如只回 b64_json）时退化为文生视频，而不是让整条真实链路失败（FR-4.5）。
+  // dropFrame：首帧图被上游内容审核拒绝后的退化路径——同一张图换渠道会被同样拒绝，只能改用纯文生（见设计文档 §6.2 第 5 条）。
+  const frameRef = dropFrame ? null : (isPublicHttpUrl(scene.frameImageUrl) ? scene.frameImageUrl : (isPublicHttpUrl(scene.mediaUrl) ? scene.mediaUrl : null));
+  if (frameRef) {
+    body.image = frameRef;
+  } else if (dropFrame) {
+    console.warn(`[video] 第 ${scene.index ?? "?"} 镜去掉首帧退化为文生视频`);
   } else {
-    const ref = scene.mediaUrl;
-    if (ref && /^https?:\/\//i.test(ref)) body.image = ref; // 无受管目录（单元/兼容调用）：沿用原始图生视频入参
-    else if (ref && /^data:image\//i.test(ref)) body.image = ref;
+    console.warn(`[video] 第 ${scene.index ?? "?"} 镜没有可用的公网首帧 URL，退化为文生视频`);
   }
   const timeoutMs = Number(process.env.PROMO_VIDEO_SUBMIT_TIMEOUT_MS ?? 30000);
   let data = null, submitErr = null;
@@ -680,108 +1012,181 @@ export async function generateSceneVideo(scene, brief, options = {}) {
   }
   if (!data) throw submitErr || new Error("视频提交失败（所有端点均不可用）");
   const videoUrl = extractVideoUrl(data);
-  if (videoUrl) return finalizeSceneVideo(videoUrl, scene, brief, model, options);
+  if (videoUrl) return { videoUrl, model, taskStatus: null };
   // 异步任务：轮询直至完成。提交响应也可能是 new-api 包装形态 {code:"success", data:{id,status}}，
   // 先解包再取 id（unwrap 对非包装形态原样返回，数组形态 data.data[] 不会被守卫吞掉）。
   const submitted = unwrapVideoTask(data);
   const id = submitted?.id || submitted?.data?.[0]?.id || submitted?.task_id || submitted?.request_id;
   if (!id) throw new Error(`视频接口未返回 url 或任务 id：${JSON.stringify(data).slice(0, 200)}`);
-  const deadline = Date.now() + Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 180000);
+  const deadline = Date.now() + Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 600000);
   let lastErr = null;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, Number(process.env.PROMO_VIDEO_POLL_MS ?? 3000)));
-    let task = null;
+    let best = null;
+    // 说明：同一任务 id 在不同端点的信息完整度不同（见 videoTaskInfo），一轮内依次询问候选端点并择优；
+    // 只有「公网可达成片地址 / 明确失败 / 成功终态但无地址」才算命中本轮 —— 只认首个 200 会拿到 /videos/{id} 的空壳响应，
+    // 让权威端点里的 FAILURE 与 fail_reason 永远读不到（2026-09 真实验收轮询超时 >旧默认 180s 的根因）。
+    // 同理，权威端点的 result_url 回环地址（localhost:3000，宿主机不可达）也不得提前命中，否则会遮蔽同响应 metadata.url
+    // 里的公网签名地址，让已经出片的付费任务在下载阶段失败（2026-09-22 真实验收根因）。
     for (const p of VIDEO_POLL_PATHS(id)) {
+      let candidate = null;
       try {
-        task = await oneApiGet(p);
-        break;
+        candidate = await oneApiGet(p);
       } catch (e) {
         lastErr = e;
         if (e.status !== 404 && !/Invalid URL/i.test(String(e.message))) break; // 非路径问题停止尝试该轮
+        continue;
       }
+      const info = videoTaskInfo(candidate);
+      if (!best || info.score > best.info.score) best = { raw: candidate, info };
+      if (info.done) break;
     }
-    if (!task) continue;
-    const body2 = unwrapVideoTask(task);
-    const status = String(body2?.status || body2?.state || "").toLowerCase();
-    const url = body2?.result_url || extractVideoUrl(body2);
-    if (url) return finalizeSceneVideo(url, scene, brief, model, options, status);
-    if (["failed", "failure", "error", "cancelled", "canceled"].includes(status)) {
-      throw new Error(`视频任务 ${id} 失败：${body2?.fail_reason || body2?.error || body2?.message || status}`);
+    if (!best) continue;
+    // 说明：公网可达地址优先直接交付；回环/内网地址虽然也通过了形态校验，但宿主机下载必然失败
+    // （实测 http://localhost:3000 → ECONNREFUSED），因此不允许它遮蔽同轮里明确的上游失败信息。
+    if (best.info.urlPublic) return { videoUrl: best.info.url, model, taskStatus: best.info.status ?? null };
+    if (best.info.failed) {
+      // 说明：失败原因有字符串 fail_reason、对象 error{code,message}（minimax-h3 实测）、字符串 error
+      // 三种形态，统一经 videoFailureReason 抽取，避免只看到 [object Object] 而丢失上游真实原因。
+      throw new Error(`视频任务 ${id} 失败：${best.info.failReason || best.info.status}`);
     }
-    if (["completed", "succeeded", "success", "finished"].includes(status) && !url) {
-      throw new Error(`视频任务 ${id} 完成但未返回 URL：${JSON.stringify(task).slice(0, 200)}`);
+    if (best.info.url) {
+      // 说明：保留旧行为——只剩非公网地址时仍然交付，由物化阶段的下载重试与错误信息给出真实原因，
+      // 不在这里直接判失败（部分自建/内网存储部署确实走内网地址，本机不一定不可达）。
+      console.warn(`[video] 任务 ${id} 只返回了非公网成片地址 ${best.info.url}，仍尝试物化`);
+      return { videoUrl: best.info.url, model, taskStatus: best.info.status ?? null };
+    }
+    if (VIDEO_SUCCESS_STATUSES.includes(best.info.status)) {
+      throw new Error(`视频任务 ${id} 完成但未返回 URL：${JSON.stringify(best.raw).slice(0, 200)}`);
     }
   }
-  throw new Error(`视频任务 ${id} 轮询超时（>${Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 180000) / 1000}s）${lastErr ? `，最近错误：${String(lastErr?.message || lastErr)}` : ""}`);
+  throw new Error(`视频任务 ${id} 轮询超时（>${Number(process.env.PROMO_VIDEO_TIMEOUT_MS ?? 600000) / 1000}s）${lastErr ? `，最近错误：${String(lastErr?.message || lastErr)}` : ""}`);
 }
 
 // new-api 任务查询包装解包：{code:"success", data:{status, result_url, fail_reason}} → 返回 data 层。
 function unwrapVideoTask(raw) {
-  // new-api 统一包装：{code:"success", data:{...}}。提交响应 data 可能只有 id（status 在轮询才有），
-  // 轮询响应 data 含 status/result_url/fail_reason —— 三种都解包；非包装形态原样返回。
-  if (raw && raw.code && raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)) {
+  // 说明：new-api 统一包装 {code:"success", data:{...}}，提交响应 data 只有 id、轮询响应 data 含
+  // status/result_url/fail_reason，实测还存在 data 为「单元素数组」的形态；都解包，非包装形态原样返回。
+  if (raw && raw.code && raw.data) {
     const d = raw.data;
-    if ("id" in d || "status" in d || "result_url" in d || "fail_reason" in d) return d;
+    if (Array.isArray(d)) {
+      if (d.length === 1 && d[0] && typeof d[0] === "object") return d[0];
+    } else if (typeof d === "object" && ("id" in d || "status" in d || "state" in d || "result_url" in d || "fail_reason" in d || "error" in d || "metadata" in d)) {
+      return d;
+    }
   }
   return raw;
 }
 
-// 从视频接口响应中提取首个可用 URL。兼容常见形态：
-//   顶层 { url | video_url }；data/output/results/videos 数组（元素为 string 或 {url|video_url|content.url}）；
-//   output 为对象 { url | video_url | content:{url} }；内容门控 {content:[{url}]} 等。
+// 从视频接口响应中提取可用成片 URL，只接受可物化地址形态：兼容
+//   顶层 { url | video_url | result_url }；data/output/results/videos 为数组（元素为 string 或 {url|video_url|content.url}）；
+//   data/output 为对象 { url | video_url | content:{url} }；内容门控 {content:[{url}]} 等；
+//   metadata.url（minimax-h3 成功响应的实际位置，2026-09 真机实测）。
+// 说明：非可物化形态一律丢弃 —— 上游失败时会把错误文案填进 result_url（实测 `upstream returned unrecognized message`），不校验就会被当成产物地址去下载。
+// 说明：必须先收齐全部候选再择优，不能按首次命中返回。new-api 的 /video/generations/{id} 会在 result_url 里回填容器内
+//   回环地址 http://localhost:3000/v1/videos/{id}/content（宿主机 ECONNREFUSED，改写成宿主端口后仍被网关自身的私网下载
+//   策略拒绝），同一响应 metadata.url 才是可直接下载的公网签名地址 https://ark-*.tos-*.volces.com/*.mp4；按首次命中会拿到
+//   回环地址，让一个已经出片的付费任务在下载阶段白白失败（2026-09-22 真实验收根因）。
+//   择优顺序：公网可达地址 > 其他可物化形态（data:/file:/不可公网直达的 http(s)），同级按出现顺序取先。
 function extractVideoUrl(data) {
   if (!data) return null;
-  const first = (list) => {
-    if (!Array.isArray(list)) return null;
-    for (const it of list) {
-      if (typeof it === "string" && it) return it;
-      if (!it) continue;
-      if (typeof it.url === "string" && it.url) return it.url;
-      if (typeof it.video_url === "string" && it.video_url) return it.video_url;
-      if (it.content) {
-        const c = it.content;
-        if (typeof c === "string" && c) return c;
-        if (typeof c.url === "string" && c.url) return c.url;
-        if (Array.isArray(c)) {
-          for (const ci of c) {
-            if (typeof ci?.url === "string" && ci.url) return ci.url;
-            if (typeof ci === "string" && ci) return ci;
-          }
-        }
-      }
-    }
-    return null;
+  const candidates = [];
+  const push = (value) => {
+    if (!isMediaUrl(value)) return;
+    const hit = value.trim();
+    if (!candidates.includes(hit)) candidates.push(hit);
   };
-  for (const key of ["url", "video_url", "result_url"]) {
-    if (typeof data[key] === "string" && data[key]) return data[key];
-  }
-  const hit = first(data.data || data.results || data.videos);
-  if (hit) return hit;
-  // output 可能为数组（多候选）或单个对象
-  if (Array.isArray(data.output)) return first(data.output);
-  if (data.output && typeof data.output === "object") {
-    const o = data.output;
-    for (const key of ["url", "video_url"]) {
-      if (typeof o[key] === "string" && o[key]) return o[key];
-    }
-    if (o.content) {
-      const c = o.content;
-      if (typeof c === "string" && c) return c;
-      if (typeof c.url === "string" && c.url) return c.url;
-      if (Array.isArray(c)) {
-        for (const ci of c) {
-          if (typeof ci?.url === "string" && ci.url) return ci.url;
-          if (typeof ci === "string" && ci) return ci;
-        }
+  function fromContent(content) {
+    if (typeof content === "string") return push(content);
+    if (Array.isArray(content)) {
+      for (const item of content) {
+        if (typeof item === "string") push(item);
+        else fromObject(item);
       }
+      return;
+    }
+    fromObject(content);
+  }
+  function fromObject(obj) {
+    if (!obj || typeof obj !== "object") return;
+    for (const key of ["url", "video_url", "result_url"]) push(obj[key]);
+    // minimax-h3 成功响应把成片地址放在 metadata.url（顶层无 url 字段），漏读会被误判为「完成但未返回 URL」。
+    if (obj.metadata && typeof obj.metadata === "object") {
+      for (const key of ["url", "video_url"]) push(obj.metadata[key]);
+    }
+    if (obj.content) fromContent(obj.content);
+  }
+  fromObject(data);
+  for (const nested of [data.data, data.results, data.videos, data.output]) {
+    if (!nested) continue;
+    if (Array.isArray(nested)) {
+      for (const item of nested) {
+        if (typeof item === "string") push(item);
+        else fromObject(item);
+      }
+    } else if (typeof nested === "string") {
+      push(nested);
+    } else {
+      fromObject(nested);
     }
   }
-  return null;
+  const best = candidates.find((candidate) => isPublicHttpUrl(candidate)) || candidates[0] || null;
+  // 说明：选中的公网地址与首个候选不一致，说明首个候选被网关回填成了内部地址；留一条可审计日志便于排障。
+  if (best && candidates[0] !== best && /^https?:\/\//i.test(candidates[0])) {
+    console.warn(`[video] 成片地址候选 ${candidates[0]} 不可公网直达，改用 ${best}`);
+  }
+  return best;
 }
 
 // DEMO：不真调视频接口 —— 沿用静态场景图（动态镜头在 real 模式由网关视频渠道产出）。
 function demoSceneVideo(scene, brief) {
   return { videoUrl: null, kind: "video-stub", model: brief.videoModel || "demo-video", note: "DEMO：未调用视频接口，出片仍为静态图合成" };
+}
+
+// 物化重试上限：成片下载或 FFmpeg 归一化的瞬时失败只对同一 URL 重试，绝不触发新的付费生成任务。
+const MEDIA_FINALIZE_MAX_ATTEMPTS = 3;
+
+/**
+ * 解析成片物化的最大尝试次数。
+ *
+ * 说明：HTTP 传输在 materializeMedia 内已有下载重试（PROMO_MEDIA_DOWNLOAD_ATTEMPTS）；
+ * 这里额外包一层是为了覆盖 FFmpeg 归一化的瞬时失败（临时文件占用、IO 抖动），默认只需 2 次。
+ *
+ * @returns {number} 1~3 之间的尝试次数。
+ * @example mediaFinalizeAttemptCount(); // 2
+ */
+function mediaFinalizeAttemptCount() {
+  const raw = Number(process.env.PROMO_MEDIA_FINALIZE_ATTEMPTS ?? 2);
+  if (!Number.isFinite(raw) || raw < 1) return 1;
+  return Math.min(MEDIA_FINALIZE_MAX_ATTEMPTS, Math.floor(raw));
+}
+
+/**
+ * 成片物化：失败只对同一成片 URL 重试，不重新提交生成任务。
+ *
+ * @param {{videoUrl: string, model: string, taskStatus: string|null}} task 生成阶段产出的任务信息。
+ * @param {Record<string, any>} scene 目标场景。
+ * @param {Record<string, any>} brief 已解析 Brief。
+ * @param {{inputsWorkspace?: string, scenesWorkspace?: string}} [options] 受管目录。
+ * @returns {Promise<{videoPath?: string, videoUrl: string|null, kind: string, model: string, _usage?: object}>} 标准化视频结果。
+ * @throws {Error} 重试耗尽后抛出最后一次物化错误（信息含底层 cause）。
+ * @example await finalizeSceneVideoWithRetry({ videoUrl, model, taskStatus: null }, scene, brief, options);
+ */
+async function finalizeSceneVideoWithRetry(task, scene, brief, options = {}) {
+  const attempts = mediaFinalizeAttemptCount();
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await finalizeSceneVideo(task.videoUrl, scene, brief, task.model, options, task.taskStatus ?? undefined);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      const waitMs = Number(process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS ?? 1500) * attempt;
+      console.warn(`[video] 第 ${scene.index ?? "?"} 镜成片物化第 ${attempt}/${attempts} 次失败（${error?.message}），${waitMs}ms 后对同一 URL 重试（不重新提交生成任务）`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw lastError || new Error("成片物化失败");
 }
 
 // ───────────────────────── 4) TTS 配音 ─────────────────────────
