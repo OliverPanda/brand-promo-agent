@@ -8,8 +8,7 @@ process.env.PROMO_LLM_MODEL = "deepseek-v4-flash";
 process.env.PROMO_IMAGE_MODEL = "doubao-seedream-4-0-250828";
 process.env.PROMO_IMAGE_SIZE = "1024x576";
 process.env.PROMO_TTS_MODEL = "tiny-iceberg";
-process.env.PROMO_MUSIC_MODEL = "mureka-v1";
-process.env.PROMO_MUSIC_PATH = "/audio/music";
+process.env.PROMO_MUSIC_MODEL = "mureka-song";
 
 import fs from "node:fs";
 import os from "node:os";
@@ -77,6 +76,14 @@ function makeRes({ ok = true, status = 200, json, text, bytes } = {}) {
 function route(path, body) {
   // 依据 path 与 body 返回对应 one-api 形状响应。
   if (path.endsWith("/chat/completions")) {
+    // Mureka 协议桥：提交与轮询共用 chat/completions 形态，content 承载业务 JSON（无 response_format）。
+    if (body.model === "mureka-song") {
+      return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ taskId: "t1", kind: "instrumental" }) } }] } });
+    }
+    if (body.model === "mureka-query") {
+      const bytes = invalidMusicResponse ? Buffer.from("invalid") : DEFAULT_MUSIC;
+      return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ status: "succeeded", audioUrl: `data:audio/wav;base64,${bytes.toString("base64")}` }) } }] } });
+    }
     if (body.response_format?.type === "json_object") {
       // 脚本 vs 分镜：用 system 文案区分（简单但够用）
       const sys = body.messages?.[0]?.content || "";
@@ -122,10 +129,6 @@ function route(path, body) {
     speechCallIndex += 1;
     if (speechCallIndex === failSpeechAt) return makeRes({ ok: false, status: 500, text: "tts failed" });
     return makeRes({ bytes: speechResponses.length ? speechResponses.shift() : DEFAULT_SPEECH });
-  }
-  if (path.endsWith("/audio/music")) {
-    if (invalidMusicResponse) return makeRes({ json: { data: [{ b64_json: Buffer.from("invalid").toString("base64") }] } });
-    return makeRes({ json: { data: [{ b64_json: DEFAULT_MUSIC.toString("base64") }] } });
   }
   return makeRes({ ok: false, status: 404, text: "not found" });
 }
@@ -505,13 +508,19 @@ test("真实模式：Brief.llmModel / Brief.imageModel 请求级覆盖模型（�
   assert.equal(def.model, process.env.PROMO_LLM_MODEL || "deepseek-v4-flash");
 });
 
-test("generateMusic 真实模式：POST /audio/music + 返回 url + _usage.tracks", async () => {
+test("generateMusic 真实模式：Mureka 桥提交 + 轮询 + 物化 + _usage.tracks", async () => {
   calls = [];
   const script = await generateScript(baseBrief);
   const scenes = await generateStoryboard(baseBrief, script);
-  const m = await generateMusic({ ...baseBrief, musicModel: "mureka-v1" }, scenes, { workspace: audioWorkspace() });
-  assert.match(calls[calls.length - 1].url, /\/audio\/music$/);
-  assert.equal(calls[calls.length - 1].body.model, "mureka-v1");
+  const m = await generateMusic({ ...baseBrief, musicModel: "mureka-song" }, scenes, { workspace: audioWorkspace() });
+  const submit = calls.find((c) => c.url.endsWith("/chat/completions") && c.body.model === "mureka-song");
+  assert.ok(submit, "配乐必须先经 mureka-song 提交任务");
+  const submitted = JSON.parse(submit.body.messages[0].content);
+  assert.match(submitted.prompt, /背景音乐/);
+  assert.equal(submitted.mode, "instrumental");
+  const poll = calls.find((c) => c.url.endsWith("/chat/completions") && c.body.model === "mureka-query");
+  assert.ok(poll, "配乐必须经 mureka-query 轮询结果");
+  assert.deepEqual(JSON.parse(poll.body.messages[0].content), { taskId: "t1", kind: "instrumental" });
   assert.ok(fs.existsSync(m.musicPath));
   assert.ok(m.durationSec > 0.9);
   assert.equal(m._usage.tracks, 1);

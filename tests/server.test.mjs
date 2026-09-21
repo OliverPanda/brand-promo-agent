@@ -102,12 +102,13 @@ test("prepareGenerationBrief：REAL 成功预检写回画布与模型审计字�
     dependencies: {
       verifyMediaToolchain: async () => calls.push("toolchain"),
       fetchRemoteModels: async () => ({
-        byType: { video: ["7zhe-seedance", "minimax-h3"], audio: ["speech-02-hd", "mureka-v1"] },
+        byType: { video: ["7zhe-seedance", "minimax-h3"], audio: ["speech-02-hd", "mureka-song", "mureka-query"] },
         raw: [
           { id: "minimax-h3", type: "video" },
           { id: "7zhe-seedance", type: "video" },
           { id: "speech-02-hd", type: "tts" },
-          { id: "mureka-v1", type: "music" },
+          { id: "mureka-song", type: "music" },
+          { id: "mureka-query", type: "music" },
         ],
       }),
       artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
@@ -115,15 +116,14 @@ test("prepareGenerationBrief：REAL 成功预检写回画布与模型审计字�
       providerMode: () => "real",
       providerBase: () => "https://gateway.example/v1",
       providerKey: () => "secret-not-returned",
-      musicPath: () => "/audio/music",
-      musicModel: () => "mureka-v1",
+      musicModel: () => "mureka-song",
       ttsModel: () => "",
     },
   });
   assert.equal(brief.canvasPreset, "social-portrait");
   assert.equal(brief.videoModel, "minimax-h3");
   assert.equal(brief.ttsModel, "speech-02-hd");
-  assert.equal(brief.musicModel, "mureka-v1");
+  assert.equal(brief.musicModel, "mureka-song");
   assert.equal(brief.modelSelectionSource, "automatic");
   assert.deepEqual(calls, ["toolchain", "writable"]);
 });
@@ -138,16 +138,19 @@ test("prepareGenerationBrief：Brief 未选时采用并校验 PROMO_VIDEO_MODEL"
       dependencies: {
         verifyMediaToolchain: async () => {},
         fetchRemoteModels: async () => ({
-          byType: { video: ["minimax-h3", "seedance-2.0"], audio: ["speech-02-hd"] },
-          raw: [{ id: "speech-02-hd", type: "tts" }],
+          byType: { video: ["minimax-h3", "seedance-2.0"], audio: ["speech-02-hd", "mureka-song", "mureka-query"] },
+          raw: [
+            { id: "speech-02-hd", type: "tts" },
+            { id: "mureka-song", type: "music" },
+            { id: "mureka-query", type: "music" },
+          ],
         }),
         artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
         verifyWritable: async () => {},
         providerMode: () => "real",
         providerBase: () => "https://gateway.example/v1",
         providerKey: () => "secret-not-returned",
-        musicPath: () => "/audio/music",
-        musicModel: () => "mureka-v1",
+        musicModel: () => "mureka-song",
         ttsModel: () => "speech-02-hd",
       },
     });
@@ -167,16 +170,20 @@ test("prepareGenerationBrief：REAL 手选非实时视频模型标记为 400", a
       dependencies: {
         verifyMediaToolchain: async () => {},
         fetchRemoteModels: async () => ({
-          byType: { video: ["minimax-h3"], audio: ["speech-02-hd"] },
-          raw: [{ id: "minimax-h3", type: "video" }, { id: "speech-02-hd", type: "tts" }],
+          byType: { video: ["minimax-h3"], audio: ["speech-02-hd", "mureka-song", "mureka-query"] },
+          raw: [
+            { id: "minimax-h3", type: "video" },
+            { id: "speech-02-hd", type: "tts" },
+            { id: "mureka-song", type: "music" },
+            { id: "mureka-query", type: "music" },
+          ],
         }),
         artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
         verifyWritable: async () => {},
         providerMode: () => "real",
         providerBase: () => "https://gateway.example/v1",
         providerKey: () => "secret-not-returned",
-        musicPath: () => "/audio/music",
-        musicModel: () => "mureka-v1",
+        musicModel: () => "mureka-song",
         ttsModel: () => "",
       },
     }),
@@ -192,14 +199,18 @@ test("prepareGenerationBrief：PROMO_TTS_MODEL 指向音乐模型时预检失败
       dependencies: {
         verifyMediaToolchain: async () => {},
         fetchRemoteModels: async () => ({
-          byType: { video: ["minimax-h3"], audio: ["speech-02-hd", "mureka-v1"] },
-          raw: [{ id: "speech-02-hd", type: "tts" }, { id: "mureka-v1", type: "music" }],
+          byType: { video: ["minimax-h3"], audio: ["speech-02-hd", "mureka-v1", "mureka-song", "mureka-query"] },
+          raw: [
+            { id: "speech-02-hd", type: "tts" },
+            { id: "mureka-v1", type: "music" },
+            { id: "mureka-song", type: "music" },
+            { id: "mureka-query", type: "music" },
+          ],
         }),
         providerMode: () => "real",
         providerBase: () => "https://gateway.example/v1",
         providerKey: () => "secret-not-returned",
-        musicPath: () => "/audio/music",
-        musicModel: () => "mureka-v1",
+        musicModel: () => "mureka-song",
         ttsModel: () => "mureka-v1",
       },
     }),
@@ -216,15 +227,18 @@ test("prepareGenerationBrief：文件系统异常不向 503 暴露路径或底�
       dependencies: {
         verifyMediaToolchain: async () => {},
         fetchRemoteModels: async () => ({
-          byType: { video: ["minimax-h3"], audio: ["speech-02-hd"] },
-          raw: [{ id: "speech-02-hd", type: "tts" }],
+          byType: { video: ["minimax-h3"], audio: ["speech-02-hd", "mureka-song", "mureka-query"] },
+          raw: [
+            { id: "speech-02-hd", type: "tts" },
+            { id: "mureka-song", type: "music" },
+            { id: "mureka-query", type: "music" },
+          ],
         }),
         artifactPaths: () => { throw new Error("EACCES: C:\\secret\\customer\\outputs"); },
         providerMode: () => "real",
         providerBase: () => "https://gateway.example/v1",
         providerKey: () => "secret-not-returned",
-        musicPath: () => "/audio/music",
-        musicModel: () => "mureka-v1",
+        musicModel: () => "mureka-song",
         ttsModel: () => "speech-02-hd",
       },
     }),

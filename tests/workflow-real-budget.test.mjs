@@ -8,8 +8,7 @@ process.env.PROMO_LLM_MODEL = "deepseek-v4-flash";
 process.env.PROMO_IMAGE_MODEL = "doubao-seedream-4-0-250828";
 process.env.PROMO_IMAGE_SIZE = "1024x576";
 process.env.PROMO_TTS_MODEL = "speech-02-hd";
-process.env.PROMO_MUSIC_MODEL = "mureka-v1";
-process.env.PROMO_MUSIC_PATH = "/audio/music";
+process.env.PROMO_MUSIC_MODEL = "mureka-song";
 process.env.PROMO_BUDGET_CAP = "100"; // 充足预算，确保成功路径
 
 const fs = (await import("node:fs")).default;
@@ -91,10 +90,20 @@ function route(path, body) {
     return makeRes({ json: { data: [
       { id: "minimax-h3", type: "video" },
       { id: "speech-02-hd", type: "tts" },
-      { id: "mureka-v1", type: "music" },
+      { id: "mureka-song", type: "music" },
+      { id: "mureka-query", type: "music" },
     ] } });
   }
   if (path.endsWith("/chat/completions")) {
+    // Mureka 协议桥：提交/轮询共用 chat/completions，content 承载业务 JSON（无 response_format）。
+    if (body.model === "mureka-song") {
+      providerCallOrder.push("music");
+      return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ taskId: "t1", kind: "instrumental" }) } }] } });
+    }
+    if (body.model === "mureka-query") {
+      const bytes = workflowInvalidMusic ? BROKEN_WAV : AUDIO_FIXTURE;
+      return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ status: "succeeded", audioUrl: `data:audio/wav;base64,${bytes.toString("base64")}` }) } }] } });
+    }
     const sys = body.messages?.[0]?.content || "";
     if (sys.includes("资深品牌文案")) {
       return makeRes({ json: { choices: [{ message: { content: JSON.stringify({
@@ -132,11 +141,6 @@ function route(path, body) {
     providerCallOrder.push("tts");
     if (workflowSpeechCall === workflowFailSpeechAt) return makeRes({ ok: false, status: 500, text: "line failed" });
     return makeRes({ bytes: AUDIO_FIXTURE });
-  }
-  if (path.endsWith("/audio/music")) {
-    providerCallOrder.push("music");
-    const bytes = workflowInvalidMusic ? BROKEN_WAV : AUDIO_FIXTURE;
-    return makeRes({ json: { data: [{ b64_json: bytes.toString("base64") }] } });
   }
   return makeRes({ ok: false, status: 404, text: "not found" });
 }

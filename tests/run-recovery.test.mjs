@@ -118,11 +118,15 @@ test("REAL 模式缺少已校验产物时不得进入成片门", async t => {
     providerBase: () => "http://127.0.0.1:1",
     providerKey: () => "test-key",
     fetchRemoteModels: async () => ({
-      byType: { video: ["minimax-h3"], audio: ["speech-02-hd"] },
-      raw: [{ id: "minimax-h3", type: "video" }, { id: "speech-02-hd", type: "tts" }],
+      byType: { video: ["minimax-h3"], audio: ["speech-02-hd", "mureka-song", "mureka-query"] },
+      raw: [
+        { id: "minimax-h3", type: "video" },
+        { id: "speech-02-hd", type: "tts" },
+        { id: "mureka-song", type: "music" },
+        { id: "mureka-query", type: "music" },
+      ],
     }),
-    musicPath: () => "/audio/music",
-    musicModel: () => "mureka-v1",
+    musicModel: () => "mureka-song",
     ttsModel: () => "speech-02-hd",
     videoModel: () => "",
   };

@@ -4,6 +4,11 @@
  */
 
 const EXACT_VIDEO_PRIORITY = ["minimax-h3", "7zhe-seedance", "seedance-2.0"];
+
+// Mureka 协议桥的模型名（由 mingstar-model-bridge 在 one-api custom channel 下注册）。
+// 配乐 = 同一渠道上的两个模型：提交任务 + 按 taskId 轮询；网关无 OpenAI /audio/music 路由。
+export const MUSIC_SUBMIT_MODEL = "mureka-song";
+export const MUSIC_QUERY_MODEL = "mureka-query";
 const SEEDANCE_20_RE = /seedance[-_.]?2[-_.]?0/i;
 
 /**
@@ -86,11 +91,11 @@ export function isTtsModel(modelId, raw = []) {
 /**
  * 一次性解析真实交付使用的模型并返回审计对象。
  *
- * @param {{brief?: {videoModel?: string}, liveModels: {byType?: {video?: string[], audio?: string[]}, raw?: Array<{id?: string, type?: string}>}, configuredVideoModel?: string, ttsModel?: string, musicModel: string}} input 解析输入。
+ * @param {{brief?: {videoModel?: string}, liveModels: {byType?: {video?: string[], audio?: string[]}, raw?: Array<{id?: string, type?: string}>}, configuredVideoModel?: string, ttsModel?: string, musicModel?: string}} input 解析输入；`musicModel` 缺省为 Mureka 桥提交模型。
  * @returns {{videoModel: string, ttsModel: string, musicModel: string, source: "manual" | "configured" | "automatic"}} 解析结果。
  * @throws {Error} 任一必需模型不可用时抛出。
  * @example
- * resolveDeliveryModels({ brief: {}, liveModels, musicModel: "mureka-v1" });
+ * resolveDeliveryModels({ brief: {}, liveModels, musicModel: MUSIC_SUBMIT_MODEL });
  */
 export function resolveDeliveryModels({ brief = {}, liveModels, configuredVideoModel, ttsModel, musicModel }) {
   const videoModels = liveModels?.byType?.video || [];
@@ -112,19 +117,21 @@ export function resolveDeliveryModels({ brief = {}, liveModels, configuredVideoM
   }
   const raw = Array.isArray(liveModels?.raw) ? liveModels.raw : [];
   const resolvedTts = selectTtsModel(audioModels, ttsModel, raw);
-  if (!musicModel) throw new Error("未配置配乐模型 PROMO_MUSIC_MODEL");
-
-  const catalogHasMusic = raw.some((item) =>
-    String(item?.type || "").toLowerCase() === "music"
-      || /(?:music|mureka|suno)/i.test(String(item?.id || ""))
+  // 配乐固定走 Mureka 协议桥：提交与轮询是两个模型，缺任一都会在付费后失败，故在预检一并拦下。
+  const resolvedMusic = musicModel || MUSIC_SUBMIT_MODEL;
+  if (resolvedMusic !== MUSIC_SUBMIT_MODEL) {
+    throw new Error(`配乐模型不可用：${resolvedMusic}（Mureka 桥仅提供 ${MUSIC_SUBMIT_MODEL}）`);
+  }
+  const missingBridgeModels = [MUSIC_SUBMIT_MODEL, MUSIC_QUERY_MODEL].filter(
+    (id) => !raw.some((item) => item?.id === id),
   );
-  if (catalogHasMusic && !raw.some((item) => item?.id === musicModel)) {
-    throw new Error(`配乐模型不可用：${musicModel}`);
+  if (missingBridgeModels.length) {
+    throw new Error(`配乐桥模型不可用：网关实时清单缺少 ${missingBridgeModels.join("、")}`);
   }
   return {
     videoModel,
     ttsModel: resolvedTts,
-    musicModel,
+    musicModel: resolvedMusic,
     source,
   };
 }

@@ -43,30 +43,35 @@ test("resolveDeliveryModels：返回视频、TTS、配乐与来源审计", () =>
     resolveDeliveryModels({
       brief: { videoModel: "7zhe-seedance" },
       liveModels: {
-        byType: { video: ["minimax-h3", "7zhe-seedance"], audio: ["speech-02-hd", "mureka-v1"] },
+        byType: { video: ["minimax-h3", "7zhe-seedance"], audio: ["speech-02-hd", "mureka-song", "mureka-query"] },
         raw: [
           { id: "minimax-h3", type: "video" },
           { id: "7zhe-seedance", type: "video" },
           { id: "speech-02-hd", type: "tts" },
-          { id: "mureka-v1", type: "music" },
+          { id: "mureka-song", type: "music" },
+          { id: "mureka-query", type: "music" },
         ],
       },
-      musicModel: "mureka-v1",
+      musicModel: "mureka-song",
     }),
-    { videoModel: "7zhe-seedance", ttsModel: "speech-02-hd", musicModel: "mureka-v1", source: "manual" }
+    { videoModel: "7zhe-seedance", ttsModel: "speech-02-hd", musicModel: "mureka-song", source: "manual" }
   );
 });
 
 test("resolveDeliveryModels：Brief 手选优先于 env，env 优先于自动模型", () => {
   const liveModels = {
-    byType: { video: ["minimax-h3", "seedance-2.0"], audio: ["speech-02-hd"] },
-    raw: [{ id: "speech-02-hd", type: "tts" }],
+    byType: { video: ["minimax-h3", "seedance-2.0"], audio: ["speech-02-hd", "mureka-song", "mureka-query"] },
+    raw: [
+      { id: "speech-02-hd", type: "tts" },
+      { id: "mureka-song", type: "music" },
+      { id: "mureka-query", type: "music" },
+    ],
   };
-  assert.equal(resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-v1" }).videoModel, "seedance-2.0");
-  assert.equal(resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-v1" }).source, "configured");
-  assert.equal(resolveDeliveryModels({ brief: { videoModel: "minimax-h3" }, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-v1" }).source, "manual");
+  assert.equal(resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-song" }).videoModel, "seedance-2.0");
+  assert.equal(resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-song" }).source, "configured");
+  assert.equal(resolveDeliveryModels({ brief: { videoModel: "minimax-h3" }, liveModels, configuredVideoModel: "seedance-2.0", musicModel: "mureka-song" }).source, "manual");
   assert.throws(
-    () => resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "missing-video", musicModel: "mureka-v1" }),
+    () => resolveDeliveryModels({ brief: {}, liveModels, configuredVideoModel: "missing-video", musicModel: "mureka-song" }),
     /配置的动态视频模型不可用/
   );
 });

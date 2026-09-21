@@ -56,7 +56,7 @@ test("已校验成片渲染 MP4 播放器与三类下载，并回显画布、模
     artifactManifest: {
       validated: true,
       canvas: { id: "social-square", width: 1080, height: 1080, aspectRatio: "1:1" },
-      models: { video: "minimax-h3", tts: "speech-02-hd", music: "mureka-v1" },
+      models: { video: "minimax-h3", tts: "speech-02-hd", music: "mureka-song" },
       scenes: [{ index: 1, durationSec: 6 }],
       timeline: { durationSec: 30 },
     },
@@ -73,7 +73,7 @@ test("已校验成片渲染 MP4 播放器与三类下载，并回显画布、模
   assert.match(html, /方形短视频 1080×1080（1:1）/);
   assert.match(html, /动态视频 minimax-h3（自动优先级）/);
   assert.match(html, /配音 speech-02-hd/);
-  assert.match(html, /配乐 mureka-v1/);
+  assert.match(html, /配乐 mureka-song/);
   assert.match(html, /已通过（可交付）/);
 });
 

@@ -51,7 +51,7 @@
 
 ## 5. M2 执行记录（v0.3 更新）
 
-**决策延续**：M2 按 §4 选定策略落地——真实 Provider 全部经 **one-api（OpenAI 兼容统一网关）** 接入：脚本/分镜走 `/chat/completions`，场景图走 `/images/generations`（Seedream `doubao-seedream-4-0-250828`），配音走 `/audio/speech`，配乐走 Mureka 桥 `/audio/music`；合成走服务端 **FFmpeg**（`PROMO_FFMPEG_BIN`）。工作流代码零改动，仅由 `PROMO_PROVIDER_MODE=real` 切换，DEMO 路径完整保留、零回归。
+**决策延续**：M2 按 §4 选定策略落地——真实 Provider 全部经 **one-api（OpenAI 兼容统一网关）** 接入：脚本/分镜走 `/chat/completions`，场景图走 `/images/generations`（Seedream `doubao-seedream-4-0-250828`），配音走 `/audio/speech`，配乐走 Mureka 桥（`/chat/completions` 的 `mureka-song` 提交 + `mureka-query` 轮询）；合成走服务端 **FFmpeg**（`PROMO_FFMPEG_BIN`）。工作流代码零改动，仅由 `PROMO_PROVIDER_MODE=real` 切换，DEMO 路径完整保留、零回归。
 
 **M2 工程修正（已落实，详见 PRD §16.9.5）**：
 1. **两段式工作流 + store 审批门**（继承 M1 对 Mastra v1.63 suspend/resume 陷阱的规避）：HITL 脚本门放在 `promoScript` 收尾步 suspend，审批通过由 server 冷启动 `promoVideo`。

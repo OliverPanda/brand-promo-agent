@@ -1,7 +1,8 @@
 // Provider 抽象层：所有外部能力（LLM / 图像 / TTS / 音乐 / 动态视频 / 合成）均经此适配。
 // 默认 DEMO 模式：完全离线、确定性的占位生成，无需任何外部密钥即可端到端运行。
 // 生产模式（PROMO_PROVIDER_MODE=real）：经 one-api（OpenAI 兼容统一网关）调用真实能力，
-//   图像走 /v1/images/generations（Seedream 等），TTS 走 /v1/audio/speech，音乐走 Mureka 桥，
+//   图像走 /v1/images/generations（Seedream 等），TTS 走 /v1/audio/speech，音乐走 Mureka 桥
+//   （/v1/chat/completions 的 mureka-song 提交 + mureka-query 轮询），
 //   动态视频走 /v1/videos/generations（图生/文生，异步任务轮询，PROMO_VIDEO_TIMEOUT_MS 超时）；
 //   合成走服务端 FFmpeg（PROMO_FFMPEG_BIN）。每个真实能力回传 _usage 供成本归集。
 //
@@ -11,6 +12,7 @@ import { encodeSVG } from "./svg.js";
 import { withGlobalLanguage } from "../i18n.js";
 import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey } from "../runtime-config.js";
 import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
+import { MUSIC_QUERY_MODEL, MUSIC_SUBMIT_MODEL } from "../media/model-selection.js";
 import { materializeMedia } from "../media/materialize.js";
 import { assertSubtitleFilters, composeFinalVideo, normalizeSceneImage, normalizeSceneVideo } from "../media/ffmpeg.js";
 import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration } from "../media/audio.js";
@@ -714,30 +716,79 @@ function parseTimecodeMs(value, index) {
   return Number(hours) * 3_600_000 + Number(minutes) * 60_000 + Number(seconds) * 1000 + Number(milliseconds);
 }
 
-// ───────────────────────── 5) 音乐（Mureka 桥 / one-api 音乐通道） ─────────────────────────
+// ───────────────────────── 5) 音乐（Mureka 协议桥：mureka-song 提交 + mureka-query 轮询） ─────────────────────────
+/**
+ * 通过 one-api 桥调用一次 chat/completions，并把 content（JSON 字符串）解析为对象。
+ *
+ * 说明：Mureka 是非 OpenAI 协议（提交任务 + 按 taskId 轮询），由 mingstar-model-bridge 以
+ * chat/completions 形态桥接；content 承载业务 JSON。此处统一解包，避免每个调用点重复解析。
+ * @param {string} model 桥暴露的模型名（mureka-song / mureka-query）。
+ * @param {Record<string, any>} payload 业务负载（序列化后放入 user content）。
+ * @param {{timeoutMs?: number}} [options] 单次请求超时。
+ * @returns {Promise<Record<string, any>>} 解析后的业务对象。
+ * @throws {Error} 响应缺少 content 或 content 不是合法 JSON 时抛出。
+ * @example await chatCompletionJson("mureka-query", { taskId, kind });
+ */
+async function chatCompletionJson(model, payload, { timeoutMs = 120000 } = {}) {
+  const data = await oneApiPost(
+    "/chat/completions",
+    { model, messages: [{ role: "user", content: JSON.stringify(payload) }] },
+    { timeoutMs },
+  );
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string" || content.trim() === "") throw new Error(`one-api 桥响应缺少 content（model=${model}）`);
+  const parsed = parseJSONSafe(content);
+  if (!parsed || typeof parsed !== "object" || Object.keys(parsed).length === 0) {
+    throw new Error(`one-api 桥返回的 content 不是合法 JSON（model=${model}）`);
+  }
+  return parsed;
+}
+
 /**
  * 生成配乐并物化、探测真实音频文件；本阶段不执行最终混音。
+ *
+ * 说明：配乐固定走 Mureka 协议桥（mureka-song 提交 → mureka-query 轮询取 audioUrl）。
+ * 网关是 new-api，不含 OpenAI /audio/music 路由，直连该端点必然 404；桥与 ai-core 共用
+ * 同一 one-api 渠道与同一密钥，因此复用桥是唯一可用且与平台一致的链路。
  * @param {Record<string, any>} brief 已解析 Brief，优先消费 musicModel。
  * @param {Array} storyboard 分镜上下文。
  * @param {{workspace?: string}} [options] `artifactPaths(runId).audio` 受管音频目录。
  * @returns {Promise<{musicPath?: string, musicUrl: string|null, durationSec?: number, mood: string, model: string, _usage?: object}>} 配乐素材。
- * @throws {Error} 真实模式响应无音频或不可解码时抛出。
+ * @throws {Error} 真实模式提交/轮询失败、超时或音频不可物化时抛出。
  * @example await generateMusic(brief, scenes, { workspace: paths.audio });
  */
 export async function generateMusic(brief, storyboard, options = {}) {
   if (getProviderMode() !== "real") return demoMusic(brief);
   if (!options.workspace) throw new Error("真实配乐必须提供受管 audio workspace");
-  const model = brief.musicModel || process.env.PROMO_MUSIC_MODEL || "mureka-v1";
-  const path = process.env.PROMO_MUSIC_PATH || "/audio/music";
+  const model = brief.musicModel || process.env.PROMO_MUSIC_MODEL || MUSIC_SUBMIT_MODEL;
   const prompt = `背景音乐：${(brief.tones || ["专业"]).join("/")}风格，匹配宣传片情绪曲线`;
-  const data = await oneApiPost(path, { model, prompt, lyrics: "", instrumental: true });
+  const submitTimeoutMs = Number(process.env.PROMO_MUSIC_SUBMIT_TIMEOUT_MS ?? 60000);
+  const pollMs = Number(process.env.PROMO_MUSIC_POLL_MS ?? 5000);
+  const timeoutMs = Number(process.env.PROMO_MUSIC_TIMEOUT_MS ?? 300000);
   let musicPath;
   let durationSec;
   try {
-    const item = data.data?.[0] || {};
-    const musicUrl = item.url || (item.b64_json ? `data:audio/mp3;base64,${item.b64_json}` : null);
-    if (!musicUrl) throw new Error("配乐服务返回空音频响应");
-    musicPath = await materializeMedia({ source: musicUrl, kind: "audio", workspace: options.workspace });
+    const submitted = await chatCompletionJson(model, { prompt, mode: "instrumental" }, { timeoutMs: submitTimeoutMs });
+    const taskId = String(submitted?.taskId || "").trim();
+    if (!taskId) throw new Error("配乐桥提交响应缺少 taskId");
+    const kind = submitted?.kind === "song" ? "song" : "instrumental";
+    const deadline = Date.now() + timeoutMs;
+    let audioUrl = null;
+    for (;;) {
+      const task = await chatCompletionJson(MUSIC_QUERY_MODEL, { taskId, kind });
+      const status = String(task?.status || "").toLowerCase();
+      if (status === "succeeded") {
+        audioUrl = String(task?.audioUrl || "").trim() || null;
+        if (!audioUrl) throw new Error("配乐任务成功但未返回音频地址");
+        break;
+      }
+      if (["failed", "cancelled", "canceled", "timeouted", "error"].includes(status)) {
+        throw new Error(`配乐任务失败：${task?.errorMessage || status}`);
+      }
+      if (Date.now() >= deadline) throw new Error(`配乐任务轮询超时（>${timeoutMs / 1000}s）`);
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    musicPath = await materializeMedia({ source: audioUrl, kind: "audio", workspace: options.workspace });
     durationSec = await probeAudioDuration(musicPath);
   } catch (error) {
     throw attachPartialUsage(error, { tracks: 1 });

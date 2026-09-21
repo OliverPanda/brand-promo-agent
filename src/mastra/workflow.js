@@ -42,7 +42,7 @@ import {
   getEffectiveOneApiKey,
 } from "../runtime-config.js";
 import { artifactPaths } from "../media/artifacts.js";
-import { resolveDeliveryModels } from "../media/model-selection.js";
+import { MUSIC_SUBMIT_MODEL, resolveDeliveryModels } from "../media/model-selection.js";
 import { fontSupportsChinese, resolveFontFile } from "../media/font-readiness.js";
 
 const execFileAsync = promisify(execFile);
@@ -137,7 +137,6 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
     providerMode: getProviderMode,
     providerBase: getEffectiveOneApiBase,
     providerKey: getEffectiveOneApiKey,
-    musicPath: () => process.env.PROMO_MUSIC_PATH || "",
     musicModel: () => process.env.PROMO_MUSIC_MODEL || "",
     ttsModel: () => process.env.PROMO_TTS_MODEL || "",
     videoModel: () => process.env.PROMO_VIDEO_MODEL || "",
@@ -149,7 +148,7 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
       ...brief,
       videoModel: brief.videoModel || dependencies.videoModel() || demoVideoChoices()[0],
       ttsModel: dependencies.ttsModel() || "speech-02-hd",
-      musicModel: dependencies.musicModel() || "mureka-v1",
+      musicModel: dependencies.musicModel() || MUSIC_SUBMIT_MODEL,
       modelSelectionSource: brief.videoModel ? "manual" : dependencies.videoModel() ? "configured" : "demo",
     };
   }
@@ -172,13 +171,9 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
   } catch {
     throw new GenerationPreflightError("真实生成预检失败：无法取得网关实时模型清单");
   }
-  if (!dependencies.musicPath()) {
-    throw new GenerationPreflightError("真实生成预检失败：未配置配乐端点 PROMO_MUSIC_PATH");
-  }
-  const musicModel = dependencies.musicModel();
-  if (!musicModel) {
-    throw new GenerationPreflightError("真实生成预检失败：未配置配乐模型 PROMO_MUSIC_MODEL");
-  }
+  // 配乐不再有独立端点开关：固定走 Mureka 桥（mureka-song 提交 + mureka-query 轮询），
+  // 端点缺失/模型缺失都由 resolveDeliveryModels 依据实时清单统一报错，避免两处规则漂移。
+  const musicModel = dependencies.musicModel() || MUSIC_SUBMIT_MODEL;
   let models;
   try {
     models = resolveDeliveryModels({
