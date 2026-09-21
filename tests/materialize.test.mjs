@@ -265,3 +265,92 @@ test("拒绝未由 artifactPaths 注册的任意本地目录作为 workspace", a
     /受管|artifactPaths|工作区/,
   );
 });
+
+test("HTTP 连接层抖动时对同一 URL 重试，且重试成功后仍通过魔数校验", async () => {
+  let attempts = 0;
+  const base = await fixture((req, res) => {
+    attempts += 1;
+    // 前两次在连接层断开（模拟 fetch failed 类抖动），第三次返回真实容器字节。
+    if (attempts <= 2) { req.socket.destroy(); return; }
+    res.writeHead(200, { "content-type": "video/mp4" });
+    res.end(MP4);
+  });
+  process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS = "3";
+  process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS = "5";
+  try {
+    const file = await materializeMedia({ source: base, kind: "video", workspace: workspace() });
+    assert.deepEqual(fs.readFileSync(file), MP4);
+    assert.equal(attempts, 3, "应对同一 URL 重试到成功");
+  } finally {
+    delete process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS;
+    delete process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS;
+  }
+});
+
+test("HTTP 4xx 契约类错误不重试（重发同样失败，只拖长失败时间）", async () => {
+  let attempts = 0;
+  const base = await fixture((_req, res) => {
+    attempts += 1;
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  });
+  process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS = "5";
+  process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS = "5";
+  try {
+    await assert.rejects(materializeMedia({ source: `${base}/gone.mp4`, kind: "video", workspace: workspace() }), /HTTP 404/);
+    assert.equal(attempts, 1, "404 不得重试");
+  } finally {
+    delete process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS;
+    delete process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS;
+  }
+});
+
+test("HTTP 下载失败必须保留底层 cause 诊断（如 ECONNREFUSED），而不是只报 fetch failed", async () => {
+  process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS = "2";
+  process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS = "5";
+  try {
+    // 占用一个端口后立刻关闭，确保拿到真实的「连接被拒绝」而不是 Node 的 bad port 校验错误。
+    const probe = await fixture((_req, res) => res.end());
+    const closedPort = Number(new URL(probe).port);
+    await new Promise((resolve) => servers.splice(servers.findIndex((s) => `http://127.0.0.1:${s.address().port}` === probe), 1)[0].close(resolve));
+    await assert.rejects(
+      materializeMedia({ source: `http://127.0.0.1:${closedPort}/never.mp4`, kind: "video", workspace: workspace() }),
+      (error) => {
+        assert.match(error.message, /ECONNREFUSED/u, `错误信息应带底层 cause，实际：${error.message}`);
+        return true;
+      },
+    );
+  } finally {
+    delete process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS;
+    delete process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS;
+  }
+});
+
+test("HTTP 下载瞬时故障的退避为指数且受封顶约束（2026-09-22 真实验收窗口过短根因）", async () => {
+  // 说明：线性 1500ms×3 的窗口只有约 4.5 秒，短暂断网跨过窗口就会把已付费成功的成片判成失败；
+  // 这里用 base=10ms、cap=25ms 锁定「base × 2^(n-1)」与封顶语义，避免实现回退成线性。
+  const waits = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...rest) => {
+    if (ms >= 5 && ms <= 1000) waits.push(ms);
+    return originalSetTimeout(fn, ms, ...rest);
+  };
+  let attempts = 0;
+  const base = await fixture((req, res) => {
+    attempts += 1;
+    req.socket.destroy();
+  });
+  process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS = "4";
+  process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS = "10";
+  process.env.PROMO_MEDIA_DOWNLOAD_MAX_BACKOFF_MS = "25";
+  try {
+    await assert.rejects(materializeMedia({ source: `${base}/flap.mp4`, kind: "video", workspace: workspace() }));
+    assert.equal(attempts, 4, "应按配置的尝试次数重试");
+    assert.deepEqual(waits, [10, 20, 25], "退避应为 base × 2^(n-1) 且被 cap 截断");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    delete process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS;
+    delete process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS;
+    delete process.env.PROMO_MEDIA_DOWNLOAD_MAX_BACKOFF_MS;
+  }
+});

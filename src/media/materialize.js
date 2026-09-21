@@ -14,6 +14,113 @@ const KIND_LIMIT = { image: "maxImageBytes", video: "maxVideoBytes", audio: "max
 const MIME_PREFIX = { image: "image/", video: "video/", audio: "audio/" };
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 5;
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429]);
+const RETRYABLE_NETWORK_CODES = new Set([
+  "EAI_AGAIN", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EHOSTUNREACH", "ENETUNREACH", "ECONNABORTED",
+]);
+const MEDIA_DOWNLOAD_MAX_ATTEMPTS = 6;
+const MEDIA_DOWNLOAD_DEFAULT_ATTEMPTS = 4;
+const MEDIA_DOWNLOAD_DEFAULT_BACKOFF_MS = 1500;
+const MEDIA_DOWNLOAD_DEFAULT_MAX_BACKOFF_MS = 15000;
+
+/**
+ * 解析 HTTP 媒体下载的最大尝试次数。
+ *
+ * 说明：成片地址由上游对象存储的签名 URL 提供，偶发抖动实测表现为 `fetch failed`（DNS/TLS/连接层），
+ * 而重新下载是免费的；因此这里做有限重试，绝不把下载抖动放大成付费生成任务的重跑（见设计文档 §6.2 第 6 条）。
+ *
+ * @returns {number} 1~6 之间的尝试次数。
+ * @example mediaDownloadAttemptCount(); // 4
+ */
+function mediaDownloadAttemptCount() {
+  const raw = Number(process.env.PROMO_MEDIA_DOWNLOAD_ATTEMPTS ?? MEDIA_DOWNLOAD_DEFAULT_ATTEMPTS);
+  if (!Number.isFinite(raw) || raw < 1) return 1;
+  return Math.min(MEDIA_DOWNLOAD_MAX_ATTEMPTS, Math.floor(raw));
+}
+
+/**
+ * 计算第 n 次下载失败后的等待毫秒数。
+ *
+ * 说明：退避必须是指数而非线性。2026-09-22 真实验收中视频任务已 SUCCESS，但下载成片时
+ * 连续 fetch failed（ECONNREFUSED），线性 1500ms×3 的窗口只有约 4.5 秒，短暂断网跨过窗口后
+ * 已付费的生成结果就被判失败；指数退避把默认窗口拉到约 22 秒，同时用封顶避免长时间空等失效 URL。
+ *
+ * @param {number} attempt 已失败的尝试序号（从 1 开始）。
+ * @returns {number} 本次等待毫秒数。
+ * @example mediaDownloadBackoffMs(1); // 1500
+ */
+function mediaDownloadBackoffMs(attempt) {
+  const base = Number(process.env.PROMO_MEDIA_DOWNLOAD_BACKOFF_MS ?? MEDIA_DOWNLOAD_DEFAULT_BACKOFF_MS);
+  const cap = Number(process.env.PROMO_MEDIA_DOWNLOAD_MAX_BACKOFF_MS ?? MEDIA_DOWNLOAD_DEFAULT_MAX_BACKOFF_MS);
+  const safeBase = Number.isFinite(base) && base > 0 ? base : MEDIA_DOWNLOAD_DEFAULT_BACKOFF_MS;
+  const safeCap = Number.isFinite(cap) && cap > 0 ? cap : MEDIA_DOWNLOAD_DEFAULT_MAX_BACKOFF_MS;
+  return Math.min(safeCap, safeBase * 2 ** Math.max(0, attempt - 1));
+}
+
+// 提取错误链上的 cause 代码：Node fetch 只抛 TypeError("fetch failed")，真实原因（DNS/ECONNRESET/UND_ERR_*）
+// 全在 error.cause 上，不带上就无法判断是网络抖动还是上游 URL 失效。
+function errorCauseCode(error) {
+  const seen = new Set();
+  function walk(current, depth) {
+    if (!current || typeof current !== "object" || depth > 5 || seen.has(current)) return "";
+    seen.add(current);
+    const code = current.code || current.errno;
+    if (typeof code === "string" && code) return code;
+    // 说明：Node undici 把连接层失败包成 AggregateError，真实 code 在 .errors[] 里；
+    // 只看 .cause 会一路拿到空字符串，诊断就退化成无信息的 "fetch failed"。
+    const nested = [];
+    if (current.cause) nested.push(current.cause);
+    if (Array.isArray(current.errors)) nested.push(...current.errors);
+    for (const item of nested) {
+      const hit = walk(item, depth + 1);
+      if (hit) return hit;
+    }
+    return "";
+  }
+  return walk(error, 0);
+}
+
+/**
+ * 把底层 cause 与目标主机拼进下载错误信息，保留原始 error 作为 cause。
+ *
+ * 说明：`fetch failed（ECONNREFUSED）` 单独看不出是哪个地址被拒。本机实测代理（Clash fake-IP）抖动时
+ * 会瞬间拒绝连接，排障必须能区分「上游 URL 失效」与「本机出网被拒」，否则只能靠猜。
+ *
+ * @param {unknown} error 捕获到的错误。
+ * @param {string} [host] 本次下载的目标主机；主机本身不可解析时留空。
+ * @returns {Error} 带 cause 摘要与目标主机的错误。
+ * @example describeDownloadFailure(new TypeError("fetch failed"), "cdn.example.com"); // 媒体下载失败：fetch failed（ECONNRESET） @ cdn.example.com
+ */
+function describeDownloadFailure(error, host) {
+  const base = error instanceof Error ? error : new Error(String(error));
+  const code = errorCauseCode(base);
+  const suffix = host ? ` @ ${host}` : "";
+  if (!code) return suffix && !base.message.includes(suffix) ? new Error(`${base.message}${suffix}`, { cause: base }) : base;
+  if (base.message.includes(code) && (!suffix || base.message.includes(suffix))) return base;
+  const message = base.message.includes(code) ? base.message : `${base.message}（${code}）`;
+  return new Error(`${message}${suffix}`, { cause: base });
+}
+
+/**
+ * 判断下载错误是否为可重试的瞬时故障。
+ *
+ * 说明：只有网络类故障与 408/425/429/5xx 才重试；4xx 契约类错误（404 签名过期、403 拒绝、MIME 不符）
+ * 重发同样失败，重试只会拖长失败时间。
+ *
+ * @param {unknown} error 捕获到的错误。
+ * @param {boolean} aborted 调用方是否主动中止（超时不应重试）。
+ * @returns {boolean} 可重试时返回 true。
+ * @example isRetryableDownloadError(new TypeError("fetch failed")); // true
+ */
+function isRetryableDownloadError(error, aborted) {
+  if (aborted) return false;
+  const status = Number(error?.status);
+  if (Number.isFinite(status) && status > 0) return RETRYABLE_HTTP_STATUSES.has(status) || status >= 500;
+  const code = errorCauseCode(error);
+  if (code && /ENOTFOUND|ERR_INVALID_URL|ERR_UNESCAPED_CHARACTERS|EACCES|EPERM/i.test(code)) return false;
+  if (code && RETRYABLE_NETWORK_CODES.has(code)) return true;
+  return /fetch failed|ECONNRESET|ETIMEDOUT|EPIPE|EAI_AGAIN|socket hang up|network|aborted|terminated|premature close/i.test(String(error?.message || error || ""));
+}
 
 function contained(root, target) {
   const relative = path.relative(path.resolve(root), path.resolve(target));
@@ -96,7 +203,9 @@ async function followHttp(source, signal, kind, maxBytes) {
     }
     if (!response.ok) {
       await response.body?.cancel();
-      throw new Error(`媒体下载失败：HTTP ${response.status}`);
+      const failure = new Error(`媒体下载失败：HTTP ${response.status}`);
+      failure.status = response.status;
+      throw failure;
     }
     try {
       verifyMime(response.headers.get("content-type"), kind);
@@ -161,37 +270,49 @@ export async function materializeMedia({ source, kind, workspace, downloadTimeou
   if (typeof workspace !== "string" || workspace.trim() === "") throw new Error("必须提供服务端创建的 workspace 工作区");
   const root = validateManagedDirectory(workspace);
   const maxBytes = MEDIA_LIMITS[KIND_LIMIT[kind]];
-  const temporary = path.join(root, `.materialize.${randomUUID()}.tmp`);
-  if (!contained(root, temporary)) throw new Error("物化目标路径越界");
+  const isHttp = /^https?:\/\//i.test(source);
+  // 说明：重试在「每次尝试都重新建连 + 重新落盘」的粒度上进行，这样 body 读取中途断开也能整体重来；
+  // 每次尝试使用独立临时文件与独立 AbortController，超时按单次尝试计算。
+  const attempts = isHttp ? mediaDownloadAttemptCount() : 1;
+  // 说明：主机只用于失败诊断；URL 本身是上游签名地址，不解析也不改写。
+  let sourceHost = "";
+  if (isHttp) { try { sourceHost = new URL(source).host; } catch { sourceHost = ""; } }
 
-  const controller = new AbortController();
-  let timer;
-  try {
-    let input;
-    if (source.startsWith("data:")) input = dataSource(source, kind);
-    else if (/^https?:\/\//i.test(source)) {
-      timer = setTimeout(() => controller.abort(new Error("媒体下载超时")), downloadTimeoutMs);
-      input = await followHttp(source, controller.signal, kind, maxBytes);
-    } else if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(source) && !/^[A-Za-z]:[\\/]/.test(source) && !source.startsWith("file:")) {
-      throw new Error("仅允许 data、HTTP(S) 或工作区内服务端文件");
-    } else input = fileSource(source, root);
+  for (let attempt = 1; ; attempt += 1) {
+    const temporary = path.join(root, `.materialize.${randomUUID()}.tmp`);
+    if (!contained(root, temporary)) throw new Error("物化目标路径越界");
+    const controller = new AbortController();
+    let timer;
+    try {
+      let input;
+      if (source.startsWith("data:")) input = dataSource(source, kind);
+      else if (isHttp) {
+        timer = setTimeout(() => controller.abort(new Error("媒体下载超时")), downloadTimeoutMs);
+        input = await followHttp(source, controller.signal, kind, maxBytes);
+      } else if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(source) && !/^[A-Za-z]:[\\/]/.test(source) && !source.startsWith("file:")) {
+        throw new Error("仅允许 data、HTTP(S) 或工作区内服务端文件");
+      } else input = fileSource(source, root);
 
-    await pipeline(input, limitingTransform(maxBytes), fs.createWriteStream(temporary, { flags: "wx" }), { signal: controller.signal });
-    const stat = fs.statSync(temporary);
-    if (stat.size === 0) throw new Error("媒体内容为空");
-    const handle = fs.openSync(temporary, "r");
-    const header = Buffer.alloc(Math.min(32, stat.size));
-    try { fs.readSync(handle, header, 0, header.length, 0); } finally { fs.closeSync(handle); }
-    const extension = detectMedia(header, kind);
-    const target = path.join(root, `${kind}-${randomUUID()}${extension}`);
-    if (!contained(root, target)) throw new Error("物化目标路径越界");
-    fs.renameSync(temporary, target);
-    return target;
-  } catch (error) {
-    if (controller.signal.aborted) throw new Error("媒体下载超时", { cause: error });
-    throw error;
-  } finally {
-    if (timer) clearTimeout(timer);
-    fs.rmSync(temporary, { force: true });
+      await pipeline(input, limitingTransform(maxBytes), fs.createWriteStream(temporary, { flags: "wx" }), { signal: controller.signal });
+      const stat = fs.statSync(temporary);
+      if (stat.size === 0) throw new Error("媒体内容为空");
+      const handle = fs.openSync(temporary, "r");
+      const header = Buffer.alloc(Math.min(32, stat.size));
+      try { fs.readSync(handle, header, 0, header.length, 0); } finally { fs.closeSync(handle); }
+      const extension = detectMedia(header, kind);
+      const target = path.join(root, `${kind}-${randomUUID()}${extension}`);
+      if (!contained(root, target)) throw new Error("物化目标路径越界");
+      fs.renameSync(temporary, target);
+      return target;
+    } catch (error) {
+      const failure = controller.signal.aborted ? new Error("媒体下载超时", { cause: error }) : describeDownloadFailure(error, sourceHost);
+      if (attempt >= attempts || !isRetryableDownloadError(error, controller.signal.aborted)) throw failure;
+      const waitMs = mediaDownloadBackoffMs(attempt);
+      console.warn(`[media] 下载第 ${attempt}/${attempts} 次失败（${failure.message}），${waitMs}ms 后对同一 URL 重试`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    } finally {
+      if (timer) clearTimeout(timer);
+      fs.rmSync(temporary, { force: true });
+    }
   }
 }
