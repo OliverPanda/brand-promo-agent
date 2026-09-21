@@ -61,6 +61,17 @@ test("场景资产只通过受控 URL 暴露，图片 MIME 正确、视频支持
     assert.equal(publicRun.storyboard[0].mediaUrl, `/api/runs/${runId}/scenes/1/image`);
     assert.equal(publicRun.storyboard[0].videoUrl, `/api/runs/${runId}/scenes/1/video`);
 
+    // 真实模式 composite() 会把场景图（file://）写进 storyboardGallery，公开视图必须改写为受控路由。
+    updateRun(runId, { storyboardGallery: [
+      { index: 1, mediaUrl: `file://${mediaPath}`, subtitle: "第一句" },
+      { index: 9, mediaUrl: `file://${mediaPath}`, subtitle: "越界镜号" },
+    ] });
+    const galleryRun = await (await fetch(`${BASE(port)}/api/runs/${runId}`)).json();
+    assert.equal(JSON.stringify(galleryRun).includes("file://"), false);
+    assert.equal(galleryRun.storyboardGallery[0].mediaUrl, `/api/runs/${runId}/scenes/1/image`);
+    assert.equal(galleryRun.storyboardGallery[1].mediaUrl, null, "镜号越界不能回落到受控路由");
+    assert.equal(galleryRun.storyboardGallery[0].subtitle, "第一句");
+
     const imageResponse = await fetch(`${BASE(port)}${publicRun.storyboard[0].mediaUrl}`);
     assert.equal(imageResponse.status, 200);
     assert.equal(imageResponse.headers.get("content-type"), "image/png");

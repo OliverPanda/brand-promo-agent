@@ -109,8 +109,29 @@ function toPublicStoryboard(runId, storyboard) {
   });
 }
 
+/**
+ * 把画廊条目的本机 file:// 图片改写为受控场景路由。
+ * 说明：真实模式的 composite() 会把标准场景图（file:// 绝对路径）写进 storyboardGallery，
+ * 浏览器无法渲染 file://，也不能把本机路径回给前端，因此按镜号回落到受控路由；镜号越界时置 null。
+ * @param {string} runId 用户态 runId。
+ * @param {Array<Record<string, unknown>> | undefined} gallery 原始画廊。
+ * @param {number} sceneCount 已登记分镜数量，用于校验镜号范围。
+ * @returns {Array<Record<string, unknown>> | undefined} 可安全返回给前端的画廊。
+ * @example toPublicGallery("run-1", run.storyboardGallery, 3);
+ */
+function toPublicGallery(runId, gallery, sceneCount) {
+  if (!Array.isArray(gallery)) return gallery;
+  return gallery.map((item, position) => {
+    if (!item || typeof item !== "object") return item;
+    if (typeof item.mediaUrl !== "string" || !item.mediaUrl.startsWith("file://")) return item;
+    const index = Number.isInteger(item.index) && item.index > 0 ? item.index : position + 1;
+    return { ...item, mediaUrl: index <= sceneCount ? `/api/runs/${runId}/scenes/${index}/image` : null };
+  });
+}
+
 function toPublicRun(runId, run) {
   if (!run || typeof run !== "object") return run;
+  const sceneCount = Array.isArray(run.storyboard) ? run.storyboard.length : 0;
   return {
     ...run,
     videoUrl: toPublicVideoUrl(runId, run.videoUrl),
@@ -118,6 +139,7 @@ function toPublicRun(runId, run) {
     musicUrl: typeof run.musicUrl === "string" && run.musicUrl.startsWith("file://") ? null : run.musicUrl,
     poster: typeof run.poster === "string" && run.poster.startsWith("file://") ? null : run.poster,
     storyboard: toPublicStoryboard(runId, run.storyboard),
+    storyboardGallery: toPublicGallery(runId, run.storyboardGallery, sceneCount),
   };
 }
 
