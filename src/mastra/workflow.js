@@ -42,7 +42,7 @@ import {
   getEffectiveOneApiKey,
 } from "../runtime-config.js";
 import { artifactPaths } from "../media/artifacts.js";
-import { MUSIC_SUBMIT_MODEL, resolveDeliveryModels } from "../media/model-selection.js";
+import { MUSIC_SUBMIT_MODEL, TTS_FALLBACK_MODEL_DEFAULT, resolveDeliveryModels } from "../media/model-selection.js";
 import { fontSupportsChinese, resolveFontFile } from "../media/font-readiness.js";
 
 const execFileAsync = promisify(execFile);
@@ -139,6 +139,7 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
     providerKey: getEffectiveOneApiKey,
     musicModel: () => process.env.PROMO_MUSIC_MODEL || "",
     ttsModel: () => process.env.PROMO_TTS_MODEL || "",
+    ttsFallbackModel: () => process.env.PROMO_TTS_FALLBACK_MODEL || "",
     videoModel: () => process.env.PROMO_VIDEO_MODEL || "",
     ...options.dependencies,
   };
@@ -148,6 +149,7 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
       ...brief,
       videoModel: brief.videoModel || dependencies.videoModel() || demoVideoChoices()[0],
       ttsModel: dependencies.ttsModel() || "speech-02-hd",
+      ttsFallbackModel: dependencies.ttsFallbackModel() || TTS_FALLBACK_MODEL_DEFAULT,
       musicModel: dependencies.musicModel() || MUSIC_SUBMIT_MODEL,
       modelSelectionSource: brief.videoModel ? "manual" : dependencies.videoModel() ? "configured" : "demo",
     };
@@ -181,6 +183,7 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
       liveModels,
       configuredVideoModel: dependencies.videoModel() || undefined,
       ttsModel: dependencies.ttsModel() || undefined,
+      ttsFallbackModel: dependencies.ttsFallbackModel() || undefined,
       musicModel,
     });
   } catch (error) {
@@ -198,7 +201,11 @@ export async function prepareGenerationBrief(rawBrief, options = {}) {
   return {
     ...brief,
     videoModel: models.videoModel,
+    // 降级链：主模型整镜尝试耗尽后按既定优先级换渠道（上游整段故障时唯一的活路，见 providers.generateSceneVideo）。
+    videoModelFallbacks: models.videoModelFallbacks,
     ttsModel: models.ttsModel,
+    // null = 网关实时清单里没有可用的 omni 备用通道，运行时只走主通道。
+    ttsFallbackModel: models.ttsFallbackModel,
     musicModel: models.musicModel,
     modelSelectionSource: models.source,
   };

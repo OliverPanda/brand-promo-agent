@@ -107,6 +107,7 @@ test("prepareGenerationBrief：REAL 成功预检写回画布与模型审计字�
           { id: "minimax-h3", type: "video" },
           { id: "7zhe-seedance", type: "video" },
           { id: "speech-02-hd", type: "tts" },
+          { id: "qwen3.5-omni-flash-2026-03-15", type: "llm" },
           { id: "mureka-song", type: "music" },
           { id: "mureka-query", type: "music" },
         ],
@@ -123,6 +124,7 @@ test("prepareGenerationBrief：REAL 成功预检写回画布与模型审计字�
   assert.equal(brief.canvasPreset, "social-portrait");
   assert.equal(brief.videoModel, "minimax-h3");
   assert.equal(brief.ttsModel, "speech-02-hd");
+  assert.equal(brief.ttsFallbackModel, "qwen3.5-omni-flash-2026-03-15", "实时清单含 omni 时应写入备用语音模型");
   assert.equal(brief.musicModel, "mureka-song");
   assert.equal(brief.modelSelectionSource, "automatic");
   assert.deepEqual(calls, ["toolchain", "writable"]);
@@ -567,6 +569,7 @@ test("/api/config 暴露模型清单（能选模型、知道用的什么模型�
     assert.ok(cfg.models.llm.choices.includes(cfg.models.llm.current), "current 应在清单内");
     assert.ok(Array.isArray(cfg.models.image.choices) && cfg.models.image.current, "image 应有清单与当前值");
     assert.ok(cfg.models.tts.current && cfg.models.music.current, "tts/music 应展示当前模型");
+    assert.ok(cfg.models.tts.fallback, "tts 应展示主通道不可用时的备用语音模型");
     assert.equal(typeof cfg.providerBaseUrl, "string", "应暴露供应商地址字段（运行时覆盖 > env，可为空串）");
     assert.equal(typeof cfg.apiKeySet, "boolean", "应暴露密钥是否配置（不回显密钥本身）");
   } finally {

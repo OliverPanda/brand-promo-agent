@@ -8,7 +8,7 @@ import { mastra, prepareGenerationBrief, publishDelivery, STEP } from "./mastra/
 import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
 import { artifactPaths, resolveRunArtifact, safeDownloadName } from "./media/artifacts.js";
-import { MUSIC_SUBMIT_MODEL } from "./media/model-selection.js";
+import { MUSIC_SUBMIT_MODEL, TTS_FALLBACK_MODEL_DEFAULT } from "./media/model-selection.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import { listCopyIdeas } from "./copyideas.js";
@@ -607,7 +607,12 @@ app.get("/api/config", (_req, res) => {
         current: imgCurrent,
         choices: mergeChoices("PROMO_IMAGE_CHOICES", imgCurrent, ["doubao-seedream-4-0-250828", "doubao-seedream-3-0-t2i"]),
       },
-      tts: { label: "配音（TTS）", current: process.env.PROMO_TTS_MODEL || "speech-02-hd" },
+      // fallback：主通道不可用时的备用语音模型；预检会在实时清单中校验并按需回落到自动候选（null = 无可用备用）。
+      tts: {
+        label: "配音（TTS）",
+        current: process.env.PROMO_TTS_MODEL || "speech-02-hd",
+        fallback: process.env.PROMO_TTS_FALLBACK_MODEL || TTS_FALLBACK_MODEL_DEFAULT,
+      },
       music: { label: "配乐", current: process.env.PROMO_MUSIC_MODEL || MUSIC_SUBMIT_MODEL },
       // 视频（动态镜头）：choices 不在此静态下发 —— 由 GET /api/models 从网关实时拉取（含真实渠道）。
       // 当前值支持 env PROMO_VIDEO_MODEL 预置；选择后存 Brief.videoModel（请求级覆盖，语义同 llmModel/imageModel）。

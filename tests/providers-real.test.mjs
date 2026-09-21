@@ -54,16 +54,41 @@ const DEFAULT_SPEECH = makeWav(0.25, 440);
 const DEFAULT_MUSIC = makeWav(1, 220);
 let speechResponses = [];
 let storyboardResponseCounts = [];
+// 分镜响应封装方式：model 返回的顶层键名在不同模型间漂移，测试需逐个覆盖。
+let storyboardWrapper = (scenes) => ({ scenes });
+let storyboardRawContent = null;
 let storyboardCallIndex = 0;
 let failStoryboardAt = 0;
+// 生成一条分镜记录；musicClimax 由调用方决定布尔还是 0~1 数值。
+function sceneFixture(index, count, musicClimax) {
+  return {
+    index: index + 1,
+    visualPrompt: `p${index + 1}`,
+    subtitle: `s${index + 1}`,
+    camera: index % 2 ? "pull" : "push",
+    durationSec: 5,
+    musicClimax: musicClimax ?? index === count - 1,
+  };
+}
+function storyboardPayload(count, musicClimax) {
+  return storyboardWrapper(Array.from({ length: count }, (_, index) => sceneFixture(index, count, musicClimax)));
+}
 let failSpeechAt = 0;
 let speechCallIndex = 0;
 let invalidMusicResponse = false;
+// 配乐桥故障注入：分别控制 mureka-song 提交与 mureka-query 轮询的失败次数与错误形态。
+let murekaSubmitFailures = 0;
+let murekaQueryFailures = 0;
+let murekaFailureStatus = 502;
+let murekaFailureCode = "bridge_upstream_unavailable";
+let murekaFailureMessage = "Mureka 上游网络暂时不可用（UND_ERR_SOCKET）";
+let omniFailStatus = 0;
+let omniFailText = "omni failed";
 after(() => fs.rmSync(mediaRoot, { recursive: true, force: true }));
 
 // ── fetch mock 基础设施 ──
 let calls = [];
-function makeRes({ ok = true, status = 200, json, text, bytes } = {}) {
+function makeRes({ ok = true, status = 200, json, text, bytes, sse } = {}) {
   const res = {
     ok,
     status,
@@ -71,18 +96,71 @@ function makeRes({ ok = true, status = 200, json, text, bytes } = {}) {
     text: async () => text ?? "",
     arrayBuffer: async () => (bytes ? Buffer.from(bytes) : Buffer.alloc(0)),
   };
+  if (sse) {
+    // SSE 通道：按帧返回 chunk，模拟长连接分片到达；最后一帧后 read() 返回 done。
+    const encoder = new TextEncoder();
+    let index = 0;
+    res.body = {
+      getReader: () => ({
+        read: async () => {
+          if (index >= sse.length) return { done: true, value: undefined };
+          const value = encoder.encode(sse[index]);
+          index += 1;
+          return { done: false, value };
+        },
+      }),
+    };
+  }
   return res;
 }
+
+// 生成一段 24kHz/单声道/16bit 裸 PCM 的 base64 分片（偶数长度，满足整帧约束）。
+function omniPcmChunks(durationSec, frequency = 440) {
+  const samples = Math.round(24000 * durationSec);
+  const pcm = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i += 1) {
+    pcm.writeInt16LE(Math.round(Math.sin((2 * Math.PI * frequency * i) / 24000) * 8000), i * 2);
+  }
+  const mid = Math.floor(pcm.length / 2 / 2) * 2;
+  return [pcm.subarray(0, mid).toString("base64"), pcm.subarray(mid).toString("base64")];
+}
+
+function omniSseFrames(base64Chunks) {
+  const frames = base64Chunks.map((data) => `data: ${JSON.stringify({ choices: [{ delta: { audio: { data } } }] })}\n\n`);
+  frames.push("data: [DONE]\n\n");
+  return frames;
+}
+// 构造 Mureka 桥的 502 故障响应：one-api 把桥的错误码包在 OpenAI error 对象里。
+function bridgeFailure() {
+  return makeRes({
+    ok: false,
+    status: murekaFailureStatus,
+    text: JSON.stringify({ error: { message: murekaFailureMessage, type: "upstream_error", param: "", code: murekaFailureCode } }),
+  });
+}
+
 function route(path, body) {
   // 依据 path 与 body 返回对应 one-api 形状响应。
   if (path.endsWith("/chat/completions")) {
     // Mureka 协议桥：提交与轮询共用 chat/completions 形态，content 承载业务 JSON（无 response_format）。
     if (body.model === "mureka-song") {
+      if (murekaSubmitFailures > 0) {
+        murekaSubmitFailures -= 1;
+        return bridgeFailure();
+      }
       return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ taskId: "t1", kind: "instrumental" }) } }] } });
     }
     if (body.model === "mureka-query") {
+      if (murekaQueryFailures > 0) {
+        murekaQueryFailures -= 1;
+        return bridgeFailure();
+      }
       const bytes = invalidMusicResponse ? Buffer.from("invalid") : DEFAULT_MUSIC;
       return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ status: "succeeded", audioUrl: `data:audio/wav;base64,${bytes.toString("base64")}` }) } }] } });
+    }
+    if (body.modalities?.includes("audio") && body.stream === true) {
+      if (omniFailStatus) return makeRes({ ok: false, status: omniFailStatus, text: omniFailText });
+      return makeRes({ sse: omniSseFrames(omniPcmChunks(0.25, 330)) });
     }
     if (body.response_format?.type === "json_object") {
       // 脚本 vs 分镜：用 system 文案区分（简单但够用）
@@ -105,21 +183,8 @@ function route(path, body) {
       storyboardCallIndex += 1;
       if (storyboardCallIndex === failStoryboardAt) return makeRes({ ok: false, status: 500, text: "storyboard retry failed" });
       const sceneCount = storyboardResponseCounts.length ? storyboardResponseCounts.shift() : 2;
-      return makeRes({
-        json: {
-          choices: [{ message: { content: JSON.stringify({
-            scenes: Array.from({ length: sceneCount }, (_, index) => ({
-              index: index + 1,
-              visualPrompt: `p${index + 1}`,
-              subtitle: `s${index + 1}`,
-              camera: index % 2 ? "pull" : "push",
-              durationSec: 5,
-              musicClimax: index === sceneCount - 1,
-            })),
-          }) } }],
-          usage: { total_tokens: 200 },
-        },
-      });
+      const content = storyboardRawContent ?? JSON.stringify(storyboardPayload(sceneCount));
+      return makeRes({ json: { choices: [{ message: { content } }], usage: { total_tokens: 200 } } });
     }
   }
   if (path.endsWith("/images/generations")) {
@@ -243,6 +308,9 @@ test("generateStoryboard 真实模式：返回 Scene[] 且提示词含画布安�
   assert.match(storyboardCall.body.messages[1].content, /主体居中/);
   assert.match(storyboardCall.body.messages[1].content, /安全区/);
   assert.match(storyboardCall.body.messages[1].content, /恰好输出 2 个分镜|严格.*2.*分镜/);
+  // response_format=json_object 强制顶层为对象，契约必须与解析层同为对象语义。
+  assert.match(storyboardCall.body.messages[0].content, /scenes/);
+  assert.match(storyboardCall.body.messages[0].content, /JSON 对象/);
 });
 
 test("generateStoryboard 数量不符只纠错重试一次，仍不符则失败", async () => {
@@ -260,6 +328,48 @@ test("generateStoryboard 数量不符只纠错重试一次，仍不符则失败"
   await assert.rejects(generateStoryboard(baseBrief, script), /分镜数量.*2|数量不一致/);
   assert.equal(calls.filter((call) => call.url.endsWith("/chat/completions")).length, 2, "最多一次纠错重试");
   storyboardResponseCounts = [];
+});
+
+test("generateStoryboard：兼容模型返回 {\"array\":[...]} 而非 scenes", async () => {
+  // 实测 deepseek-v4-flash 在 response_format=json_object 下返回 {"array":[...]}；
+  // 只认 parsed.scenes 会让整步误判为 0 个分镜并失败。
+  const script = await generateScript(baseBrief);
+  calls = [];
+  storyboardWrapper = (scenes) => ({ array: scenes });
+  try {
+    const scenes = await generateStoryboard(baseBrief, script);
+    assert.equal(scenes.length, 2);
+    assert.equal(scenes[1].index, 2);
+  } finally {
+    storyboardWrapper = (scenes) => ({ scenes });
+  }
+});
+
+test("generateStoryboard：兼容 storyboard 键与一层嵌套", async () => {
+  const script = await generateScript(baseBrief);
+  calls = [];
+  storyboardWrapper = (scenes) => ({ storyboard: { items: scenes } });
+  try {
+    assert.equal((await generateStoryboard(baseBrief, script)).length, 2);
+  } finally {
+    storyboardWrapper = (scenes) => ({ scenes });
+  }
+});
+
+test("generateStoryboard：musicClimax 为 0~1 情绪强度时按 ≥0.8 归一化", async () => {
+  const script = await generateScript(baseBrief);
+  calls = [];
+  // 实测模型倾向返回情绪强度而非布尔值；若直接做 Boolean 转换会把每一镜都判成高潮。
+  const intensity = [0.2, 1];
+  storyboardWrapper = (scenes) => ({
+    scenes: scenes.map((scene, i) => ({ ...scene, musicClimax: intensity[i] })),
+  });
+  try {
+    const scenes = await generateStoryboard(baseBrief, script);
+    assert.deepEqual(scenes.map((scene) => scene.musicClimax), [false, true]);
+  } finally {
+    storyboardWrapper = (scenes) => ({ scenes });
+  }
 });
 
 test("generateStoryboard 纠错请求失败时保留首轮已付 tokens", async () => {
@@ -419,6 +529,85 @@ test("逐句 TTS 第 N 次失败时异常保留此前已付费用量", async () 
         return true;
       },
     );
+  } finally {
+    failSpeechAt = 0;
+  }
+});
+
+test("generateVoiceover：主通道 403 时自动切换到 Omni 流式备用通道", async () => {
+  calls = [];
+  speechCallIndex = 0;
+  failSpeechAt = 1; // 上游 apilio 渠道额度为负时 /audio/speech 返回 403，这里用首句失败模拟同一分支。
+  const fallbackModel = "qwen3.5-omni-flash-2026-03-15";
+  try {
+    const script = { voiceover: [{ text: "第一句" }, { text: "第二句" }] };
+    const v = await generateVoiceover(
+      script,
+      { ...baseBrief, ttsModel: "speech-02-hd", ttsFallbackModel: fallbackModel },
+      { workspace: audioWorkspace() },
+    );
+    const omniCalls = calls.filter((call) => call.url.endsWith("/chat/completions") && call.body.modalities?.includes("audio"));
+    assert.equal(omniCalls.length, 2, "切换后应固定走备用通道，避免同一支成片中途换音色");
+    assert.ok(omniCalls.every((call) => call.body.model === fallbackModel));
+    assert.ok(omniCalls.every((call) => call.body.stream === true), "Omni 语音只支持流式返回");
+    assert.deepEqual(omniCalls.map((call) => call.body.audio), [
+      { voice: "Ethan", format: "pcm" },
+      { voice: "Ethan", format: "pcm" },
+    ]);
+    assert.deepEqual(omniCalls.map((call) => call.body.messages[1].content), ["第一句", "第二句"]);
+    assert.equal(v.model, fallbackModel, "审计字段必须记录实际使用的备用模型");
+    assert.match(v.fallbackNote, /speech-02-hd/);
+    assert.match(v.fallbackNote, new RegExp(fallbackModel));
+    assert.equal(v._usage.requests, 2);
+    assert.ok(fs.existsSync(v.voicePath));
+    assert.match(v.srt, /第一句/);
+  } finally {
+    failSpeechAt = 0;
+  }
+});
+
+test("generateVoiceover：主/备两条通道都失败时错误同时给出两个模型", async () => {
+  calls = [];
+  speechCallIndex = 0;
+  failSpeechAt = 1;
+  omniFailStatus = 403;
+  omniFailText = "insufficient_user_quota";
+  try {
+    await assert.rejects(
+      generateVoiceover(
+        { voiceover: [{ text: "无法合成" }] },
+        { ...baseBrief, ttsModel: "speech-02-hd", ttsFallbackModel: "qwen3.5-omni-flash-2026-03-15" },
+        { workspace: audioWorkspace() },
+      ),
+      (error) => {
+        assert.match(error.message, /两条通道均失败/);
+        assert.match(error.message, /speech-02-hd/);
+        assert.match(error.message, /qwen3.5-omni-flash-2026-03-15/);
+        assert.match(error.message, /insufficient_user_quota/);
+        return true;
+      },
+    );
+  } finally {
+    failSpeechAt = 0;
+    omniFailStatus = 0;
+    omniFailText = "omni failed";
+  }
+});
+
+test("generateVoiceover：未配置备用模型时保持主通道硬失败语义", async () => {
+  calls = [];
+  speechCallIndex = 0;
+  failSpeechAt = 1;
+  try {
+    await assert.rejects(
+      generateVoiceover(
+        { voiceover: [{ text: "无备用" }] },
+        { ...baseBrief, ttsModel: "speech-02-hd", ttsFallbackModel: null },
+        { workspace: audioWorkspace() },
+      ),
+      /500|failed/,
+    );
+    assert.equal(calls.filter((call) => call.body.modalities?.includes("audio")).length, 0, "无备用模型时不得偷偷打 Omni");
   } finally {
     failSpeechAt = 0;
   }

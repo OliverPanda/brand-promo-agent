@@ -15,7 +15,7 @@ import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
 import { MUSIC_QUERY_MODEL, MUSIC_SUBMIT_MODEL } from "../media/model-selection.js";
 import { materializeMedia } from "../media/materialize.js";
 import { assertSubtitleFilters, composeFinalVideo, normalizeSceneImage, normalizeSceneVideo } from "../media/ffmpeg.js";
-import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration } from "../media/audio.js";
+import { buildVoiceTimeline, concatenateVoiceSegments, formatSrt, probeAudioDuration, wrapPcmAsWav } from "../media/audio.js";
 import { MEDIA_LIMITS } from "../media/artifacts.js";
 import { configuredFontPath, fontSupportsChinese, resolveFontFile } from "../media/font-readiness.js";
 import fs from "node:fs";
@@ -69,14 +69,35 @@ function paletteFor(tones = []) {
 
 // ───────────────────────── one-api HTTP 客户端（OpenAI 兼容） ─────────────────────────
 // 导出：雷达模块（sentiment/topics）的 LLM 调用复用同一 base/key/超时/错误处理，不再各写一份 fetch。
-export async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } = {}) {
+// 说明：base/key 校验与 AbortController 生命周期在此统一，普通 POST 与流式 POST 复用同一约定，避免两处漂移。
+function beginOneApiRequest(path, timeoutMs) {
   // base/key = 运行时配置覆盖（前端「模型与服务」保存的供应商地址与密钥）> env 默认；每次调用现取，改完即生效。
   const base = getEffectiveOneApiBase();
   const key = activeKey();
   if (!base || !key) throw new Error("one-api 未配置：请先在页面「模型与服务」保存供应商地址与 API Key，或设置 PROMO_ONEAPI_BASE_URL / PROMO_ONEAPI_API_KEY");
-  const url = base.replace(/\/$/, "") + path;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  return { url: base.replace(/\/$/, "") + path, key, ctrl, timer };
+}
+
+// 非 2xx → 面向用户的中文错误。401/503 的网关级提示由两条通道共用，避免同一种故障给出两种文案。
+async function oneApiResponseError(res, path, body) {
+  const txt = await res.text().catch(() => "");
+  if (res.status === 401 && /登录已过期|login expired|unauthorized|invalid token/i.test(txt)) {
+    return new Error(/invalid token/i.test(txt)
+      ? "New API 拒绝了当前 API Key：请在该 New API 实例重新创建或复制有效令牌，再回到页面保存"
+      : "远程地址返回网页登录 401：请改用 OpenAI 兼容中转 API 地址（通常以 /v1 结尾），并填写该中转站生成的 API Key");
+  }
+  if (res.status === 503 && /model_not_found|No available channel/i.test(txt)) {
+    return new Error(`远程中转没有可用的文本模型渠道：当前请求模型未加入该分组。请在 New API 为 API Key 所属分组开通文本模型，或改用包含文本模型的 API Key（当前请求：${body?.model || "未知模型"}）`);
+  }
+  const err = new Error(`one-api ${path} ${res.status}: ${txt.slice(0, 300)}`);
+  err.status = res.status;
+  return err;
+}
+
+export async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120000 } = {}) {
+  const { url, key, ctrl, timer } = beginOneApiRequest(path, timeoutMs);
   let res;
   try {
     res = await (globalThis.fetch || fetch)(url, {
@@ -90,22 +111,106 @@ export async function oneApiPost(path, body, { isBinary = false, timeoutMs = 120
     throw new Error(`one-api ${path} 请求失败：${e?.message || e}`);
   }
   clearTimeout(timer);
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    if (res.status === 401 && /登录已过期|login expired|unauthorized|invalid token/i.test(txt)) {
-      throw new Error(/invalid token/i.test(txt)
-        ? "New API 拒绝了当前 API Key：请在该 New API 实例重新创建或复制有效令牌，再回到页面保存"
-        : "远程地址返回网页登录 401：请改用 OpenAI 兼容中转 API 地址（通常以 /v1 结尾），并填写该中转站生成的 API Key");
-    }
-    if (res.status === 503 && /model_not_found|No available channel/i.test(txt)) {
-      throw new Error(`远程中转没有可用的文本模型渠道：当前请求模型未加入该分组。请在 New API 为 API Key 所属分组开通文本模型，或改用包含文本模型的 API Key（当前请求：${body?.model || "未知模型"}）`);
-    }
-    const err = new Error(`one-api ${path} ${res.status}: ${txt.slice(0, 300)}`);
-    err.status = res.status;
-    throw err;
-  }
+  if (!res.ok) throw await oneApiResponseError(res, path, body);
   if (isBinary) return Buffer.from(await res.arrayBuffer());
   return res.json();
+}
+
+// SSE 帧解析：只取 `data:` 行，其余（event:/id:/: 心跳）按协议忽略。
+function sseDataPayload(line) {
+  if (typeof line !== "string") return null;
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("data:")) return null;
+  const payload = trimmed.slice(5).trim();
+  return payload || null;
+}
+
+function parseSseEventJson(payload) {
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null; // 非 JSON 帧（厂商心跳）忽略，不阻断后续有效帧。
+  }
+}
+
+/**
+ * 流式 POST（SSE）：Qwen-Omni 语音输出只能以长连接分帧返回，普通 oneApiPost 的整段 JSON 解析会失败。
+ *
+ * 说明：读取在收到 `[DONE]` 时立即结束 —— 部分中转在终止符后仍保持连接，若等到 EOF 会白等到超时。
+ *
+ * @param {string} path one-api 相对路径。
+ * @param {object} body JSON 请求体。
+ * @param {{timeoutMs?: number}} [options] 读取总超时；默认 PROMO_TTS_STREAM_TIMEOUT_MS 或 300000。
+ * @returns {Promise<object[]>} 解析后的 SSE 事件对象列表（按到达顺序）。
+ * @throws {Error} 网关未配置、请求失败或响应非 2xx 时抛出中文错误。
+ * @example await oneApiPostStream("/chat/completions", { model, stream: true });
+ */
+export async function oneApiPostStream(path, body, { timeoutMs = Number(process.env.PROMO_TTS_STREAM_TIMEOUT_MS || 300000) } = {}) {
+  const { url, key, ctrl, timer } = beginOneApiRequest(path, timeoutMs);
+  let res;
+  try {
+    res = await (globalThis.fetch || fetch)(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream", Authorization: `Bearer ${key}` },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    throw new Error(`one-api ${path} 请求失败：${e?.message || e}`);
+  }
+  if (!res.ok) {
+    clearTimeout(timer);
+    throw await oneApiResponseError(res, path, body);
+  }
+  const events = [];
+  let head = "";
+  let rawText = "";
+  const consume = (line) => {
+    const payload = sseDataPayload(line);
+    if (!payload) return false;
+    if (payload === "[DONE]") return true;
+    const event = parseSseEventJson(payload);
+    if (event) events.push(event);
+    return false;
+  };
+  try {
+    if (!res.body || typeof res.body.getReader !== "function") {
+      // 说明：header 可能漏掉 body；用 text() 兜底，并把整段文本留给下方 JSON 兜底解析。
+      rawText = String(await res.text());
+      head = rawText.slice(0, 4000);
+      for (const line of rawText.split("\n")) if (consume(line)) break;
+    } else {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finished = false;
+      while (!finished) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        head = (head + chunk).slice(0, 4000);
+        buffer += chunk;
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (consume(line)) { finished = true; break; }
+        }
+      }
+      if (!finished) consume(buffer);
+    }
+  } catch (e) {
+    clearTimeout(timer);
+    throw new Error(`one-api ${path} 流式读取失败：${e?.message || e}`);
+  }
+  clearTimeout(timer);
+  // 说明：不支持 SSE 的中转会把整段 JSON 一次性返回（无 data: 帧），此时按普通 JSON 兜底解析。
+  const fallbackText = (rawText || head).trim();
+  if (events.length === 0 && fallbackText.startsWith("{")) {
+    const single = parseSseEventJson(fallbackText);
+    if (single) events.push(single);
+  }
+  return events;
 }
 
 // GET 辅助（视频异步任务轮询等只读查询复用同一 base/key 约定）。
@@ -149,6 +254,72 @@ export function parseJSONSafe(s) {
     return {};
   }
 }
+// 分镜数组可能被对象包裹（response_format=json_object 强制顶层为对象），不同模型分别用
+// scenes / array / storyboard 等键承载；实测 deepseek-v4-flash 返回 {"array":[...]}。
+const SCENE_ARRAY_KEYS = ["scenes", "array", "storyboard", "shots", "list", "items", "分镜"];
+
+/**
+ * 从 LLM 返回的 JSON 对象中提取分镜数组，兼容常见键名漂移与一层嵌套。
+ *
+ * @param {unknown} parsed 已解析的响应内容。
+ * @returns {Array<Record<string, any>>} 分镜数组；无法识别时返回空数组。
+ * @example
+ * extractSceneArray({ array: [{ index: 1 }] });
+ */
+export function extractSceneArray(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (!parsed || typeof parsed !== "object") return [];
+  const pick = (obj) => {
+    for (const key of SCENE_ARRAY_KEYS) {
+      if (Array.isArray(obj?.[key])) return obj[key];
+    }
+    return null;
+  };
+  const direct = pick(parsed);
+  if (direct) return direct;
+  for (const key of [...SCENE_ARRAY_KEYS, "data", "result"]) {
+    const nested = pick(parsed?.[key]);
+    if (nested) return nested;
+  }
+  // 兜底：模型自造键名时取第一个「元素为对象」的数组，避免整步失败。
+  for (const value of Object.values(parsed)) {
+    if (Array.isArray(value) && value.some((item) => item && typeof item === "object")) return value;
+  }
+  return [];
+}
+
+/**
+ * 从含解释文字或代码块的响应里抠出第一个括号平衡的 JSON 数组字面量。
+ *
+ * @param {string} text LLM 原始输出。
+ * @returns {string | null} 数组字面量；未找到时返回 null。
+ * @example
+ * sliceFirstJsonArray("结果：\n[{\"index\":1}]");
+ */
+export function sliceFirstJsonArray(text) {
+  const source = String(text ?? "");
+  const start = source.indexOf("[");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+      continue;
+    }
+    if (ch === "\"") inString = true;
+    else if (ch === "[") depth += 1;
+    else if (ch === "]") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  return null;
+}
 function estimateTokens(s = "") {
   // 粗略估算（中文约 1.5 字/token，英文约 4 字符/token）。仅用于成本预估兜底。
   return Math.max(1, Math.round(s.length / 2));
@@ -160,6 +331,35 @@ function mapVoiceTone(tone = "男声") {
   if (t.includes("活泼")) return "shimmer";
   return "onyx"; // 沉稳/男声/默认
 }
+// Omni 备用通道音色映射：该渠道只认自家音色名，OpenAI 的 onyx/nova/shimmer 无效。
+// 实测 Ethan 男声、Dylan 活泼男声、Serena 女声可用；Chelsie 返回 0 字节音频，不列入候选。
+function omniVoiceFor(tone = "男声") {
+  const t = String(tone).toLowerCase();
+  if (t.includes("女")) return "Serena";
+  if (t.includes("活泼")) return "Dylan";
+  return "Ethan"; // 沉稳/男声/默认
+}
+
+// 把 Omni 的 SSE 事件流拼成一段裸 PCM。
+// 网关按 `choices[0].delta.audio.data` 逐帧下发 base64；文本 delta 一并收集，仅用于错误日志定位。
+function collectOmniAudio(events, { model, input }) {
+  const chunks = [];
+  let transcript = "";
+  for (const event of events) {
+    const delta = event?.choices?.[0]?.delta;
+    if (!delta) continue;
+    if (typeof delta.content === "string") transcript += delta.content;
+    const data = delta.audio?.data;
+    if (typeof data === "string" && data) chunks.push(Buffer.from(data, "base64"));
+  }
+  const pcm = Buffer.concat(chunks);
+  if (pcm.length === 0) {
+    const detail = transcript.trim() ? `（模型只返回了文本：${transcript.trim().slice(0, 80)}）` : "";
+    throw new Error(`TTS 备用通道 ${model} 未返回音频${detail}，输入：「${String(input).slice(0, 40)}」`);
+  }
+  return pcm;
+}
+
 
 // ───────────────────────── 1) LLM：脚本生成 ─────────────────────────
 export async function generateScript(brief) {
@@ -265,7 +465,7 @@ export async function generateStoryboard(brief, script) {
   const model = brief.llmModel || process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
   const expectedSceneCount = script?.voiceover?.length || 0;
   if (expectedSceneCount === 0) throw new Error("确认脚本没有可生成分镜的旁白");
-  const sys = "你是资深分镜师，把脚本拆为若干 Scene，严格只输出 JSON 数组，结构：[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]。";
+  const sys = "你是资深分镜师，把脚本拆为若干 Scene。严格只输出 JSON 对象，形如 {\"scenes\":[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]}，不得输出解释文字；musicClimax 为布尔值，仅情绪最高点的分镜为 true。";
   const vo = (script?.voiceover || []).map((v) => `${v.timecode} ${v.text}`).join("\n");
   let user =
     `品牌：${brief.brandName} 产品：${brief.productName}\n调性：${(brief.tones || []).join("、")}\n` +
@@ -277,7 +477,7 @@ export async function generateStoryboard(brief, script) {
   let arr = [];
   let tokens = 0;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const correction = attempt === 0 ? "" : `\n纠正上次输出：上次分镜数量为 ${arr.length}，本次必须严格返回 ${expectedSceneCount} 个分镜。`;
+    const correction = attempt === 0 ? "" : `\n纠正上次输出：上次只解析到 ${arr.length} 个分镜，本次必须严格返回 ${expectedSceneCount} 个，并放在顶层 scenes 数组内。`;
     const attemptUser = withGlobalLanguage(`${user}${correction}`, brief.language);
     try {
       const data = await oneApiPost("/chat/completions", {
@@ -291,7 +491,19 @@ export async function generateStoryboard(brief, script) {
       });
       const content = data.choices?.[0]?.message?.content || "{}";
       const parsed = parseJSONSafe(content);
-      arr = Array.isArray(parsed) ? parsed : parsed.scenes || [];
+      arr = extractSceneArray(parsed);
+      if (arr.length === 0) {
+        // 说明：模型偶尔在 JSON 前后夹带解释或代码块，此时 parseJSONSafe 抠对象会失配，补一次数组字面量兜底。
+        const rawArray = sliceFirstJsonArray(content);
+        if (rawArray) {
+          try {
+            const direct = JSON.parse(rawArray);
+            if (Array.isArray(direct)) arr = direct;
+          } catch {
+            arr = [];
+          }
+        }
+      }
       tokens += data.usage?.total_tokens ?? estimateTokens(attemptUser + content);
     } catch (error) {
       if (tokens > 0) throw attachPartialUsage(error, { tokens });
@@ -311,7 +523,8 @@ export async function generateStoryboard(brief, script) {
     subtitle: s.subtitle || script?.voiceover?.[i]?.text || `场景 ${i + 1}`,
     camera: ["push", "pull", "pan", "fixed"].includes(s.camera) ? s.camera : "fixed",
     durationSec: Number(s.durationSec) || Math.round((brief.durationSec / arr.length) * 10) / 10,
-    musicClimax: !!s.musicClimax,
+    // 说明：部分模型把 musicClimax 给成 0~1 情绪强度而非布尔值，按阈值归一化，避免所有分镜都被判为高潮。
+    musicClimax: s.musicClimax === true || (typeof s.musicClimax === "number" && s.musicClimax >= 0.8),
     status: "pending",
   }));
   return scenes.map((s) => ({ ...s, _usage: { tokens: Math.round(tokens / scenes.length) } }));
@@ -600,56 +813,119 @@ async function finalizeSceneVideo(videoUrl, scene, brief, model, options, taskSt
   return { videoUrl, kind: "video", model, _usage: { videos: 1 }, ...(taskStatus ? { taskStatus } : {}) };
 }
 
+// 主通道：OpenAI 兼容 /audio/speech，返回带容器的音频字节（mp3/wav 由上游决定）。
+async function fetchPrimarySpeech(model, input, brief, openaiTts) {
+  // response_format 是 OpenAI 专属字段：MiniMax speech 系上游只认自己的 output_format(hex|url)，带它会 406。
+  // 仅在 OpenAI 原生系模型名（tts-1*/gpt-4o-mini-tts）时携带，其余（speech-* 等）不带，网关默认 mp3。
+  const body = { model, input, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN" };
+  if (openaiTts) body.response_format = "mp3";
+  const audio = await oneApiPost("/audio/speech", body, { isBinary: true });
+  // 网关成功返回即可能产生费用，调用方在成功后立刻计费，不依赖后续解码是否成功。
+  if (!Buffer.isBuffer(audio) || audio.length === 0) throw new Error("TTS 返回空音频响应");
+  return `data:audio/mpeg;base64,${audio.toString("base64")}`;
+}
+
+// 备用通道：Qwen-Omni 多模态流式语音。返回裸 PCM（24kHz/单声道/s16le），必须补 RIFF 头才能通过魔数与 ffprobe 校验。
+async function fetchOmniSpeech(model, input, brief) {
+  const events = await oneApiPostStream("/chat/completions", {
+    model,
+    messages: [
+      { role: "system", content: "你是专业的中文配音演员。只朗读用户给出的台词原文，不添加任何解释、标点说明或额外语句。" },
+      { role: "user", content: withGlobalLanguage(String(input), brief.language) },
+    ],
+    modalities: ["text", "audio"],
+    audio: { voice: omniVoiceFor(brief.voiceTone), format: "pcm" },
+    stream: true,
+    // include_usage 让网关口径与 chat 通道一致，便于后续按 token 侧计费对账。
+    stream_options: { include_usage: true },
+  });
+  const pcm = collectOmniAudio(events, { model, input });
+  return `data:audio/wav;base64,${wrapPcmAsWav(pcm).toString("base64")}`;
+}
+
+// 逐句合成配音：主通道逐句往返，任一失败即整句重走备用通道；一旦备用通道成功，后续各句继续用它，
+// 避免同一支成片中途换音色（音色由 voiceTone 映射，两条通道名称体系不同）。
+async function synthesizeVoiceSegments({ lines, brief, workspace, model, fallbackModel, openaiTts, paidDurationsSec }) {
+  const segmentPaths = [];
+  const speechDurationsSec = [];
+  let active = { kind: "primary", model };
+  let fallbackNote = "";
+  for (const input of lines) {
+    let source;
+    if (active.kind === "primary") {
+      try {
+        source = await fetchPrimarySpeech(model, input, brief, openaiTts);
+      } catch (primaryError) {
+        if (!fallbackModel) throw primaryError;
+        // 主通道失败原因写进回退说明：额度不足这类外部状态无法在预检发现，失败必须可解释。
+        fallbackNote = `主通道 ${model} 失败后改用备用通道 ${fallbackModel}：${primaryError?.message || primaryError}`;
+        active = { kind: "fallback", model: fallbackModel, primaryError };
+      }
+    }
+    if (active.kind === "fallback") {
+      try {
+        source = await fetchOmniSpeech(active.model, input, brief);
+      } catch (fallbackError) {
+        // 两条通道都失败时，错误必须同时给出两个模型 ID 与两条通道各自的最后一次原因，否则排障只能猜。
+        const primaryReason = active.primaryError?.message || "未调用";
+        throw new Error(`TTS 两条通道均失败。主通道 ${model}：${primaryReason}；备用通道 ${active.model}：${fallbackError?.message || fallbackError}`);
+      }
+    }
+    paidDurationsSec.push(3);
+    const segmentPath = await materializeMedia({ source, kind: "audio", workspace });
+    const durationSec = await probeAudioDuration(segmentPath);
+    segmentPaths.push(segmentPath);
+    speechDurationsSec.push(durationSec);
+    paidDurationsSec[paidDurationsSec.length - 1] = durationSec;
+  }
+  return { segmentPaths, speechDurationsSec, model: active.model, fallbackNote };
+}
+
 /**
  * 按确认脚本逐句生成真实配音，并用实测时长生成权威字幕时间轴。
+ *
+ * 主通道为 OpenAI 兼容 `/audio/speech`；逐句失败（额度 403 / 无渠道 / 5xx / 空音频）时切换到
+ * 同一网关上的 Qwen-Omni 备用通道，并在成功的那一句起固定使用备用通道的音色。
+ *
  * @param {{voiceover?: Array<{text?: string}>}} script 已确认脚本。
- * @param {Record<string, any>} brief 已解析 Brief，优先消费 ttsModel 与画布配置。
+ * @param {Record<string, any>} brief 已解析 Brief，优先消费 ttsModel / ttsFallbackModel 与画布配置。
  * @param {{workspace?: string}} [options] `artifactPaths(runId).audio` 受管音频目录。
- * @returns {Promise<{voicePath?: string, voiceUrl: string|null, cues?: Array, srt: string, durationSec?: number, sceneDurationsMs?: number[], voiceTone: string, model: string, _usage?: object}>} 配音及权威时间轴。
- * @throws {Error} 真实模式缺少工作区、文本为空、响应为空或音频不可解码时抛出。
+ * @returns {Promise<{voicePath?: string, voiceUrl: string|null, cues?: Array, srt: string, durationSec?: number, sceneDurationsMs?: number[], voiceTone: string, model: string, fallbackNote?: string, _usage?: object}>} 配音及权威时间轴。
+ * @throws {Error} 真实模式缺少工作区、文本为空、两条通道都失败或音频不可解码时抛出。
  * @example await generateVoiceover(script, brief, { workspace: paths.audio });
  */
 export async function generateVoiceover(script, brief, options = {}) {
   if (getProviderMode() !== "real") return demoVoiceover(script, brief);
   const model = brief.ttsModel || process.env.PROMO_TTS_MODEL || "speech-02-hd";
+  const fallbackModel = brief.ttsFallbackModel || process.env.PROMO_TTS_FALLBACK_MODEL || "";
   const lines = (script?.voiceover || []).map((item) => String(item?.text ?? ""));
   if (lines.length === 0 || lines.some((line) => line.replace(/[\u0000-\u0020\u007F]/gu, "").length === 0)) {
     throw new Error("确认脚本的逐句旁白文本不能为空");
   }
   if (!options.workspace) throw new Error("真实配音必须提供受管 audio workspace");
-  // response_format 是 OpenAI 专属字段：MiniMax speech 系上游只认自己的 output_format(hex|url)，带它会 406。
-  // 仅在 OpenAI 原生系模型名（tts-1*/gpt-4o-mini-tts）时携带，其余（speech-* 等）不带，网关默认 mp3。
   const openaiTts = /^(?:tts-|gpt-4o-mini-tts(?:$|-))/i.test(model);
-  const segmentPaths = [];
-  const speechDurationsSec = [];
   const paidDurationsSec = [];
+  let synthesized;
+  try {
+    synthesized = await synthesizeVoiceSegments({
+      lines,
+      brief,
+      workspace: options.workspace,
+      model,
+      fallbackModel,
+      openaiTts,
+      paidDurationsSec,
+    });
+  } catch (error) {
+    throw withPartialTtsUsage(error, paidDurationsSec);
+  }
+  const { segmentPaths, speechDurationsSec, fallbackNote } = synthesized;
+  const usedModel = synthesized.model;
   let voicePath;
   try {
-    for (const input of lines) {
-      const body = { model, input, voice: mapVoiceTone(brief.voiceTone), language: brief.language || "zh-CN" };
-      if (openaiTts) body.response_format = "mp3";
-      const audio = await oneApiPost("/audio/speech", body, { isBinary: true });
-      // 网关成功返回即可能产生费用；在素材不可解码时按既有 3 秒/句估算，探测成功后替换为实测值。
-      paidDurationsSec.push(3);
-      if (!Buffer.isBuffer(audio) || audio.length === 0) throw new Error("TTS 返回空音频响应");
-      const source = `data:audio/mpeg;base64,${audio.toString("base64")}`;
-      const segmentPath = await materializeMedia({ source, kind: "audio", workspace: options.workspace });
-      const durationSec = await probeAudioDuration(segmentPath);
-      segmentPaths.push(segmentPath);
-      speechDurationsSec.push(durationSec);
-      paidDurationsSec[paidDurationsSec.length - 1] = durationSec;
-    }
     voicePath = await concatenateVoiceSegments(segmentPaths, { workspace: options.workspace });
   } catch (error) {
-    if (paidDurationsSec.length > 0) {
-      const paidSeconds = paidDurationsSec.reduce((sum, value) => sum + value, 0);
-      throw attachPartialUsage(error, {
-        minutes: paidSeconds / 60,
-        audioSeconds: paidSeconds,
-        requests: paidDurationsSec.length,
-      });
-    }
-    throw error;
+    throw withPartialTtsUsage(error, paidDurationsSec);
   }
   const speechSeconds = speechDurationsSec.reduce((sum, value) => sum + value, 0);
   const usage = { minutes: speechSeconds / 60, audioSeconds: speechSeconds, requests: lines.length };
@@ -669,12 +945,24 @@ export async function generateVoiceover(script, brief, options = {}) {
       durationSec: timeline.durationSec,
       sceneDurationsMs: timeline.sceneDurationsMs,
       voiceTone: brief.voiceTone || "男声",
-      model,
+      model: usedModel,
+      ...(fallbackNote ? { fallbackNote } : {}),
       _usage: usage,
     };
   } catch (error) {
     throw attachPartialUsage(error, usage);
   }
+}
+
+// 部分计费：主/备通道已成功返回音频的句子按实测秒数计入，失败本身不掩盖已发生费用。
+function withPartialTtsUsage(error, paidDurationsSec) {
+  if (paidDurationsSec.length === 0) return error;
+  const paidSeconds = paidDurationsSec.reduce((sum, value) => sum + value, 0);
+  return attachPartialUsage(error, {
+    minutes: paidSeconds / 60,
+    audioSeconds: paidSeconds,
+    requests: paidDurationsSec.length,
+  });
 }
 
 function demoVoiceover(script, brief) {
