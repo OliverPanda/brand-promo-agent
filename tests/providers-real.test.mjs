@@ -713,6 +713,80 @@ test("generateMusic 真实模式：Mureka 桥提交 + 轮询 + 物化 + _usage.t
   assert.ok(fs.existsSync(m.musicPath));
   assert.ok(m.durationSec > 0.9);
   assert.equal(m._usage.tracks, 1);
+
+test("generateMusic：提交遇 bridge_upstream_unavailable（连接未到达上游）时重试一次并成功", async () => {
+  // 说明：2026-09 真实验收在 voiceover 成功后、generateScenes 之前被一次 502 UND_ERR_SOCKET 打断；
+  // 桥已声明该故障发生在到达上游之前，重发安全，重试把一次性抖动挡在付费视频阶段之外。
+  calls = [];
+  process.env.PROMO_MUSIC_RETRY_BACKOFF_MS = "5";
+  murekaSubmitFailures = 1;
+  try {
+    const scenes = await generateStoryboard(baseBrief, await generateScript(baseBrief));
+    const m = await generateMusic(baseBrief, scenes, { workspace: audioWorkspace() });
+    const submissions = calls.filter((c) => c.url.endsWith("/chat/completions") && c.body.model === "mureka-song").length;
+    assert.equal(submissions, 2, "瞬时故障应重试提交，共 2 次提交调用");
+    assert.ok(fs.existsSync(m.musicPath));
+  } finally {
+    murekaSubmitFailures = 0;
+    delete process.env.PROMO_MUSIC_RETRY_BACKOFF_MS;
+  }
+});
+
+test("generateMusic：轮询遇瞬时故障只重试查询，绝不重新提交已付费任务", async () => {
+  calls = [];
+  process.env.PROMO_MUSIC_RETRY_BACKOFF_MS = "5";
+  murekaQueryFailures = 1;
+  try {
+    const scenes = await generateStoryboard(baseBrief, await generateScript(baseBrief));
+    const m = await generateMusic(baseBrief, scenes, { workspace: audioWorkspace() });
+    const submissions = calls.filter((c) => c.url.endsWith("/chat/completions") && c.body.model === "mureka-song").length;
+    const queries = calls.filter((c) => c.url.endsWith("/chat/completions") && c.body.model === "mureka-query").length;
+    assert.equal(submissions, 1, "轮询抖动不得触发第二次提交付费任务");
+    assert.equal(queries, 2, "轮询应重试一次后拿到结果");
+    assert.ok(fs.existsSync(m.musicPath));
+  } finally {
+    murekaQueryFailures = 0;
+    delete process.env.PROMO_MUSIC_RETRY_BACKOFF_MS;
+  }
+});
+
+test("generateMusic：契约类 4xx 立即失败，不做无意义重试", async () => {
+  calls = [];
+  process.env.PROMO_MUSIC_RETRY_BACKOFF_MS = "5";
+  murekaSubmitFailures = 5;
+  murekaFailureStatus = 400;
+  murekaFailureCode = "bridge_upstream_error";
+  murekaFailureMessage = "Mureka 拒绝请求：prompt 非法";
+  try {
+    await assert.rejects(generateMusic(baseBrief, [], { workspace: audioWorkspace() }), /400/);
+    const submissions = calls.filter((c) => c.url.endsWith("/chat/completions") && c.body.model === "mureka-song").length;
+    assert.equal(submissions, 1, "4xx 契约类错误只应尝试一次");
+  } finally {
+    murekaSubmitFailures = 0;
+    murekaFailureStatus = 502;
+    murekaFailureCode = "bridge_upstream_unavailable";
+    murekaFailureMessage = "Mureka 上游网络暂时不可用（UND_ERR_SOCKET）";
+    delete process.env.PROMO_MUSIC_RETRY_BACKOFF_MS;
+  }
+});
+
+test("generateMusic：提交受理结果未知（bridge_submission_unknown）时不得重试，避免重复付费生成", async () => {
+  calls = [];
+  process.env.PROMO_MUSIC_RETRY_BACKOFF_MS = "5";
+  murekaSubmitFailures = 5;
+  murekaFailureCode = "bridge_submission_unknown";
+  murekaFailureMessage = "Mureka 提交连接中断，受理结果未知（UND_ERR_SOCKET）";
+  try {
+    await assert.rejects(generateMusic(baseBrief, [], { workspace: audioWorkspace() }));
+    const submissions = calls.filter((c) => c.url.endsWith("/chat/completions") && c.body.model === "mureka-song").length;
+    assert.equal(submissions, 1, "受理结果未知时重发可能生成两首，必须只提交一次");
+  } finally {
+    murekaSubmitFailures = 0;
+    murekaFailureCode = "bridge_upstream_unavailable";
+    murekaFailureMessage = "Mureka 上游网络暂时不可用（UND_ERR_SOCKET）";
+    delete process.env.PROMO_MUSIC_RETRY_BACKOFF_MS;
+  }
+});
 });
 
 test("composite 真实模式缺少受管产物目录或 FFmpeg：直接拒绝，不再降级为分镜包", async () => {

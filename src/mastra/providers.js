@@ -1437,6 +1437,84 @@ async function chatCompletionJson(model, payload, { timeoutMs = 120000 } = {}) {
   return parsed;
 }
 
+// 配乐桥调用的瞬时故障重试上限：提交与轮询各自算一次调用，默认只额外重试 1 次（共 2 次）。
+const MUSIC_MAX_ATTEMPTS = 3;
+
+/**
+ * 解析配乐桥调用的最大尝试次数。
+ *
+ * 说明：Mureka 桥把上游网络故障统一包成 502，实测同一请求重发即可恢复（2026-09 真实验收在
+ * voiceover 成功后、generateScenes 之前被一次 UND_ERR_SOCKET 打断）。上限固定为 3，避免配置错误
+ * 把一次 run 的费用放大到不可控。
+ *
+ * @returns {number} 1~3 之间的尝试次数。
+ * @example musicAttemptCount(); // 2
+ */
+function musicAttemptCount() {
+  const raw = Number(process.env.PROMO_MUSIC_ATTEMPTS ?? 2);
+  if (!Number.isFinite(raw) || raw < 1) return 1;
+  return Math.min(MUSIC_MAX_ATTEMPTS, Math.floor(raw));
+}
+
+/**
+ * 判断配乐桥错误是否为可重试的瞬时故障。
+ *
+ * 说明：桥把上游故障统一压成 HTTP 502 + error.code，HTTP 状态本身无法区分「上游抖动」与
+ * 「上游拒绝」，因此必须同时看 status 与错误文案。契约类错误（4xx、缺少 taskId、content 非 JSON）
+ * 重发同样失败，必须立即抛出。
+ *
+ * @param {unknown} error 捕获到的错误。
+ * @param {{submissionSensitive?: boolean}} [options] 该调用是否会创建上游付费任务。
+ *   提交路径只重试「确定未到达上游」的故障（bridge_upstream_unavailable / 连接层错误），
+ *   受理结果未知与客户端超时中止一律不重试；轮询是只读查询，可放宽到 5xx 与网络类文案。
+ * @returns {boolean} 可重试时返回 true。
+ * @example isTransientMusicError(new Error("one-api /chat/completions 502: bridge_upstream_unavailable")); // true
+ */
+function isTransientMusicError(error, { submissionSensitive = false } = {}) {
+  const message = String(error?.message || error || "");
+  if (submissionSensitive) {
+    // 说明：提交会真的创建上游付费任务。桥用两种码区分故障位置：bridge_upstream_unavailable 表示连接
+    // 从未到达上游（重发安全）；bridge_submission_unknown 表示受理结果未知。客户端自身的超时中止同样
+    // 无法判定上游是否受理，与「受理结果未知」等价处理，一律不重试。
+    if (/submission_unknown|受理结果未知|abort|timeout|超时/i.test(message)) return false;
+    return /bridge_upstream_unavailable|网络暂时不可用|UND_ERR_CONNECT_TIMEOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|ERR_INVALID_URL/i.test(message);
+  }
+  const status = Number(error?.status);
+  if (Number.isFinite(status) && status > 0) return status >= 500 || status === 408 || status === 429;
+  return /bridge_upstream_unavailable|bridge_upstream_error|UND_ERR_|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN|socket hang up|fetch failed|网络暂时不可用|请求失败/i.test(message);
+}
+
+/**
+ * 带瞬时故障重试的桥调用：重试粒度是「一次 chat/completions」，绝不跨越提交边界。
+ *
+ * 说明：只能包住单次调用。若把 generateMusic 的整个流程（含轮询等待、音频下载与物化）包进重试，
+ * 下游失败会重新提交一次已付费的配乐任务 —— 与视频那次「下载抖动放大成两次付费生成」是同一类缺陷。
+ *
+ * @param {string} model 桥暴露的模型名（mureka-song / mureka-query）。
+ * @param {Record<string, any>} payload 业务负载（序列化后放入 user content）。
+ * @param {{timeoutMs?: number, submissionSensitive?: boolean}} [options] 单次请求超时与提交敏感标记。
+ * @returns {Promise<Record<string, any>>} 解析后的业务对象。
+ * @throws {Error} 重试耗尽或遇到契约类错误时抛出最后一次错误。
+ * @example await chatCompletionJsonWithRetry("mureka-query", { taskId, kind });
+ */
+async function chatCompletionJsonWithRetry(model, payload, { timeoutMs = 120000, submissionSensitive = false } = {}) {
+  const attempts = musicAttemptCount();
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await chatCompletionJson(model, payload, { timeoutMs });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !isTransientMusicError(error, { submissionSensitive })) throw error;
+      // 说明：按尝试次数线性退避，给上游故障窗口留出恢复时间；最后一次不再等待。
+      const waitMs = Number(process.env.PROMO_MUSIC_RETRY_BACKOFF_MS ?? 2000) * attempt;
+      console.warn(`[music] ${model} 第 ${attempt}/${attempts} 次调用失败（${error?.message}），${waitMs}ms 后重试`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw lastError || new Error("配乐桥调用失败");
+}
+
 /**
  * 生成配乐并物化、探测真实音频文件；本阶段不执行最终混音。
  *
@@ -1461,14 +1539,16 @@ export async function generateMusic(brief, storyboard, options = {}) {
   let musicPath;
   let durationSec;
   try {
-    const submitted = await chatCompletionJson(model, { prompt, mode: "instrumental" }, { timeoutMs: submitTimeoutMs });
+    // 说明：提交会创建上游付费任务，故标记 submissionSensitive：受理结果未知（bridge_submission_unknown）不重试。
+    const submitted = await chatCompletionJsonWithRetry(model, { prompt, mode: "instrumental" }, { timeoutMs: submitTimeoutMs, submissionSensitive: true });
     const taskId = String(submitted?.taskId || "").trim();
     if (!taskId) throw new Error("配乐桥提交响应缺少 taskId");
     const kind = submitted?.kind === "song" ? "song" : "instrumental";
     const deadline = Date.now() + timeoutMs;
     let audioUrl = null;
     for (;;) {
-      const task = await chatCompletionJson(MUSIC_QUERY_MODEL, { taskId, kind });
+      // 说明：轮询是只读查询，重试零费用，可安全对瞬时故障重发。
+      const task = await chatCompletionJsonWithRetry(MUSIC_QUERY_MODEL, { taskId, kind });
       const status = String(task?.status || "").toLowerCase();
       if (status === "succeeded") {
         audioUrl = String(task?.audioUrl || "").trim() || null;
