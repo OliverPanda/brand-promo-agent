@@ -92,6 +92,49 @@ export async function probeAudioDuration(filePath, options = {}) {
   if (!Number.isFinite(durationSec) || durationSec <= 0) throw new Error("ffprobe 返回了无效 duration 时长");
   return durationSec;
 }
+const WAV_HEADER_BYTES = 44;
+
+/**
+ * 把无容器头的线性 PCM 封装为合法 RIFF/WAVE 文件，供受管素材链路消费。
+ *
+ * Qwen-Omni 流式语音返回的是裸 PCM（无 RIFF 头），`materializeMedia` 的魔数校验与 ffprobe 都无法直接读取，
+ * 因此必须在进入工作区前补一个 44 字节标准头。
+ *
+ * @param {Buffer|Uint8Array} pcm 线性 PCM 字节。
+ * @param {{sampleRate?: number, channels?: number, bitDepth?: number}} [options] 采样规格；默认 24000Hz / 单声道 / 16bit。
+ * @returns {Buffer} 带 44 字节头的 WAV 文件字节。
+ * @throws {Error} 输入为空、采样规格非法或字节长度不是完整采样帧时抛出。
+ * @example wrapPcmAsWav(pcmBuffer, { sampleRate: 24000, channels: 1, bitDepth: 16 });
+ */
+export function wrapPcmAsWav(pcm, options = {}) {
+  const sampleRate = options.sampleRate ?? 24000;
+  const channels = options.channels ?? 1;
+  const bitDepth = options.bitDepth ?? 16;
+  for (const [label, value] of [["采样率", sampleRate], ["声道数", channels], ["位深", bitDepth]]) {
+    if (!Number.isInteger(value) || value <= 0) throw new Error(`PCM ${label}必须是正整数`);
+  }
+  if (bitDepth % 8 !== 0) throw new Error("PCM 位深必须是 8 的整数倍");
+  if (!Buffer.isBuffer(pcm) && !(pcm instanceof Uint8Array)) throw new Error("PCM 数据必须是 Buffer 或 Uint8Array");
+  const data = Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+  if (data.length === 0) throw new Error("PCM 数据为空");
+  const blockAlign = channels * (bitDepth / 8);
+  if (data.length % blockAlign !== 0) throw new Error(`PCM 数据长度 ${data.length} 不是完整采样帧的整数倍（帧大小 ${blockAlign} 字节）`);
+  const header = Buffer.alloc(WAV_HEADER_BYTES);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + data.length, 4);
+  header.write("WAVEfmt ", 8, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // 1 = PCM 未压缩
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * blockAlign, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(data.length, 40);
+  return Buffer.concat([header, data]);
+}
+
 
 /**
  * 依序拼接语音片段，并在相邻片段之间插入固定静音。

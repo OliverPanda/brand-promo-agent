@@ -16,6 +16,7 @@ import {
   concatenateVoiceSegments,
   formatSrt,
   probeAudioDuration,
+  wrapPcmAsWav,
 } from "../src/media/audio.js";
 
 const roots = [];
@@ -109,6 +110,50 @@ test("拒绝空台词、非法时长、倒序/重叠 cue 和非法总时长", ()
     { startMs: 700, endMs: 900, text: "二" },
   ], 1), /重叠|时间/);
   assert.throws(() => formatSrt([{ startMs: 0, endMs: 1, text: "一" }], -1), /时长/);
+});
+
+test("wrapPcmAsWav 补 44 字节 RIFF 头并写入正确采样规格", async () => {
+  // 24000Hz / 单声道 / 16bit 各 0.25s = 12000 字节 = 6000 个采样帧。
+  const pcm = Buffer.alloc(12000, 0x11);
+  const wav = wrapPcmAsWav(pcm);
+  assert.equal(wav.subarray(0, 4).toString("ascii"), "RIFF");
+  assert.equal(wav.readUInt32LE(4), 36 + pcm.length);
+  assert.equal(wav.subarray(8, 12).toString("ascii"), "WAVE");
+  assert.equal(wav.subarray(12, 16).toString("ascii"), "fmt ");
+  assert.equal(wav.readUInt32LE(16), 16, "fmt 块长度固定 16");
+  assert.equal(wav.readUInt16LE(20), 1, "audioFormat=1 表示未压缩 PCM");
+  assert.equal(wav.readUInt16LE(22), 1, "默认单声道");
+  assert.equal(wav.readUInt32LE(24), 24000, "默认 24000Hz");
+  assert.equal(wav.readUInt32LE(28), 48000, "byteRate = sampleRate * blockAlign");
+  assert.equal(wav.readUInt16LE(32), 2, "blockAlign = channels * bitDepth/8");
+  assert.equal(wav.readUInt16LE(34), 16, "默认 16bit");
+  assert.equal(wav.subarray(36, 40).toString("ascii"), "data");
+  assert.equal(wav.readUInt32LE(40), pcm.length);
+  assert.equal(wav.length, 44 + pcm.length);
+  assert.ok(wav.subarray(44).equals(pcm), "PCM 载荷必须原样保留");
+  // 交给 ffprobe 必须被识别为真实可解码音频，而不是靠魔数糊过去。
+  const wavWorkspace = workspace();
+  const materialized = await materializeMedia({ source: `data:audio/wav;base64,${wav.toString("base64")}`, kind: "audio", workspace: wavWorkspace });
+  assert.ok(materialized.endsWith(".wav"));
+  const duration = await probeAudioDuration(materialized);
+  assert.ok(Math.abs(duration - 0.25) < 0.02, `实际时长 ${duration}`);
+});
+
+test("wrapPcmAsWav 支持自定义规格并按整帧校验长度", () => {
+  const stereo = wrapPcmAsWav(Buffer.alloc(640), { sampleRate: 48000, channels: 2, bitDepth: 16 });
+  assert.equal(stereo.readUInt16LE(22), 2);
+  assert.equal(stereo.readUInt32LE(24), 48000);
+  assert.equal(stereo.readUInt32LE(28), 192000);
+  assert.equal(stereo.readUInt16LE(32), 4);
+});
+
+test("wrapPcmAsWav 拒绝空数据、非法规格与非整帧长度", () => {
+  assert.throws(() => wrapPcmAsWav(Buffer.alloc(0)), /空/);
+  assert.throws(() => wrapPcmAsWav("not-buffer"), /Buffer|Uint8Array/);
+  assert.throws(() => wrapPcmAsWav(Buffer.alloc(3)), /采样帧|整数倍/);
+  assert.throws(() => wrapPcmAsWav(Buffer.alloc(2), { sampleRate: 0 }), /采样率/);
+  assert.throws(() => wrapPcmAsWav(Buffer.alloc(2), { channels: -1 }), /声道/);
+  assert.throws(() => wrapPcmAsWav(Buffer.alloc(2), { bitDepth: 12 }), /8 的整数倍/);
 });
 
 test("受管音频经 materialize、ffprobe 并按固定静音间隔拼接", async () => {
