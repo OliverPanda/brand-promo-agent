@@ -371,7 +371,7 @@ const storyboard = createStep({
   id: STEP.STORYBOARD,
   execute: async ({ runId, inputData }) => {
     const rid = inputData.runId || runId;
-    const { brief, script, voice } = inputData;
+    const { brief, script, voice, music } = inputData;
     return withStep(rid, STEP.STORYBOARD, async () => {
       // 说明：分镜在真实配音之后执行，模型只负责画面创意；每镜时长一律由实测语音时间轴覆盖，
       // 保证「分镜数量 = 确认旁白句数」「分镜总时长 = 权威音轨时长」两条硬约束。
@@ -380,7 +380,7 @@ const storyboard = createStep({
       const scenes = applyVoiceTimelineToStoryboard(script, proposed, voice);
       const tokens = (proposed || []).reduce((a, s) => a + (s._usage?.tokens || 0), 0);
       updateRun(rid, { storyboard: scenes });
-      return { brief, script, voice, storyboard: scenes, runId: rid, _usage: tokens ? { tokens } : undefined };
+      return { brief, script, voice, music, storyboard: scenes, runId: rid, _usage: tokens ? { tokens } : undefined };
     });
   },
 });
@@ -389,7 +389,7 @@ const generateScenes = createStep({
   id: STEP.SCENES,
   execute: async ({ runId, inputData }) => {
     const rid = inputData.runId || runId;
-    const { brief, script, voice, storyboard } = inputData;
+    const { brief, script, voice, music, storyboard } = inputData;
     return withStep(rid, STEP.SCENES, async () => {
       assertVoiceoverMatchesStoryboard(script, storyboard);
       const scenes = [];

@@ -40,7 +40,9 @@ after(() => {
   fs.rmSync(fixtureDir, { recursive: true, force: true });
 });
 
-function silentWav(durationSec = 0.25) {
+function toneWav({ durationSec = 0.25, frequency = 440 } = {}) {
+  // 说明：全零采样的静音 WAV 会让 composeFinalVideo 的 loudnorm 分析得到 -inf LUFS 而被判失败，
+  // 成功路径的 fixture 必须具备可测量响度，因此写入正弦采样而不是留空。
   const sampleRate = 8_000;
   const samples = Math.round(sampleRate * durationSec);
   const dataBytes = samples * 2;
@@ -57,14 +59,21 @@ function silentWav(durationSec = 0.25) {
   buffer.writeUInt16LE(16, 34);
   buffer.write("data", 36);
   buffer.writeUInt32LE(dataBytes, 40);
+  for (let index = 0; index < samples; index += 1) {
+    const value = Math.round(0.6 * 32767 * Math.sin((2 * Math.PI * frequency * index) / sampleRate));
+    buffer.writeInt16LE(value, 44 + index * 2);
+  }
   return buffer;
 }
 
-const AUDIO_FIXTURE = silentWav();
+const AUDIO_FIXTURE = toneWav();
+const MUSIC_FIXTURE = toneWav({ frequency: 220 });
 const BROKEN_WAV = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVE")]);
+// 说明：成片硬字幕像素门要求字幕区域差异超过 MEDIA_LIMITS.subtitlePixelDiffRatio，
+// 3 字短句的字幕像素占比不足 0.005 会被判失败，因此 fixture 必须使用完整中文长句。
 let scriptVoiceover = [
-  { timecode: "00:00:00.000", text: "第一句" },
-  { timecode: "00:00:00.000", text: "第二句" },
+  { timecode: "00:00:00.000", text: "铭星科技让创意即刻成片" },
+  { timecode: "00:00:00.000", text: "真实配音配乐与硬字幕" },
 ];
 let workflowSpeechCall = 0;
 let workflowFailSpeechAt = 0;
@@ -101,7 +110,7 @@ function route(path, body) {
       return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ taskId: "t1", kind: "instrumental" }) } }] } });
     }
     if (body.model === "mureka-query") {
-      const bytes = workflowInvalidMusic ? BROKEN_WAV : AUDIO_FIXTURE;
+      const bytes = workflowInvalidMusic ? BROKEN_WAV : MUSIC_FIXTURE;
       return makeRes({ json: { choices: [{ message: { content: JSON.stringify({ status: "succeeded", audioUrl: `data:audio/wav;base64,${bytes.toString("base64")}` }) } }] } });
     }
     const sys = body.messages?.[0]?.content || "";
@@ -480,5 +489,84 @@ test("GET /api/config 在真实模式返回 one-api provider 与预算上限", a
     assert.equal(cfg.budgetCap, 100);
   } finally {
     server.close();
+  }
+});
+test("REAL 成功路径：配乐载荷透传至 composite 并交付带配音、配乐与硬字幕的 MP4", async () => {
+  // 说明：本用例是「步骤间载荷透传」的回归门。storyboard/generateScenes 一旦漏传 music，
+  // composite 会收到 undefined 并抛「配乐缺失」；只有真跑一次完整合成才能拦住这类断链。
+  workflowSpeechCall = 0;
+  workflowStoryboardCall = 0;
+  workflowImageCalls = 0;
+  workflowVideoCalls = 0;
+  providerCallOrder.length = 0;
+  const previousFfmpeg = process.env.PROMO_FFMPEG_BIN;
+  process.env.PROMO_FFMPEG_BIN = "ffmpeg"; // 与 tests/composite-real.test.mjs 一致：合成走真实 FFmpeg
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const response = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: false }),
+    });
+    assert.equal(response.status, 200);
+    const { runId } = await response.json();
+    const run = await waitStatus(port, runId, ["success", "failed"], 120000);
+
+    assert.equal(run.status, "success", `真实合成应成功，实际=${run.status}：${run.steps?.composite?.error || ""}`);
+    assert.equal(run.steps.composite.status, "done");
+
+    // 1) 载荷透传：music → storyboard → generateScenes → composite 必须携带同一份配乐。
+    const stored = getRun(runId);
+    const musicPath = stored.steps.music.output.music.musicPath;
+    assert.ok(typeof musicPath === "string" && musicPath !== "", "music 步骤必须落盘配乐");
+    assert.equal(stored.steps.voiceover.output.music, undefined, "voiceover 不产生配乐载荷");
+    assert.equal(stored.steps.storyboard.output.music?.musicPath, musicPath, "storyboard 必须透传配乐");
+    assert.equal(stored.steps.generateScenes.output.music?.musicPath, musicPath, "generateScenes 必须透传配乐");
+    const composite = stored.steps.composite.output.composite;
+    assert.equal(composite.validated, true, "成片必须通过校验");
+    assert.equal(composite.model, "ffmpeg");
+
+    // 2) 四件产物必须提升到 run 目录，并附带已校验清单。
+    const paths = artifactPaths(runId);
+    for (const key of ["finalVideo", "subtitles", "manifest", "poster"]) {
+      assert.ok(fs.existsSync(paths[key]), `成功运行必须产出 ${key}`);
+    }
+    const manifest = JSON.parse(fs.readFileSync(paths.manifest, "utf8"));
+    assert.equal(manifest.validated, true);
+    assert.equal(manifest.canvas.width, 1080);
+    assert.equal(manifest.canvas.height, 1920);
+    assert.equal(manifest.models.music, "mureka-song");
+
+    // 3) 成片规格：H.264 / yuv420p / 1080x1920 / AAC，时长与权威音轨一致。
+    const probed = JSON.parse(execFileSync("ffprobe", [
+      "-v", "error",
+      "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt,channels:format=duration,format_name",
+      "-of", "json",
+      paths.finalVideo,
+    ], { stdio: "pipe" }).toString());
+    const videoStream = (probed.streams || []).find((stream) => stream.codec_type === "video");
+    const audioStream = (probed.streams || []).find((stream) => stream.codec_type === "audio");
+    assert.equal(videoStream.codec_name, "h264");
+    assert.equal(videoStream.pix_fmt, "yuv420p");
+    assert.equal(Number(videoStream.width), 1080);
+    assert.equal(Number(videoStream.height), 1920);
+    assert.equal(audioStream.codec_name, "aac");
+    assert.match(String(probed.format.format_name), /mp4/);
+    const voice = stored.steps.voiceover.output.voice;
+    assert.ok(
+      Math.abs(Number(probed.format.duration) - voice.durationSec) <= MEDIA_LIMITS.durationToleranceSec,
+      `成片时长 ${probed.format.duration}s 应≈权威音轨 ${voice.durationSec}s`,
+    );
+
+    // 4) 硬字幕：SRT 必须逐条包含确认台词，且条数与 cue 数一致。
+    const srt = fs.readFileSync(paths.subtitles, "utf8");
+    for (const line of scriptVoiceover) {
+      assert.ok(srt.includes(line.text), `SRT 应包含确认台词「${line.text}」`);
+    }
+    assert.equal((srt.match(/-->/gu) || []).length, voice.cues.length);
+  } finally {
+    server.close();
+    if (previousFfmpeg === undefined) delete process.env.PROMO_FFMPEG_BIN;
+    else process.env.PROMO_FFMPEG_BIN = previousFfmpeg;
   }
 });
