@@ -15,9 +15,22 @@ process.env.PROMO_BUDGET_CAP = "100"; // 充足预算，确保成功路径
 const fs = (await import("node:fs")).default;
 const os = (await import("node:os")).default;
 const path = (await import("node:path")).default;
+const { execFileSync } = await import("node:child_process");
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "promo-workflow-real-"));
 const previousDataDir = process.env.PROMO_DATA_DIR;
 process.env.PROMO_DATA_DIR = testDataDir;
+
+// 说明：网关 mock 必须回传可被 FFmpeg 真实归一化的媒体。用本机 ffmpeg 生成 1080x1920 黑帧 PNG 与 1s MP4，
+// 以 b64_json / data URL 回给 mock，避免测试依赖外网 CDN。
+const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "promo-real-fixtures-"));
+const fixturePng = path.join(fixtureDir, "scene.png");
+const fixtureMp4 = path.join(fixtureDir, "scene.mp4");
+execFileSync("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1080x1920", "-frames:v", "1", fixturePng], { windowsHide: true });
+execFileSync("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=25:d=1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", fixtureMp4], { windowsHide: true });
+const PNG_B64 = fs.readFileSync(fixturePng).toString("base64");
+const MP4_B64 = fs.readFileSync(fixtureMp4).toString("base64");
+// 记录真实 Provider 付费调用顺序，用于断言「音频通道先于素材通道」。
+const providerCallOrder = [];
 
 const { test, after } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
@@ -25,6 +38,7 @@ after(() => {
   if (previousDataDir === undefined) delete process.env.PROMO_DATA_DIR;
   else process.env.PROMO_DATA_DIR = previousDataDir;
   fs.rmSync(testDataDir, { recursive: true, force: true });
+  fs.rmSync(fixtureDir, { recursive: true, force: true });
 });
 
 function silentWav(durationSec = 0.25) {
@@ -104,15 +118,23 @@ function route(path, body) {
   }
   if (path.endsWith("/images/generations")) {
     workflowImageCalls += 1;
-    return makeRes({ json: { data: [{ url: "https://cdn.example/scene.png" }] } });
+    providerCallOrder.push("image");
+    return makeRes({ json: { data: [{ b64_json: PNG_B64 }] } });
+  }
+  if (path.endsWith("/videos/generations") || path.endsWith("/video/generations")) {
+    workflowVideoCalls += 1;
+    providerCallOrder.push("video");
+    return makeRes({ json: { data: [{ url: `data:video/mp4;base64,${MP4_B64}` }] } });
   }
   if (path.includes("/video") || path.includes("/videos")) workflowVideoCalls += 1;
   if (path.endsWith("/audio/speech")) {
     workflowSpeechCall += 1;
+    providerCallOrder.push("tts");
     if (workflowSpeechCall === workflowFailSpeechAt) return makeRes({ ok: false, status: 500, text: "line failed" });
     return makeRes({ bytes: AUDIO_FIXTURE });
   }
   if (path.endsWith("/audio/music")) {
+    providerCallOrder.push("music");
     const bytes = workflowInvalidMusic ? BROKEN_WAV : AUDIO_FIXTURE;
     return makeRes({ json: { data: [{ b64_json: bytes.toString("base64") }] } });
   }
@@ -130,7 +152,9 @@ globalThis.fetch = async (url, opts = {}) => {
 
 const { app } = await import("../src/server.js");
 const { applyVoiceTimelineToStoryboard } = await import("../src/mastra/workflow.js");
-const { artifactPaths } = await import("../src/media/artifacts.js");
+const { artifactPaths, MEDIA_LIMITS } = await import("../src/media/artifacts.js");
+const { getRun } = await import("../src/store.js");
+const { bus } = await import("../src/mastra/eventBus.js");
 app.locals.generationPreflightDependencies = {
   verifyMediaToolchain: async () => {},
   artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
@@ -234,7 +258,8 @@ test("storyboard 两次数量不一致会在任何图像/视频调用前失败",
     assert.match(run.steps.storyboard.error, /分镜数量.*2|数量不一致/);
     assert.equal(workflowImageCalls, 0);
     assert.equal(workflowVideoCalls, 0);
-    assert.equal(workflowSpeechCall, 0);
+    // 新顺序下 TTS 先于分镜：数量不一致必须在生成任何素材前失败，但配音已完成。
+    assert.equal(workflowSpeechCall, 2);
   } finally {
     workflowStoryboardCount = 2;
     server.close();
@@ -351,6 +376,92 @@ test("真实模式 + 极小配额：首步即触发 QuotaExceededError，run=fai
   } finally {
     process.env.PROMO_QUOTA_CAP = "200";
     server.close();
+  }
+});
+
+test("REAL 严格顺序：TTS/配乐先于素材、每镜标准化动态片段、失败只发布一次且不进入交付", async () => {
+  workflowSpeechCall = 0;
+  workflowStoryboardCall = 0;
+  workflowImageCalls = 0;
+  workflowVideoCalls = 0;
+  providerCallOrder.length = 0;
+  const previousFfmpeg = process.env.PROMO_FFMPEG_BIN;
+  delete process.env.PROMO_FFMPEG_BIN; // 让 composite 在步骤内硬失败，避免测试真跑一次完整合成
+  const stepStarts = [];
+  const compositeEvents = [];
+  const failures = [];
+  const finalReviews = [];
+  const onProgress = (event) => {
+    if (event.status === "step-start") stepStarts.push(event.step);
+    if (event.step === "composite") compositeEvents.push(event);
+  };
+  const onFailed = (event) => failures.push(event);
+  const onFinalReview = (event) => finalReviews.push(event);
+  bus.on("progress", onProgress);
+  bus.on("run-failed", onFailed);
+  bus.on("final-review", onFinalReview);
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const response = await fetch(`${BASE(port)}/api/generate`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...baseBrief, hitlEnabled: false, finalGateEnabled: true }),
+    });
+    const { runId } = await response.json();
+    const run = await waitStatus(port, runId, ["failed"]);
+
+    // 1) 严格步骤顺序：配音/配乐先于分镜与素材，合成收尾。
+    const videoSteps = stepStarts.filter((step) => ["prepareVideo", "voiceover", "music", "storyboard", "generateScenes", "composite"].includes(step));
+    assert.deepEqual(videoSteps, ["prepareVideo", "voiceover", "music", "storyboard", "generateScenes", "composite"]);
+
+    // 2) 付费顺序：任何图像/视频调用之前必须完成 TTS 与配乐。
+    const firstVisual = providerCallOrder.findIndex((kind) => kind === "image" || kind === "video");
+    assert.ok(firstVisual > 0, `本轮应存在图像/视频调用，实际=${providerCallOrder.join(",")}`);
+    for (const kind of ["tts", "music"]) {
+      const index = providerCallOrder.indexOf(kind);
+      assert.ok(index >= 0 && index < firstVisual, `${kind} 必须先于图像/视频：${providerCallOrder.join(",")}`);
+    }
+
+    // 3) 逐镜标准化动态片段与权威时长（videoPath 只存在于服务端 store，公开 API 会剥离）。
+    const stored = getRun(runId);
+    const voice = stored.steps.voiceover.output.voice;
+    assert.equal(run.brief.videoModel, "minimax-h3", "未手选时应按优先级自动选 minimax-h3");
+    assert.equal(stored.storyboard.length, scriptVoiceover.length);
+    stored.storyboard.forEach((scene, index) => {
+      assert.ok(typeof scene.videoPath === "string" && scene.videoPath !== "", `第 ${index + 1} 镜必须有标准化动态片段`);
+      assert.ok(fs.existsSync(scene.videoPath), `第 ${index + 1} 镜动态片段应已落盘`);
+      assert.equal(scene.durationSec, voice.sceneDurationsMs[index] / 1000);
+    });
+    // 每镜时长 = 实测语音时长，仅非末镜追加固定句间隔；总长必须等于权威音轨时长。
+    const speechMs = scriptVoiceover.map((_, lineIndex) => {
+      const cues = voice.cues.filter((cue) => cue.lineIndex === lineIndex);
+      return cues[cues.length - 1].endMs - cues[0].startMs;
+    });
+    assert.deepEqual(
+      voice.sceneDurationsMs,
+      speechMs.map((ms, index) => ms + (index < speechMs.length - 1 ? MEDIA_LIMITS.voiceGapMs : 0)),
+    );
+    assert.equal(voice.sceneDurationsMs.reduce((sum, ms) => sum + ms, 0), Math.round(voice.durationSec * 1000));
+    const sceneTotal = stored.storyboard.reduce((sum, scene) => sum + scene.durationSec, 0);
+    assert.ok(Math.abs(sceneTotal * 1000 - voice.durationSec * 1000) < 1e-6, `分镜总时长 ${sceneTotal} 应等于权威音轨 ${voice.durationSec}`);
+
+    // 4) 校验事件必须早于成片校验失败；失败运行只发一次 run-failed 且永不进入成片门。
+    const validating = compositeEvents.find((event) => event.status === "step-progress" && event.phase === "validating" && event.message === "正在校验成片");
+    assert.ok(validating, "composite 必须在校验产物前发出 validating 进度事件");
+    const failedIndex = compositeEvents.findIndex((event) => event.status === "step-failed");
+    assert.ok(failedIndex > compositeEvents.indexOf(validating), "validating 进度必须早于 composite 失败");
+    assert.equal(run.status, "failed");
+    assert.equal(run.steps.composite.status, "failed");
+    assert.match(run.steps.composite.error, /PROMO_FFMPEG_BIN/);
+    assert.equal(finalReviews.filter((event) => event.runId === runId).length, 0, "失败运行不得进入成片门");
+    assert.equal(failures.filter((event) => event.runId === runId).length, 1, "同一 run 只发布一次 run-failed");
+  } finally {
+    bus.off("progress", onProgress);
+    bus.off("run-failed", onFailed);
+    bus.off("final-review", onFinalReview);
+    server.close();
+    if (previousFfmpeg === undefined) delete process.env.PROMO_FFMPEG_BIN;
+    else process.env.PROMO_FFMPEG_BIN = previousFfmpeg;
   }
 });
 

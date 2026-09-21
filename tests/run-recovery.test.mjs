@@ -104,3 +104,52 @@ test("引擎 resolve success 但核心步骤失败时，不得覆盖成片验收
     assert.match(run.error, /分镜超时/);
   });
 });
+
+// 说明：REAL 模式的交付契约是「已校验的持久化成片」，工作流回报 success 不足以放行；
+// 这里用 mock 让两段工作流都成功但不产出 artifactManifest，验证服务端交付门会拦下并置 failed。
+test("REAL 模式缺少已校验产物时不得进入成片门", async t => {
+  const previousMode = process.env.PROMO_PROVIDER_MODE;
+  const previousDeps = app.locals.generationPreflightDependencies;
+  process.env.PROMO_PROVIDER_MODE = "real";
+  app.locals.generationPreflightDependencies = {
+    verifyMediaToolchain: async () => {},
+    artifactPaths: () => ({ outputRoot: process.cwd(), workspace: process.cwd() }),
+    verifyWritable: async () => {},
+    providerBase: () => "http://127.0.0.1:1",
+    providerKey: () => "test-key",
+    fetchRemoteModels: async () => ({
+      byType: { video: ["minimax-h3"], audio: ["speech-02-hd"] },
+      raw: [{ id: "minimax-h3", type: "video" }, { id: "speech-02-hd", type: "tts" }],
+    }),
+    musicPath: () => "/audio/music",
+    musicModel: () => "mureka-v1",
+    ttsModel: () => "speech-02-hd",
+    videoModel: () => "",
+  };
+  t.mock.method(mastra.getWorkflow("promoScript"), "createRun", async () => ({ start: async () => ({ status: "success" }) }));
+  t.mock.method(mastra.getWorkflow("promoVideo"), "createRun", async () => ({ start: async () => ({ status: "success" }) }));
+  const finalReviews = [];
+  const onReview = event => finalReviews.push(event);
+  bus.on("final-review", onReview);
+  try {
+    await withServer(async base => {
+      const response = await fetch(`${base}/api/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(brief) });
+      assert.equal(response.status, 200);
+      const { runId } = await response.json();
+      let run;
+      for (let i = 0; i < 100; i++) {
+        run = await (await fetch(`${base}/api/runs/${runId}`)).json();
+        if (run.status !== "running") break;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.equal(run.status, "failed");
+      assert.match(run.error, /已校验产物清单/);
+      assert.equal(finalReviews.filter(event => event.runId === runId).length, 0);
+    });
+  } finally {
+    bus.off("final-review", onReview);
+    app.locals.generationPreflightDependencies = previousDeps;
+    if (previousMode === undefined) delete process.env.PROMO_PROVIDER_MODE;
+    else process.env.PROMO_PROVIDER_MODE = previousMode;
+  }
+});

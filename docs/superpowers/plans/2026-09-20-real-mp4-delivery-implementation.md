@@ -408,35 +408,35 @@ git commit -m "feat(brand-promo): burn subtitles into persistent mp4"
 - Test: `tests/run-recovery.test.mjs`
 - Test: `tests/server.test.mjs`
 
-- [ ] **Step 1: Write failing workflow tests**
+- [x] **Step 1: Write failing workflow tests**
 
 Assert order `prepareVideo → voiceover → music → storyboard → generateScenes → composite`; TTS/music execute before image/video calls; storyboard count equals confirmed voiceover-line count; each scene duration equals the corresponding measured speech duration plus 120ms except the final scene, which has no trailing gap; summed Scene duration equals the authoritative timeline; every REAL scene requires normalized video; each provider/compositor error produces one `run-failed`; no failure reaches `awaiting_delivery` or `success`. Assert composite emits `{ step:"composite", status:"step-progress", phase:"validating", message:"正在校验成片" }` before artifact validation and final review.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `node --import ./tests/setup.mjs --test tests/workflow-real-budget.test.mjs tests/run-recovery.test.mjs tests/server.test.mjs`
 
 Expected: FAIL because the current workflow orders visuals first and catches failures as successful degradation.
 
-- [ ] **Step 3: Reorder steps and thread authoritative timing**
+- [x] **Step 3: Reorder steps and thread authoritative timing**
 
 Pass `{ brief, script, voice, music, timeline }` into storyboard; require one scene per confirmed voiceover line and overwrite each model-proposed duration with `timeline.sceneDurationsMs[index] / 1000`; pass normalized workspace paths through scenes into composite.
 
-- [ ] **Step 4: Remove REAL catches that return null/static fallbacks**
+- [x] **Step 4: Remove REAL catches that return null/static fallbacks**
 
 Keep DEMO behavior behind explicit provider-mode branches. In REAL, throw typed errors carrying safe `stage` and `message`; let the existing server phase boundary publish the single terminal failure.
 
-- [ ] **Step 5: Gate final review on validated artifacts**
+- [x] **Step 5: Gate final review on validated artifacts**
 
 At the start of final artifact validation, emit the defined composite `step-progress` event. Before setting `awaiting_delivery`, require `artifactManifest.validated === true` and persistent files. Send the persistent `/api/video/:runId` URL in `final-review`.
 
-- [ ] **Step 6: Run focused tests**
+- [x] **Step 6: Run focused tests**
 
 Run: `node --import ./tests/setup.mjs --test tests/workflow-real-budget.test.mjs tests/run-recovery.test.mjs tests/server.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit strict workflow semantics**
+- [x] **Step 7: Commit strict workflow semantics**
 
 ```powershell
 git add src/mastra/workflow.js src/server.js tests/workflow-real-budget.test.mjs tests/run-recovery.test.mjs tests/server.test.mjs

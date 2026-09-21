@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { mastra, prepareGenerationBrief, publishDelivery, STEP } from "./mastra/workflow.js";
 import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
-import { resolveRunArtifact } from "./media/artifacts.js";
+import { artifactPaths, resolveRunArtifact } from "./media/artifacts.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import { listCopyIdeas } from "./copyideas.js";
@@ -161,6 +161,34 @@ function requireSuccess(result, runId) {
   if (failedStep) throw new Error(failedStep.error || "核心步骤失败，无法交付");
 }
 
+/**
+ * REAL 模式成片门：发布成片前校验持久化产物确实完整可用。
+ * 说明：工作流返回 success 只代表 composite 步骤没有抛错；若产物被删除、被替换或未提升到运行目录，
+ * 仍不得进入交付或成片门，否则前端只会拿到 404 的成片地址。DEMO 模式无持久化产物，直接放行。
+ * @param {string} runId 用户态 runId。
+ * @throws {Error} 产物缺失、越界或 manifest 未标记 validated 时抛出，交由 failRun 收口。
+ * @example assertRealDeliveryReady("run-123");
+ */
+function assertRealDeliveryReady(runId) {
+  if (getProviderMode() !== "real") return;
+  const run = getRun(runId);
+  if (run?.artifactManifest?.validated !== true) throw new Error("真实成片缺少已校验产物清单，禁止进入交付");
+  const paths = artifactPaths(runId);
+  const required = [
+    ["finalVideo", paths.finalVideo],
+    ["subtitles", paths.subtitles],
+    ["manifest", paths.manifest],
+    ["poster", paths.poster],
+  ];
+  for (const [kind, target] of required) {
+    try {
+      resolveRunArtifact(runId, target);
+    } catch (error) {
+      throw new Error(`真实成片产物不可用（${kind}）：${error?.message || error}`);
+    }
+  }
+}
+
 // GET /api/video/:runId：以 HTTP 提供该 run 本机合成的 MP4（Range 支持，可直接 <video>/下载）。
 app.get("/api/video/:runId", (req, res) => {
   const run = getRun(req.params.runId);
@@ -229,12 +257,14 @@ async function runVideoPhase(runId, brief, opts = {}) {
   return mrun.start({ inputData: { brief, script, runId } })
     .then((result) => {
       requireSuccess(result, runId);
+      assertRealDeliveryReady(runId);
       const finalGate = opts.finalGate ?? brief.finalGateEnabled !== false;
       const r = getRun(runId);
       if (finalGate) {
         updateRun(runId, { status: "awaiting_delivery" });
         emitFinalReview(runId, {
-          videoUrl: r.videoUrl,
+          // 说明：REAL 的 videoUrl 是 file:// 本机路径，浏览器无法播放，必须换成受控路由；DEMO 保持原值。
+          videoUrl: getProviderMode() === "real" ? `/api/video/${runId}` : r.videoUrl,
           gallery: r.storyboard || r.storyboardGallery, // 优先完整分镜（含 videoUrl，成片门可预览动态片段）
           poster: r.poster,
           note: r.note,

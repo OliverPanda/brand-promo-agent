@@ -4,7 +4,7 @@
 //   Mastra v1.63 的 suspend() 在步骤体内「始终以 undefined resolve」，且 resume() 重跑被挂起步骤后
 //   **不会继续后续 DAG**（实测会卡在 suspended 步骤、下游步骤永不触发）。因此 HITL 门采用「短工作流 + server 冷启动」：
 //     - promoScript：ingestBrief → writeScript（suspend 为脚本人审门，是工作流最后一步）→ 结束。
-//     - promoVideo：prepareVideo → storyboard → scenes → voiceover → music → composite（终点，无 deliver）。
+//     - promoVideo：prepareVideo → voiceover → music → storyboard → generateScenes → composite（终点，无 deliver）。
 //       脚本门通过后由 server 冷启动；composite 完成后由 server 决定走「成片门」还是「直接交付」。
 //   **成片门（FR-9.2 / M3）不放在 Mastra 内 suspend**——改为 server 侧状态机（awaiting_delivery + final-review
 //   事件），规避 resume 续跑陷阱；approve 时直接调用纯函数 publishDelivery（标记 success + 广播 run-done）。
@@ -369,13 +369,16 @@ const storyboard = createStep({
   id: STEP.STORYBOARD,
   execute: async ({ runId, inputData }) => {
     const rid = inputData.runId || runId;
-    const { brief, script } = inputData;
+    const { brief, script, voice } = inputData;
     return withStep(rid, STEP.STORYBOARD, async () => {
-      const storyboard = await generateStoryboard(brief, script);
-      assertVoiceoverMatchesStoryboard(script, storyboard);
-      const tokens = (storyboard || []).reduce((a, s) => a + (s._usage?.tokens || 0), 0);
-      updateRun(rid, { storyboard });
-      return { brief, script, storyboard, runId: rid, _usage: tokens ? { tokens } : undefined };
+      // 说明：分镜在真实配音之后执行，模型只负责画面创意；每镜时长一律由实测语音时间轴覆盖，
+      // 保证「分镜数量 = 确认旁白句数」「分镜总时长 = 权威音轨时长」两条硬约束。
+      const proposed = await generateStoryboard(brief, script);
+      assertVoiceoverMatchesStoryboard(script, proposed);
+      const scenes = applyVoiceTimelineToStoryboard(script, proposed, voice);
+      const tokens = (proposed || []).reduce((a, s) => a + (s._usage?.tokens || 0), 0);
+      updateRun(rid, { storyboard: scenes });
+      return { brief, script, voice, storyboard: scenes, runId: rid, _usage: tokens ? { tokens } : undefined };
     });
   },
 });
@@ -384,51 +387,48 @@ const generateScenes = createStep({
   id: STEP.SCENES,
   execute: async ({ runId, inputData }) => {
     const rid = inputData.runId || runId;
-    const { brief, script, storyboard } = inputData;
+    const { brief, script, voice, storyboard } = inputData;
     return withStep(rid, STEP.SCENES, async () => {
+      assertVoiceoverMatchesStoryboard(script, storyboard);
       const scenes = [];
       // 受管工作区：图像/视频必须经共享物化器归一化后落盘到本次运行的 scenes 目录，
       // 后续预览、图生视频首帧与最终合成都只消费这些标准资产（不暴露渠道原始 URL 或本机路径）。
       const paths = artifactPaths(rid);
       const mediaOptions = { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes };
       for (const scene of storyboard) {
-        try {
-          const media = await generateSceneMedia(scene, brief, mediaOptions);
-          // mediaModel 透传实际使用的图像模型（brief.imageModel 请求级覆盖 > env 默认），供交付页展示
-          const done = { ...scene, mediaUrl: media.mediaUrl, mediaModel: media.model, status: "done" };
-          // 动态视频（图生/文生）：仅 real + brief.videoModel 时启用 —— 场景图 URL 作首帧生成动态镜头。
-          // 单镜失败降级为静态图（不阻断全片）；DEMO 模式 generateSceneVideo 返回 stub 不真调。
-          if (getProviderMode() === "real" && brief.videoModel) {
-            try {
-              const vid = await generateSceneVideo(done, brief, mediaOptions);
-              if (vid?.videoUrl) {
-                done.videoUrl = vid.videoUrl;
-                done.videoModel = vid.model;
-              }
-              emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: vid?.videoUrl ? "video-done" : "video-stub" });
-            } catch (err) {
-              emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: `video-failed:${String(err?.message || err).slice(0, 80)}` });
+        const media = await generateSceneMedia(scene, brief, mediaOptions);
+        // mediaModel 透传实际使用的图像模型（brief.imageModel 请求级覆盖 > env 默认），供交付页展示
+        const done = { ...scene, mediaUrl: media.mediaUrl, mediaModel: media.model, status: "done" };
+        // 说明：REAL 模式任一动态片段失败即整步失败（不再退回静态图）；DEMO 走 stub 不计费。
+        if (getProviderMode() === "real") {
+          if (!brief.videoModel) throw new Error("真实成片要求动态视频模型（Brief.videoModel 未解析）");
+          const vid = await generateSceneVideo(done, brief, mediaOptions);
+          if (!vid?.videoPath) throw new Error(`第 ${done.index} 镜未产出标准化动态片段，真实成片不允许静态降级`);
+          done.videoPath = vid.videoPath;
+          done.videoUrl = vid.videoUrl;
+          done.videoModel = vid.model;
+          emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: "video-done" });
+        } else {
+          if (brief.videoModel) {
+            const vid = await generateSceneVideo(done, brief, mediaOptions);
+            if (vid?.videoUrl) {
+              done.videoUrl = vid.videoUrl;
+              done.videoModel = vid.model;
             }
-          } else {
-            emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: "done" });
           }
-          scenes.push(done);
-        } catch (err) {
-          // 单场景失败不阻断全片（PRD FR-4.3 / NFR 可靠性）
-          const failed = { ...scene, mediaUrl: null, status: "failed", error: String(err?.message || err) };
-          scenes.push(failed);
-          emitProgress(rid, STEP.SCENES, "step-progress", { scene: failed.index, result: "failed" });
+          emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: "done" });
         }
+        scenes.push(done);
       }
       updateRun(rid, { storyboard: scenes });
       const images = getProviderMode() === "real" ? scenes.length : 0;
-      const videos = getProviderMode() === "real" && brief.videoModel ? scenes.filter((s) => s.videoUrl).length : 0;
+      const videos = getProviderMode() === "real" && brief.videoModel ? scenes.filter((s) => s.videoPath).length : 0;
       const usage = images ? { images } : undefined;
       if (videos) {
         usage.videos = videos;
         usage.videoModel = brief.videoModel; // 供 costFor 命中按次真实单价（中转站 /api/pricing，见 cost.js）
       }
-      return { brief, script, storyboard: scenes, runId: rid, _usage: usage };
+      return { brief, script, voice, storyboard: scenes, runId: rid, _usage: usage };
     });
   },
 });
@@ -467,13 +467,12 @@ const voiceover = createStep({
   id: STEP.VOICE,
   execute: async ({ runId, inputData }) => {
     const rid = inputData.runId || runId;
-    const { brief, script, storyboard } = inputData;
+    const { brief, script } = inputData;
     return withStep(rid, STEP.VOICE, async () => {
-      assertVoiceoverMatchesStoryboard(script, storyboard);
+      // 说明：TTS/配乐必须早于任何场景图与动态视频付费调用 —— 音频通道不可用时在零素材成本处失败。
       const voice = await generateVoiceover(script, brief, { workspace: artifactPaths(rid).audio });
-      const timedStoryboard = applyVoiceTimelineToStoryboard(script, storyboard, voice);
-      updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt, storyboard: timedStoryboard });
-      return { brief, script, storyboard: timedStoryboard, voice, runId: rid, _usage: voice._usage };
+      updateRun(rid, { voiceUrl: voice.voiceUrl, srt: voice.srt });
+      return { brief, script, voice, runId: rid, _usage: voice._usage };
     });
   },
 });
@@ -482,11 +481,11 @@ const music = createStep({
   id: STEP.MUSIC,
   execute: async ({ runId, inputData }) => {
     const rid = inputData.runId || runId;
-    const { brief, script, storyboard, voice } = inputData;
+    const { brief, script, voice } = inputData;
     return withStep(rid, STEP.MUSIC, async () => {
-      const music = await generateMusic(brief, storyboard, { workspace: artifactPaths(rid).audio });
+      const music = await generateMusic(brief, undefined, { workspace: artifactPaths(rid).audio });
       updateRun(rid, { musicUrl: music.musicUrl });
-      return { brief, script, storyboard, voice, music, runId: rid, _usage: music._usage };
+      return { brief, script, voice, music, runId: rid, _usage: music._usage };
     });
   },
 });
@@ -499,11 +498,11 @@ const compositeStep = createStep({
     return withStep(rid, STEP.COMPOSITE, async () => {
       const paths = artifactPaths(rid);
       emitProgress(rid, STEP.COMPOSITE, "step-progress", { phase: "compositing", message: "正在合成成片" });
+      emitProgress(rid, STEP.COMPOSITE, "step-progress", { phase: "validating", message: "正在校验成片" });
       const result = await composite(storyboard, voice, music, brief, { paths });
       if (getProviderMode() === "real" && result.validated !== true) {
         throw new Error("真实合成未通过成片校验，禁止进入交付");
       }
-      emitProgress(rid, STEP.COMPOSITE, "step-progress", { phase: "validating", message: "正在校验成片" });
       updateRun(rid, {
         poster: result.poster,
         storyboardGallery: result.storyboardGallery,
@@ -520,10 +519,10 @@ const compositeStep = createStep({
 
 export const videoWorkflow = createWorkflow({ id: "promoVideo" })
   .then(prepareVideo)
-  .then(storyboard)
-  .then(generateScenes)
   .then(voiceover)
   .then(music)
+  .then(storyboard)
+  .then(generateScenes)
   .then(compositeStep)
   .commit();
 
