@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { mastra, prepareGenerationBrief, publishDelivery, STEP } from "./mastra/workflow.js";
 import { getProviderMode } from "./mastra/providers.js";
 import { getBudgetCap } from "./cost.js";
+import { resolveRunArtifact } from "./media/artifacts.js";
 import { getQuotaCap, checkQuota, getUsage } from "./quota.js";
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate, isPresetTemplate } from "./templates.js";
 import { listCopyIdeas } from "./copyideas.js";
@@ -57,16 +58,67 @@ const app = express();
 app.use(express.json());
 app.use(express.static(PUBLIC_DIR));
 
-// ── 本机合成成片（file://）→ HTTP 可播放 ───────────────────────────
-// composite 产物落服务端临时目录，videoUrl 形如 file://C:\...\out.mp4，浏览器无法直接打开。
-// 统一映射为 /api/video/<runId>（sendFile 自带 Range，<video> 可拖动进度）；无本机视频则原样返回。
+// ── 本机产物（file://）→ 受控 HTTP 路由 ───────────────────────────
+// 服务端产物落受管运行目录（data/outputs/<runId>/），videoUrl/mediaUrl 形如 file://C:\...\out.mp4。
+// 浏览器无法打开 file://，也不能把本机绝对路径暴露给前端：统一改写为受控路由，由服务端校验路径边界后回源。
 function toPublicVideoUrl(runId, url) {
   if (typeof url === "string" && url.startsWith("file://")) return `/api/video/${runId}`;
   return url;
 }
+
+// 场景资产受控路由：只暴露 runId + 镜号，真实路径留在服务端。
+const SCENE_MEDIA_ROUTE = /^\/api\/runs\/[A-Za-z0-9_-]+\/scenes\/\d+\/(?:image|video)$/;
+
+function contentTypeFor(file) {
+  switch (path.extname(file).toLowerCase()) {
+    case ".png": return "image/png";
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".webp": return "image/webp";
+    case ".gif": return "image/gif";
+    case ".webm": return "video/webm";
+    default: return "video/mp4";
+  }
+}
+
+/**
+ * 把分镜媒体字段改写为受控路由，并剥离服务端绝对路径。
+ * @param {string} runId 用户态 runId。
+ * @param {Array<Record<string, unknown>> | undefined} storyboard 原始分镜。
+ * @returns {Array<Record<string, unknown>> | undefined} 可安全返回给前端的分镜。
+ * @example toPublicStoryboard("run-1", run.storyboard);
+ */
+function toPublicStoryboard(runId, storyboard) {
+  if (!Array.isArray(storyboard)) return storyboard;
+  return storyboard.map((scene, position) => {
+    if (!scene || typeof scene !== "object") return scene;
+    const { mediaPath, videoPath, ...rest } = scene;
+    const index = Number.isInteger(scene.index) && scene.index > 0 ? scene.index : position + 1;
+    const route = (kind) => `/api/runs/${runId}/scenes/${index}/${kind}`;
+    const hasImage = typeof mediaPath === "string" && mediaPath !== "";
+    const hasVideo = typeof videoPath === "string" && videoPath !== "";
+    return {
+      ...rest,
+      mediaUrl: hasImage ? route("image")
+        : typeof rest.mediaUrl === "string" && rest.mediaUrl.startsWith("file://") ? (hasImage ? route("image") : null)
+          : rest.mediaUrl,
+      videoUrl: hasVideo ? route("video")
+        : typeof rest.videoUrl === "string" && rest.videoUrl.startsWith("file://") ? route("video")
+          : rest.videoUrl,
+    };
+  });
+}
+
 function toPublicRun(runId, run) {
   if (!run || typeof run !== "object") return run;
-  return { ...run, videoUrl: toPublicVideoUrl(runId, run.videoUrl) };
+  return {
+    ...run,
+    videoUrl: toPublicVideoUrl(runId, run.videoUrl),
+    voiceUrl: typeof run.voiceUrl === "string" && run.voiceUrl.startsWith("file://") ? null : run.voiceUrl,
+    musicUrl: typeof run.musicUrl === "string" && run.musicUrl.startsWith("file://") ? null : run.musicUrl,
+    poster: typeof run.poster === "string" && run.poster.startsWith("file://") ? null : run.poster,
+    storyboard: toPublicStoryboard(runId, run.storyboard),
+  };
 }
 
 function failRun(runId, error) {
@@ -97,6 +149,43 @@ app.get("/api/video/:runId", (req, res) => {
   const file = url.slice(7);
   if (!fs.existsSync(file)) return res.status(404).json({ error: "视频文件已不存在（临时目录被清理？）" });
   res.sendFile(file, { headers: { "Content-Type": "video/mp4", "Cache-Control": "private, max-age=300" } });
+});
+
+// GET /api/runs/:runId/scenes/:index/(image|video)：受控提供标准场景资产。
+// 只按 runId + 镜号索引服务端已登记的分镜，真实路径经 resolveRunArtifact 校验必须落在本 run 目录内；
+// 越界路径、缺失文件、非法镜号一律 404，不泄漏本机路径。
+app.get("/api/runs/:runId/scenes/:index/:kind", (req, res) => {
+  const { runId, index, kind } = req.params;
+  if (!["image", "video"].includes(kind) || !SCENE_MEDIA_ROUTE.test(`/api/runs/${runId}/scenes/${index}/${kind}`)) {
+    return res.status(400).json({ error: "非法场景媒体请求" });
+  }
+  const run = getRun(runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  const position = Number(index) - 1;
+  const scene = Array.isArray(run.storyboard) ? run.storyboard.find((item, i) =>
+    (Number.isInteger(item?.index) && item.index === Number(index)) || i === position) : undefined;
+  if (!scene) return res.status(404).json({ error: "场景不存在" });
+  const candidate = kind === "image"
+    ? scene.mediaPath || (typeof scene.mediaUrl === "string" && scene.mediaUrl.startsWith("file://") ? scene.mediaUrl : null)
+    : scene.videoPath || (typeof scene.videoUrl === "string" && scene.videoUrl.startsWith("file://") ? scene.videoUrl : null);
+  if (!candidate) return res.status(404).json({ error: "场景媒体不存在" });
+  let file;
+  try {
+    file = resolveRunArtifact(runId, candidate);
+  } catch {
+    return res.status(404).json({ error: "场景媒体不存在" });
+  }
+  res.sendFile(file, {
+    headers: {
+      "Content-Type": contentTypeFor(file),
+      "Cache-Control": "private, max-age=300",
+      "X-Content-Type-Options": "nosniff",
+    },
+  }, (error) => {
+    if (!error) return;
+    if (res.headersSent) return res.destroy();
+    res.status(error.statusCode === 404 || error.code === "ENOENT" ? 404 : 500).json({ error: "场景媒体读取失败" });
+  });
 });
 
 // 第二段：基于已批准脚本冷启动成片工作流（无 suspend，止于 composite）。
@@ -218,7 +307,9 @@ app.get("/api/generate/:runId/stream", (req, res) => {
   const onFinalReview = (e) => {
     if (e.runId !== runId) return;
     // file:// 成片 → HTTP 可预览
-    const p = e.preview && typeof e.preview === "object" ? { ...e.preview, videoUrl: toPublicVideoUrl(e.runId, e.preview.videoUrl) } : e.preview;
+    const p = e.preview && typeof e.preview === "object"
+      ? { ...e.preview, videoUrl: toPublicVideoUrl(e.runId, e.preview.videoUrl), gallery: toPublicStoryboard(e.runId, e.preview.gallery) }
+      : e.preview;
     res.write(`event: final-review\ndata: ${JSON.stringify({ ...e, preview: p })}\n\n`); // 非终态，不关闭流
   };
   const finish = (type, e) => {

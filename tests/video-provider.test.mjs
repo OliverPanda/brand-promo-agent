@@ -4,7 +4,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { generateSceneVideo } from "../src/mastra/providers.js";
+import { artifactPaths } from "../src/media/artifacts.js";
 import { setRuntimeConfig, getEffectiveOneApiBase } from "../src/runtime-config.js";
 
 function listen(handler) {
@@ -312,5 +317,40 @@ test("generateSceneVideo：横屏画布尺寸与比例进入 provider payload", 
     assert.equal(gotBody.size, "1920x1080");
   } finally {
     stub.close();
+  }
+});
+
+test("generateSceneVideo：I2V 首帧来自受管标准图字节，不发送原始 URL 或本地路径", async () => {
+  const previousOutputRoot = process.env.PROMO_OUTPUT_ROOT;
+  const outputRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-i2v-"));
+  process.env.PROMO_OUTPUT_ROOT = outputRoot;
+  const paths = artifactPaths("video-provider-i2v");
+  const mediaPath = path.join(paths.scenes, "scene-image.png");
+  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=purple:s=1080x1920", "-frames:v", "1", mediaPath], { stdio: "pipe" });
+  let gotBody = null;
+  const stub = await listen(async (req, res) => {
+    if (req.method === "POST" && req.url === "/videos/generations") {
+      gotBody = await readBody(req);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ url: "https://cdn.example.com/result.mp4" }));
+    } else {
+      res.statusCode = 404; res.end();
+    }
+  });
+  try {
+    const localScene = { ...scene, mediaUrl: "https://untrusted.example/original.png", mediaPath };
+    await withReal(stub, () => generateSceneVideo(localScene, {
+      ...brief,
+      videoModel: "kling-v1-6",
+    }, { scenesWorkspace: paths.scenes }));
+    assert.match(gotBody.image, /^data:image\/png;base64,/u);
+    assert.notEqual(gotBody.image, localScene.mediaUrl);
+    assert.equal(gotBody.image.includes(mediaPath), false, "请求体不得含本地路径");
+    assert.deepEqual(Buffer.from(gotBody.image.split(",")[1], "base64"), fs.readFileSync(mediaPath));
+  } finally {
+    stub.close();
+    if (previousOutputRoot === undefined) delete process.env.PROMO_OUTPUT_ROOT;
+    else process.env.PROMO_OUTPUT_ROOT = previousOutputRoot;
+    fs.rmSync(outputRoot, { recursive: true, force: true });
   }
 });

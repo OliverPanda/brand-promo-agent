@@ -438,13 +438,16 @@ export async function generateSceneVideo(scene, brief, options = {}) {
     height: canvas.height,
     size: `${canvas.width}x${canvas.height}`,
   };
-  const ref = scene.mediaUrl;
-  if (ref && /^https?:\/\//i.test(ref)) body.image = ref; // 图生视频：首帧用本镜场景图
-  else if (ref && /^data:image\//i.test(ref)) body.image = ref;
-  else if (scene.mediaPath && options.scenesWorkspace) {
-    // 先交由共享物化器验证场景图确实位于本次受管目录，再编码为 provider 可消费的 data URL；绝不发送本地路径。
+  // 首帧来源：真实工作流必须传入受管目录，只把已物化、已按画布标准化的本地场景图编码为 data URL 交给渠道，
+  // 既不发送原始 http(s)/data 来源，也不泄露本机路径（provider 侧无本地文件访问权限）。
+  if (options.scenesWorkspace) {
+    if (!scene.mediaPath) throw new Error("真实视频生成缺少已标准化的本机场景图（scene.mediaPath）");
     const safeImage = await materializeMedia({ source: scene.mediaPath, kind: "image", workspace: options.scenesWorkspace });
     body.image = `data:image/png;base64,${fs.readFileSync(safeImage).toString("base64")}`;
+  } else {
+    const ref = scene.mediaUrl;
+    if (ref && /^https?:\/\//i.test(ref)) body.image = ref; // 无受管目录（单元/兼容调用）：沿用原始图生视频入参
+    else if (ref && /^data:image\//i.test(ref)) body.image = ref;
   }
   const timeoutMs = Number(process.env.PROMO_VIDEO_SUBMIT_TIMEOUT_MS ?? 30000);
   let data = null, submitErr = null;

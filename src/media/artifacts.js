@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 
 /** 媒体下载、验收和时间轴使用的统一阈值。 */
 export const MEDIA_LIMITS = {
@@ -169,6 +170,39 @@ function resolveArtifactPaths(runId, createDirectories) {
  */
 export function artifactPaths(runId) {
   return resolveArtifactPaths(runId, true);
+}
+
+/**
+ * 将受控运行目录内的既有产物解析为真实绝对路径（只读，不创建目录）。
+ *
+ * @param {string} runId 服务端生成的运行 ID。
+ * @param {string} candidate 运行目录内的候选路径，或指向该文件的 file:// URL。
+ * @returns {string} 位于该 run 目录内、非符号链接的真实文件绝对路径。
+ * @throws {Error} runId 非法、文件不存在、越界或为链接时抛出。
+ * @example resolveRunArtifact("run-123", "file:///.../scene-image.png");
+ */
+export function resolveRunArtifact(runId, candidate) {
+  validateRunId(runId);
+  if (typeof candidate !== "string" || candidate.trim() === "") throw new Error("产物路径不能为空");
+  const configuredRoot = outputRoot();
+  if (!fs.existsSync(configuredRoot)) throw new Error("运行产物根目录不存在");
+  const root = fs.realpathSync(configuredRoot);
+  const runRoot = path.resolve(root, runId);
+  if (!isContained(root, runRoot)) throw new Error("非法 runId：产物路径越界");
+  rejectLink(runRoot, "runRoot");
+  const realRunRoot = fs.realpathSync(runRoot);
+  if (realRunRoot !== runRoot) throw new Error("运行产物目录不得包含符号链接或目录联接");
+  let resolved;
+  try {
+    resolved = candidate.startsWith("file:") ? fileURLToPath(new URL(candidate)) : path.resolve(candidate);
+  } catch {
+    throw new Error("产物路径无效");
+  }
+  if (!isContained(realRunRoot, resolved)) throw new Error("产物路径越界：不在本次运行目录内");
+  rejectLink(resolved, "产物文件");
+  const realTarget = fs.realpathSync(resolved);
+  if (!isContained(realRunRoot, realTarget) || !fs.statSync(realTarget).isFile()) throw new Error("产物不存在或不是普通文件");
+  return realTarget;
 }
 
 /**

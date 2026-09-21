@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 process.env.STEP_DELAY_MS = "10"; // 加速测试，避免每步 400ms 真实停顿
 
@@ -26,6 +30,58 @@ const baseBrief = {
   language: "zh-CN",
   voiceTone: "男声",
 };
+
+test("场景资产只通过受控 URL 暴露，图片 MIME 正确、视频支持 Range 且不泄漏本地路径", async () => {
+  const previousOutputRoot = process.env.PROMO_OUTPUT_ROOT;
+  const outputRoot = fs.mkdtempSync(path.join(os.tmpdir(), "promo-scene-routes-"));
+  process.env.PROMO_OUTPUT_ROOT = outputRoot;
+  const { artifactPaths } = await import("../src/media/artifacts.js");
+  const { createRun, updateRun } = await import("../src/store.js");
+  const { app } = await import("../src/server.js");
+  const runId = `scene-route-${Date.now()}`;
+  const paths = artifactPaths(runId);
+  const mediaPath = path.join(paths.scenes, "scene-image.png");
+  const videoPath = path.join(paths.scenes, "scene-video.mp4");
+  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=orange:s=1080x1920", "-frames:v", "1", mediaPath], { stdio: "pipe" });
+  execFileSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=blue:s=1080x1920:r=25:d=1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", videoPath], { stdio: "pipe" });
+  createRun(runId, baseBrief);
+  updateRun(runId, { storyboard: [{ index: 1, mediaPath, videoPath, mediaUrl: `file://${mediaPath}`, videoUrl: `file://${videoPath}` }] });
+
+  const server = app.listen(0);
+  const port = server.address().port;
+  try {
+    const runResponse = await fetch(`${BASE(port)}/api/runs/${runId}`);
+    assert.equal(runResponse.status, 200);
+    const publicRun = await runResponse.json();
+    const serialized = JSON.stringify(publicRun);
+    assert.equal(serialized.includes(outputRoot), false);
+    assert.equal(serialized.includes("file://"), false);
+    assert.equal(publicRun.storyboard[0].mediaPath, undefined);
+    assert.equal(publicRun.storyboard[0].videoPath, undefined);
+    assert.equal(publicRun.storyboard[0].mediaUrl, `/api/runs/${runId}/scenes/1/image`);
+    assert.equal(publicRun.storyboard[0].videoUrl, `/api/runs/${runId}/scenes/1/video`);
+
+    const imageResponse = await fetch(`${BASE(port)}${publicRun.storyboard[0].mediaUrl}`);
+    assert.equal(imageResponse.status, 200);
+    assert.equal(imageResponse.headers.get("content-type"), "image/png");
+    assert.ok((await imageResponse.arrayBuffer()).byteLength > 100);
+
+    const videoResponse = await fetch(`${BASE(port)}${publicRun.storyboard[0].videoUrl}`, { headers: { Range: "bytes=0-99" } });
+    assert.equal(videoResponse.status, 206);
+    assert.equal(videoResponse.headers.get("content-type"), "video/mp4");
+    assert.match(videoResponse.headers.get("content-range") || "", /^bytes 0-99\//u);
+
+    updateRun(runId, { storyboard: [{ index: 1, mediaPath: path.join(outputRoot, "outside.png") }] });
+    fs.copyFileSync(mediaPath, path.join(outputRoot, "outside.png"));
+    const escaped = await fetch(`${BASE(port)}/api/runs/${runId}/scenes/1/image`);
+    assert.equal(escaped.status, 404);
+  } finally {
+    server.close();
+    if (previousOutputRoot === undefined) delete process.env.PROMO_OUTPUT_ROOT;
+    else process.env.PROMO_OUTPUT_ROOT = previousOutputRoot;
+    fs.rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
 
 test("prepareGenerationBrief：REAL 成功预检写回画布与模型审计字段", async () => {
   const { prepareGenerationBrief } = await import("../src/mastra/workflow.js");

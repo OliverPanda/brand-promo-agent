@@ -404,16 +404,20 @@ const generateScenes = createStep({
     const { brief, script, storyboard } = inputData;
     return withStep(rid, STEP.SCENES, async () => {
       const scenes = [];
+      // 受管工作区：图像/视频必须经共享物化器归一化后落盘到本次运行的 scenes 目录，
+      // 后续预览、图生视频首帧与最终合成都只消费这些标准资产（不暴露渠道原始 URL 或本机路径）。
+      const paths = artifactPaths(rid);
+      const mediaOptions = { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes };
       for (const scene of storyboard) {
         try {
-          const media = await generateSceneMedia(scene, brief);
+          const media = await generateSceneMedia(scene, brief, mediaOptions);
           // mediaModel 透传实际使用的图像模型（brief.imageModel 请求级覆盖 > env 默认），供交付页展示
           const done = { ...scene, mediaUrl: media.mediaUrl, mediaModel: media.model, status: "done" };
           // 动态视频（图生/文生）：仅 real + brief.videoModel 时启用 —— 场景图 URL 作首帧生成动态镜头。
           // 单镜失败降级为静态图（不阻断全片）；DEMO 模式 generateSceneVideo 返回 stub 不真调。
           if (getProviderMode() === "real" && brief.videoModel) {
             try {
-              const vid = await generateSceneVideo(done, brief);
+              const vid = await generateSceneVideo(done, brief, mediaOptions);
               if (vid?.videoUrl) {
                 done.videoUrl = vid.videoUrl;
                 done.videoModel = vid.model;
