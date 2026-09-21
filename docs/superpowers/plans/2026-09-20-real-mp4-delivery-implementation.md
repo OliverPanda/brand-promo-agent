@@ -503,12 +503,13 @@ git commit -m "feat(brand-promo): expose validated delivery artifacts"
 - Modify: `public/index.html`
 - Modify: `tests/frontend-recovery.test.mjs`
 - Create: `tests/frontend-delivery.test.mjs`
+- Create: `tests/helpers/frontend-harness.mjs`
 
-- [ ] **Step 1: Read the required PC design spec before editing UI**
+- [x] **Step 1: Read the required PC design spec before editing UI**
 
 Read: `../spec/design/pc-design.md`.
 
-- [ ] **Step 2: Write failing frontend tests**
+- [x] **Step 2: Write failing frontend tests**
 
 Extract/evaluate the inline script using the existing VM harness. Assert:
 
@@ -521,33 +522,33 @@ Extract/evaluate the inline script using the existing VM harness. Assert:
 - rerun response switches to the new runId and opens a fresh SSE stream;
 - historical fallback run is labeled and has no MP4-delivery claim.
 
-- [ ] **Step 3: Run frontend tests and verify RED**
+- [x] **Step 3: Run frontend tests and verify RED**
 
 Run: `node --test tests/frontend-recovery.test.mjs tests/frontend-delivery.test.mjs`
 
 Expected: FAIL for missing canvas/default/delivery/retry UI.
 
-- [ ] **Step 4: Add canvas and automatic model controls**
+- [x] **Step 4: Add canvas and automatic model controls**
 
 Use existing fieldset/token styles. Default to “竖屏短视频 1080×1920”; options are “横屏 1920×1080” and “方形 1080×1080”. Display “自动（当前：model）” as the default video choice and preserve manual selection.
 
-- [ ] **Step 5: Update final review and delivery rendering**
+- [x] **Step 5: Update final review and delivery rendering**
 
 Use `/api/video/:runId` in a `<video controls>` player and render explicit artifact download buttons. Display canvas, resolved video/TTS/music models, duration and validation state from manifest-safe run fields.
 
 During composite validation, consume the server progress event and set the composite step metadata to “正在校验成片”; clear it only when the validated snapshot/final-review arrives. Add a VM assertion so this state cannot regress.
 
-- [ ] **Step 6: Implement failure rerun UI**
+- [x] **Step 6: Implement failure rerun UI**
 
 Show the safe error stage/reason. POST `/api/runs/:runId/rerun`; while pending disable the button; after 201 call `selectRun(newRunId)` and `openStream(newRunId)`.
 
-- [ ] **Step 7: Run frontend tests**
+- [x] **Step 7: Run frontend tests**
 
 Run: `node --test tests/frontend-recovery.test.mjs tests/frontend-delivery.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit frontend delivery UX**
+- [x] **Step 8: Commit frontend delivery UX**
 
 ```powershell
 git add public/index.html tests/frontend-recovery.test.mjs tests/frontend-delivery.test.mjs

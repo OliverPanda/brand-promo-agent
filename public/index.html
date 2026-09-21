@@ -277,6 +277,15 @@
   a.dl:hover { border-bottom-style:solid; }
   .kv { display:flex; flex-wrap:wrap; gap:4px var(--sp-3); font-size:12.5px; color:var(--sub); margin-top:var(--sp-2); }
   .kv b { color:var(--txt); font-weight:600; }
+  /* 成片播放器：竖屏/横屏/方形三种画布都不得溢出卡片（UI 规范：播放器须覆盖 1440/768/375 三视口） */
+  .final-video { display:block; width:100%; max-width:420px; height:auto; max-height:440px; margin-top:var(--sp-2);
+                 background:#000; border:1px solid var(--line); border-radius:var(--r-sm); }
+  /* 产物下载行：点击区不小于 36px，触屏与鼠标均可点 */
+  .dlbar { display:flex; flex-wrap:wrap; gap:var(--sp-2) var(--sp-4); margin-top:var(--sp-3); align-items:center; }
+  .dlbar a.dl { display:inline-flex; align-items:center; min-height:36px; }
+  /* 失败态：与成功交付视觉区分，红色仅用于本态 */
+  .fail-box { border:1px solid #f0c7c3; background:var(--bad-soft); border-radius:var(--r-sm); padding:var(--sp-3); }
+  .fail-box .fail-hd { font-weight:650; color:var(--bad); margin-bottom:var(--sp-2); }
   .cost-box { margin-top:var(--sp-3); padding:var(--sp-3); border:1px solid var(--line); border-radius:var(--r-sm); background:var(--card-inset); }
   .cost-box ul { margin:var(--sp-2) 0 0; padding-left:18px; font-size:12.5px; color:var(--sub); }
 
@@ -467,6 +476,14 @@
 
     <fieldset class="grp">
       <legend>成片规格</legend>
+      <div class="field">
+        <label class="lbl" for="canvasPreset">画布尺寸 <span class="opt">（分镜构图、成片分辨率与字幕安全区统一按此执行）</span></label>
+        <select id="canvasPreset">
+          <option value="social-portrait" selected>竖屏短视频 1080×1920（9:16）</option>
+          <option value="social-landscape">横屏短视频 1920×1080（16:9）</option>
+          <option value="social-square">方形短视频 1080×1080（1:1）</option>
+        </select>
+      </div>
       <div class="grid3">
         <div class="field">
           <label class="lbl" for="durationSec">期望时长</label>
@@ -1290,19 +1307,81 @@ function fillModelSelect(id, def, extra) {
     sel.appendChild(o);
   });
 }
-// 视频模型下拉：语义同 llm/image 的「默认」，但默认 = 不启用动态视频；清单来自网关（/api/models.video）。
+// 画布与动态视频的默认值常量：画布 id 与服务端 src/media/canvas.js 枚举一一对应。
+const DEFAULT_CANVAS_PRESET = "social-portrait";
+const CANVAS_LABEL = {
+  "social-portrait": "竖屏短视频 1080×1920（9:16）",
+  "social-landscape": "横屏短视频 1920×1080（16:9）",
+  "social-square": "方形短视频 1080×1080（1:1）",
+};
+// 自动优先级与服务端 src/media/model-selection.js 保持一致（minimax-h3 → 7zhe-seedance → seedance-2.0）。
+const VIDEO_MODEL_PRIORITY = ["minimax-h3", "7zhe-seedance", "seedance-2.0"];
+const SEEDANCE_20_RE = /seedance[-_.]?2[-_.]?0/i;
+const MODEL_SELECTION_LABEL = { manual: "手动指定", configured: "服务端配置", automatic: "自动优先级", demo: "DEMO 占位" };
+
+/**
+ * 在网关实时清单里解析「自动」会选中的动态视频模型。
+ * 说明：下拉留空表示交给服务端自动解析，界面必须把解析结果显示出来；
+ * 否则用户看到的是「不启用」而实际会调用动态视频，属于误导，也无法确认优先级是否生效。
+ *
+ * @param {{current?: string}} [videoDef] GET /api/config 返回的 models.video。
+ * @param {string[]} [list] GET /api/models 返回的实时视频模型 ID。
+ * @returns {string} 自动选中的模型 ID；清单不可用时回落配置默认值或空串。
+ * @example pickDefaultVideoModel({ current: "" }, ["7zhe-seedance", "minimax-h3"]); // "minimax-h3"
+ */
+function pickDefaultVideoModel(videoDef, list) {
+  const choices = [...new Set((list || []).filter((m) => typeof m === "string" && m))];
+  for (const exact of VIDEO_MODEL_PRIORITY) if (choices.includes(exact)) return exact;
+  const compatible = choices.filter((id) => SEEDANCE_20_RE.test(id));
+  compatible.sort((a, b) => {
+    const rank = (id) => (/mini/i.test(id) ? 2 : /fast/i.test(id) ? 1 : 0);
+    return rank(a) - rank(b) || a.localeCompare(b, "en");
+  });
+  return compatible[0] || videoDef?.current || "";
+}
+
+/**
+ * 回显模型选择来源，便于用户确认「自动」到底走了哪条路径。
+ * @param {"manual"|"configured"|"automatic"|"demo"|undefined} source 服务端记录的选择来源。
+ * @returns {string} 中文来源说明。
+ * @example selectionSourceLabel("automatic"); // "自动优先级"
+ */
+function selectionSourceLabel(source) { return MODEL_SELECTION_LABEL[source] || "未记录"; }
+
+/**
+ * 判断 run 是否真的交付了经过校验的 MP4 成片。
+ * 说明：DEMO 与历史 run 只有分镜故事板，绝不能显示成「成片已交付」；
+ * REAL 交付必须同时具备成片地址与 manifest.validated，二者缺一即视为降级产物。
+ *
+ * @param {{videoUrl?: string|null, artifactManifest?: {validated?: boolean}}} [run] 运行快照。
+ * @returns {boolean} 是否可宣称 MP4 成片交付。
+ * @example isMp4Delivery({ videoUrl: "/api/video/r1", artifactManifest: { validated: true } }); // true
+ */
+function isMp4Delivery(run) { return !!run?.videoUrl && run?.artifactManifest?.validated === true; }
+
+/**
+ * 画布 id 转中文标签；未知 id 直接回显，避免静默显示成默认竖屏。
+ * @param {string} [id] 画布预设标识。
+ * @returns {string} 中文画布说明。
+ * @example canvasLabel("social-square");
+ */
+function canvasLabel(id) { return CANVAS_LABEL[id] || (id ? id : CANVAS_LABEL[DEFAULT_CANVAS_PRESET]); }
+
+// 视频模型下拉：首项「自动（当前：xxx）」值留空 = 服务端按优先级解析；其余为网关实时清单，可手动覆盖。
 function fillVideoModelSelect(videoDef, list) {
   const sel = document.getElementById("videoModel");
   if (!sel) return;
   sel.innerHTML = "";
-  const cur = videoDef?.current || "";
+  const auto = pickDefaultVideoModel(videoDef, list);
   const o0 = document.createElement("option");
   o0.value = "";
-  o0.textContent = cur ? `默认（${cur}）` : "不启用";
+  o0.textContent = auto ? `自动（当前：${auto}）` : "自动（等待网关返回动态视频模型）";
   sel.appendChild(o0);
   const seen = new Set();
-  if (cur) seen.add(cur);
-  (list || []).forEach((m) => {
+  if (auto) seen.add(auto);
+  const manual = (list || []).slice();
+  if (videoDef?.current) manual.push(videoDef.current);
+  manual.forEach((m) => {
     if (!m || seen.has(m)) return;
     seen.add(m);
     const o = document.createElement("option");
@@ -1394,6 +1473,8 @@ async function submitBrief() {
   const brief = {
     brandName: v("brandName"), productName: v("productName"), coreSellingPoint: v("coreSellingPoint"),
     durationSec: Number(v("durationSec")), language: v("language"), voiceTone: v("voiceTone"),
+    // 说明：画布决定分镜尺寸、成片分辨率与字幕安全区；留空回落到服务端默认竖屏 1080×1920。
+    canvasPreset: v("canvasPreset") || DEFAULT_CANVAS_PRESET,
     audience: [...audienceSel], tones: [...toneSel],
     keyMessages: v("keyMessages").split("\n").map(s=>s.trim()).filter(Boolean),
     styleReference: v("styleReference") || undefined, hitlEnabled: document.getElementById("hitlEnabled").checked,
@@ -1473,7 +1554,13 @@ function applyRunSnapshot(run) {
   updateProgress();
   closeRunGates();
   if (run.status === "success") onDone(run);
-  else if (run.status === "failed") onFailed(run.error || Object.values(run.steps || {}).find(s => s.error)?.error);
+  else if (run.status === "failed") {
+    // 说明：快照里才有「哪个 step 失败」，必须在这里记录，否则 onFailed 只能显示一句笼统错误。
+    const failed = Object.entries(run.steps || {}).find(([, s]) => s?.status === "failed");
+    const reason = failed?.[1]?.error || run.error || Object.values(run.steps || {}).find(s => s?.error)?.error;
+    rememberFailedStage(failed?.[0], reason);
+    onFailed(reason);
+  }
   else if (run.status === "suspended" && run.script) showGate(run.script);
   else if (run.status === "awaiting_delivery") onFinalReview({ preview: {
     videoUrl: run.videoUrl, gallery: run.storyboard || run.storyboardGallery, poster: run.poster, note: run.note,
@@ -1500,12 +1587,62 @@ async function restoreRun() {
     setTimeout(restoreRun, 5000);
   }
 }
+// 失败重跑状态：失败阶段来自快照或 step-failed 事件；rerunPending 防止双击造成重复计费。
+let failedStage = null, rerunPending = false;
+function rememberFailedStage(id, error) {
+  failedStage = { id: id || "", label: STEP_LABEL[id] || id || "未知阶段", error: error || "" };
+}
+// 说明：失败详情含服务端返回的模型名/路径文本，渲染前必须转义，避免注入。
+function escText(value) { return String(value ?? "").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+function renderFailure(reason) {
+  const card = document.getElementById("resultCard");
+  if (!card) return;
+  card.classList.remove("hidden");
+  const stageLine = failedStage?.label ? `<span>失败环节：<b>${escText(failedStage.label)}</b></span>` : "";
+  document.getElementById("delivery").innerHTML =
+    `<div class="fail-box" role="alert" id="failBox">
+  <div class="fail-hd">任务未完成，本次没有产出成片 MP4</div>
+  <div class="kv">${stageLine}<span>失败原因：<b>${escText(reason)}</b></span></div>
+  <div class="dlbar">
+    <button type="button" id="rerunBtn" class="ghost" onclick="rerunFailed()">重跑本次生成</button>
+    <span class="hint">重跑会按原需求创建一个新任务，失败任务的记录与产物保留供排查。</span>
+  </div>
+</div>`;
+}
+// 重跑：POST /api/runs/:runId/rerun 返回新 runId 后必须切换上下文并新开 SSE，
+// 否则界面还订阅着旧的失败流，永远等不到进度。
+async function rerunFailed() {
+  const runId = currentRunId;
+  if (!runId || rerunPending) return;
+  rerunPending = true;
+  const btn = document.getElementById("rerunBtn");
+  if (btn) { btn.disabled = true; btn.classList.add("loading"); btn.textContent = "正在提交重跑…"; }
+  try {
+    const r = await fetch(`/api/runs/${encodeURIComponent(runId)}/rerun`, { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || `重跑失败（${r.status}）`);
+    if (!j.runId) throw new Error("重跑接口未返回新任务 ID");
+    toast("已提交重跑，正在连接新任务…", "ok");
+    selectRun(j.runId);
+    openStream(j.runId);
+  } catch (e) {
+    toastErr("重跑失败：" + (e?.message || e));
+    if (btn) { btn.disabled = false; btn.classList.remove("loading"); btn.textContent = "重跑本次生成"; }
+  } finally {
+    rerunPending = false;
+  }
+}
 function onFailed(error) {
   if (es) { es.close(); es = null; }
   closeRunGates();
   genBtnReset();
-  document.getElementById("progText").textContent = "生成失败：" + (error || "请重新生成");
-  toastErr("生成失败：" + (error || "请重新生成"));
+  const reason = error || failedStage?.error || "请重新生成";
+  // 说明：只给一句错误原因，用户无法判断该重跑还是改需求；必须带上失败环节。
+  const headline = failedStage?.label ? `生成失败（${failedStage.label}）` : "生成失败";
+  document.getElementById("progText").textContent = `${headline}：${reason}`;
+  toastErr(`${headline}：${reason}`);
+  updateProgress();
+  renderFailure(reason);
 }
 async function refreshRun(runId) {
   try {
@@ -1521,20 +1658,37 @@ async function refreshRun(runId) {
     if (!es) openStream(runId);
   }
 }
+// 成片子阶段（compositing/validating）只是进度说明，不是 step.status；校验通过后必须清掉，
+// 否则步骤条会一直停在「正在校验成片」，用户以为成片没交付。
+function clearCompositeMeta() {
+  const row = document.getElementById("step-composite");
+  if (!row) return;
+  const meta = row.querySelector(".meta");
+  if (meta) meta.textContent = "";
+}
 function onProgress(ev) {
   const map = { "step-start":"running", "step-done":"done", "step-suspended":"running", "step-failed":"failed" };
+  if (ev.status === "step-failed") rememberFailedStage(ev.step, ev.error);
   if (map[ev.status]) setStep(ev.step, map[ev.status], ev.error);
   if (ev.step === "writeScript" && ev.status === "step-suspended") showGate(ev.script);
   if (ev.step === "generateScenes" && ev.status === "step-progress") {
     setStep("generateScenes", "running", "场景 #" + ev.scene + " " + (ev.result||""));
+  }
+  // composite 是最后一个步骤：真实合成前会连续发 compositing/validating 两个 step-progress，
+  // 之后才可能进入成片门。这里显式回显子阶段，避免长静默被误判为卡死。
+  if (ev.step === "composite" && ev.status === "step-progress" && ev.phase) {
+    setStep("composite", "running", ev.phase === "validating" ? "正在校验成片" : "正在合成成片");
   }
 }
 function onDone(run) {
   if (es) { es.close(); es = null; }
   closeRunGates();
   genBtnReset();
+  clearCompositeMeta();
   updateProgress();
-  toast("成片已交付", "ok");
+  // 说明：DEMO/历史 run 没有成片 MP4，不能再用「成片已交付」误导用户。
+  if (isMp4Delivery(run)) toast("成片 MP4 已交付（含配音、配乐与中文硬字幕）", "ok");
+  else toast("已完成，但本次只有分镜故事板，未产出 MP4 成片", "warn");
   renderDelivery(run);
 }
 
@@ -1560,14 +1714,22 @@ async function approveScript(useEdits) {
 // 成片门（FR-9.2 / M3）：composite 完成后弹出验收门，approve=交付，reject=重新生成。
 function onFinalReview(ev) {
   const p = ev.preview || {};
+  const runId = ev.runId || currentRunId;
+  clearCompositeMeta();
   let html = "";
-  if (p.poster) html += `<img src="${p.poster}" style="max-width:280px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
-  if (p.videoUrl) html += `<p><a class="dl" href="${p.videoUrl}" target="_blank">预览成片</a></p>`;
+  if (p.poster) html += `<img src="${esc(p.poster)}" style="max-width:280px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
+  // 说明：REAL 的成片是本机 file:// 路径，浏览器打不开；服务端已改写为 /api/video/:runId（支持 Range）。
+  if (p.videoUrl) {
+    html += `<video class="final-video" src="${esc(p.videoUrl)}" controls preload="metadata"${p.poster ? ` poster="${esc(p.poster)}"` : ""}></video>`;
+    html += `<div class="dlbar"><a class="dl" href="${esc(p.videoUrl)}" download>下载成片 MP4</a></div>`;
+  } else {
+    html += `<div class="note">当前是 DEMO/降级结果：没有可播放的 MP4，下面是需要人工确认的分镜故事板。</div>`;
+  }
   const scenes = p.gallery || [];
   if (scenes.length) {
     html += `<div class="gallery">` + scenes.map(sceneHtml).join("") + `</div>`;
   }
-  if (p.note) html += `<div class="note">${p.note}</div>`;
+  if (p.note) html += `<div class="note">${esc(p.note)}</div>`;
   document.getElementById("finalPreview").innerHTML = html;
   document.getElementById("finalGateModal").classList.remove("hidden");
 }
@@ -1600,27 +1762,47 @@ function esc(s){ return String(s).replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
 
 function renderDelivery(run) {
   const card = document.getElementById("resultCard"); card.classList.remove("hidden");
+  const brief = run.brief || {};
+  const runId = run.runId || currentRunId;
+  const mp4 = isMp4Delivery(run);
+  const manifest = run.artifactManifest || {};
+  const manifestModels = manifest.models || {};
+  const timeOf = (v) => Number.isFinite(Number(v)) ? Number(v) : "未知";
   let html = "";
-  if (run.poster) html += `<img src="${run.poster}" style="max-width:320px;border-radius:10px;border:1px solid var(--line);" /><br/>`;
+  if (mp4) {
+    // 产物路由由服务端按 runId 构造并校验边界，前端只声明要哪一种产物。
+    const artifact = (kind) => `/api/runs/${encodeURIComponent(runId)}/artifacts/${kind}`;
+    html += `<h4>成片 MP4（含画面、配音、配乐与烧录中文字幕）</h4>`;
+    html += `<video class="final-video" src="${esc(run.videoUrl)}" controls preload="metadata"${run.poster ? ` poster="${esc(run.poster)}"` : ""}></video>`;
+    html += `<div class="dlbar">
+      <a class="dl" href="${artifact("video")}" download>下载 MP4</a>
+      <a class="dl" href="${artifact("subtitles")}" download>下载字幕 SRT</a>
+      <a class="dl" href="${artifact("poster")}" download>下载封面</a>
+    </div>`;
+  } else {
+    // 说明：只有分镜故事板时绝不能出现「成片已交付」，否则用户会以为拿到了 MP4。
+    const demo = /DEMO/i.test(String(run.note || ""));
+    html += `<div class="note" id="fallbackNote">${demo ? "演示结果：当前为 DEMO/降级模式，未接入真实合成服务，下面是分镜故事板。" : "历史降级产物：本次任务没有经过校验的 MP4 成片，下面是分镜故事板。"}</div>`;
+    if (run.poster) html += `<img src="${esc(run.poster)}" style="max-width:320px;border-radius:10px;border:1px solid var(--line);" />`;
+  }
   html += `<div class="kv">
-    <span>状态：<b>${esc(run.status)}</b></span>
-    <span>语言：<b>${esc(run.brief.language)}</b></span>
-    <span>时长：<b>${run.brief.durationSec}s</b></span>
-    ${run.srt ? `<span><a class="dl" href="${srtBlob(run.srt)}" download="script.srt">下载字幕 SRT</a></span>` : ""}
+    <span>状态：<b>${esc(run.status || "unknown")}</b></span>
+    <span>画布：<b>${esc(canvasLabel(brief.canvasPreset || manifest.canvas?.id))}` +
+    (manifest.canvas?.width ? `（${manifest.canvas.width}×${manifest.canvas.height}）` : "") + `</b></span>
+    <span>时长：<b>${esc(brief.durationSec ?? manifest.timeline?.durationSec ?? "?")}s</b></span>
+    <span>语言：<b>${esc(brief.language || "?")}</b></span>
+    <span>校验：<b>${manifest.validated === true ? "已通过（可交付）" : mp4 ? "已通过" : "不适用（无 MP4 产物）"}</b></span>
   </div>`;
-  // 模型可见性（用户诉求：知道用的什么模型）—— 本次 brief 覆盖值优先，否则显示服务端当前默认
-  if (SERVER_CONFIG?.models) {
-    const m = SERVER_CONFIG.models;
-    const hasVideo = (run.storyboard || []).some((s) => s.videoUrl);
-    const videoModel = run.brief.videoModel || m.video?.current || "";
-    const bits = [
-      `脚本/分镜 ${run.script?.model || run.brief.llmModel || m.llm?.current || "?"}`,
-      `场景图 ${run.brief.imageModel || m.image?.current || "?"}`,
-      videoModel ? `动态视频 ${videoModel}${hasVideo ? "" : "（静态降级）"}` : "动态视频 未启用",
-      `配音 ${m.tts?.current || "?"}`,
-      `配乐 ${m.music?.current || "?"}`,
-    ];
-    html += `<div class="kv">${bits.map((b) => `<span>${b}</span>`).join("")}</div>`;
+  // 模型可见性（用户诉求：知道用的什么模型）—— manifest 是成片时的真实记录，其次才是 Brief 与服务端当前值。
+  const bits = [
+    `动态视频 ${manifestModels.video || brief.videoModel || "未启用"}${brief.modelSelectionSource ? `（${selectionSourceLabel(brief.modelSelectionSource)}）` : ""}`,
+    `配音 ${manifestModels.tts || brief.ttsModel || SERVER_CONFIG?.models?.tts?.current || "?"}`,
+    `配乐 ${manifestModels.music || brief.musicModel || SERVER_CONFIG?.models?.music?.current || "?"}`,
+    `脚本/分镜 ${manifestModels.llm || run.script?.model || brief.llmModel || SERVER_CONFIG?.models?.llm?.current || "?"}`,
+  ];
+  html += `<div class="kv">${bits.map((b) => `<span>${esc(b)}</span>`).join("")}</div>`;
+  if (manifest.scenes?.length) {
+    html += `<div class="kv"><span>成片镜头：<b>${manifest.scenes.length} 个</b></span><span>时间轴：<b>${timeOf(manifest.timeline?.durationSec)}s</b></span></div>`;
   }
   // 成本汇总（M2 / FR-10）—— 用 cost-box 组件
   if (run.cost && run.cost.length) {
@@ -1629,7 +1811,7 @@ function renderDelivery(run) {
     run.cost.forEach(c=>{ html += `<li>${c.step}：¥${(c.amount||0).toFixed(4)}${c.tokens?` （${c.tokens} tokens）`:""}</li>`; });
     html += `</ul></div>`;
   }
-  if (run.note) html += `<div class="note">${run.note}</div>`;
+  if (run.note) html += `<div class="note">${esc(run.note)}</div>`;
   // 分镜画廊（优先完整 storyboard —— 含 videoUrl，可播动态片段；回退摘要 gallery）
   const scenes = (run.storyboard && run.storyboard.length) ? run.storyboard
     : (run.storyboardGallery && run.storyboardGallery.length) ? run.storyboardGallery : [];
@@ -1645,7 +1827,6 @@ function renderDelivery(run) {
   }
   document.getElementById("delivery").innerHTML = html;
 }
-function srtBlob(srt){ return "data:text/plain;charset=utf-8," + encodeURIComponent(srt); }
 restoreRun();
 </script>
 </body>
