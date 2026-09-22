@@ -12,6 +12,7 @@ import { encodeSVG } from "./svg.js";
 import { withGlobalLanguage } from "../i18n.js";
 import { getEffectiveOneApiBase, getEffectiveProviderMode, getEffectiveOneApiKey } from "../runtime-config.js";
 import { canvasPrompt, resolveCanvas } from "../media/canvas.js";
+import { styleManifest, stylePrompt } from "../media/style.js";
 import { MUSIC_QUERY_MODEL, MUSIC_SUBMIT_MODEL } from "../media/model-selection.js";
 import { materializeMedia } from "../media/materialize.js";
 import { assertSubtitleFilters, composeFinalVideo, normalizeSceneImage, normalizeSceneVideo } from "../media/ffmpeg.js";
@@ -465,13 +466,17 @@ export async function generateStoryboard(brief, script) {
   const model = brief.llmModel || process.env.PROMO_LLM_MODEL || "deepseek-v4-flash";
   const expectedSceneCount = script?.voiceover?.length || 0;
   if (expectedSceneCount === 0) throw new Error("确认脚本没有可生成分镜的旁白");
-  const sys = "你是资深分镜师，把脚本拆为若干 Scene。严格只输出 JSON 对象，形如 {\"scenes\":[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]}，不得输出解释文字；musicClimax 为布尔值，仅情绪最高点的分镜为 true。";
+  // 说明：风格锚点是全片唯一画风来源，必须先进 system prompt；否则模型会在每镜 visualPrompt 里各写一种画风。
+  const style = stylePrompt(brief);
+  const sys = "你是资深分镜师，把脚本拆为若干 Scene。严格只输出 JSON 对象，形如 {\"scenes\":[{index, visualPrompt, subtitle, camera, durationSec, musicClimax}]}，不得输出解释文字；musicClimax 为布尔值，仅情绪最高点的分镜为 true。" +
+    "\n" + style +
+    "\nvisualPrompt 只描述画面内容（主体、动作、环境、镜头），不得自行声明或更改画风、光影、材质与配色；全片画风由上述锚点统一决定。";
   const vo = (script?.voiceover || []).map((v) => `${v.timecode} ${v.text}`).join("\n");
   let user =
     `品牌：${brief.brandName} 产品：${brief.productName}\n调性：${(brief.tones || []).join("、")}\n` +
     `时长：${brief.durationSec}s\n旁白：\n${vo}\n` +
     `必须恰好输出 ${expectedSceneCount} 个分镜，与旁白逐句一一对应，不得合并、拆分或增删；` +
-    `camera ∈ push/pull/pan/fixed；视觉风格全程统一。\n${canvasPrompt(brief)}`;
+    `camera ∈ push/pull/pan/fixed。\n${style}\n${canvasPrompt(brief)}`;
   if (brief.bannedWords?.length) user += `\n禁用词：${brief.bannedWords.join("、")}。`;
   if (brief.logoColor) user += `\n品牌主色 ${brief.logoColor}，画面配色需呼应。`;
   let arr = [];
@@ -487,7 +492,8 @@ export async function generateStoryboard(brief, script) {
           { role: "user", content: attemptUser },
         ],
         response_format: { type: "json_object" },
-        temperature: 0.7,
+        // 说明：0.7 会让模型对每镜各自发挥画风，与全片锚点相互打架；收紧到 0.4 降低逐镜漂移。
+        temperature: 0.4,
       });
       const content = data.choices?.[0]?.message?.content || "{}";
       const parsed = parseJSONSafe(content);
@@ -535,13 +541,16 @@ function demoStoryboard(brief, script) {
   const rnd = mulberry32(seed);
   const dur = brief.durationSec || 30;
   const n = script?.voiceover?.length || Math.max(3, Math.round(dur / 5));
-  const tones = brief.tones || ["专业"];
+  // 说明：DEMO 分镜也必须与真实链路同源——原来的 pick(tones, rnd) 让每个分镜各挑一种调性，
+  // 演示出「一镜一个画风」的假象，也让人无法判断风格锚点是否生效。
+  const style = stylePrompt(brief);
+  const tone = (brief.tones || ["专业"]).join("、");
   const scenes = [];
   for (let i = 0; i < n; i++) {
     const camera = pick(["push", "pull", "pan", "fixed"], rnd);
     scenes.push({
       index: i + 1,
-      visualPrompt: `${brief.brandName} ${brief.productName} 的${pick(tones, rnd)}风格画面，镜头${camera}，突出${brief.coreSellingPoint}；${canvasPrompt(brief)}`,
+      visualPrompt: `${brief.brandName} ${brief.productName} 的产品画面，调性 ${tone}，镜头${camera}，突出${brief.coreSellingPoint}；${style}；${canvasPrompt(brief)}`,
       subtitle: script?.voiceover?.[i]?.text || `场景 ${i + 1}`,
       camera,
       durationSec: Math.round((dur / n) * 10) / 10,
@@ -566,7 +575,8 @@ export async function generateSceneMedia(scene, brief, options = {}) {
   if (getProviderMode() !== "real") return demoSceneMedia(scene, brief);
   const model = brief.imageModel || process.env.PROMO_IMAGE_MODEL || "doubao-seedream-4-0-250828";
   const canvas = resolveCanvas(brief.canvasPreset);
-  let prompt = `${scene.visualPrompt}；${canvasPrompt(brief)}`;
+  // 说明：风格锚点必须前置——原实现把参考风格追加在末尾，模型已按 visualPrompt 定好画风，尾部约束基本无效。
+  let prompt = `${stylePrompt(brief)}；${scene.visualPrompt}；${canvasPrompt(brief)}`;
   if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
   // 渠道适配：doubao/seedream 系渠道 size 使用 1K|2K|4K 档位，
   // 并用 aspect_ratio 传递画布比例；其余渠道直接使用受控画布的像素尺寸。
@@ -966,7 +976,9 @@ async function requestSceneVideoTask(scene, brief, modelOverride, { dropFrame = 
   if (getProviderMode() !== "real") return demoSceneVideo(scene, brief);
   const model = modelOverride || brief.videoModel || process.env.PROMO_VIDEO_MODEL;
   if (!model) throw new Error("未指定视频模型（Brief.videoModel / env PROMO_VIDEO_MODEL）");
-  let prompt = scene.visualPrompt || scene.subtitle || "";
+  // 说明：动态视频与分镜、场景图必须同源。首帧被内容审核拒绝退化为文生时只改输入形态，
+  // prompt 在首帧判定之前构造，因此两条路径天然携带同一份风格锚点。
+  let prompt = `${stylePrompt(brief)}；${scene.visualPrompt || scene.subtitle || ""}`;
   if (brief.logoColor) prompt += `；主色 ${brief.logoColor}`;
   const canvas = resolveCanvas(brief.canvasPreset);
   const body = {
@@ -1644,6 +1656,8 @@ export async function composite(scenes, voice, music, brief, options = {}) {
     canvasPreset: brief?.canvasPreset,
     fontPath,
     fontFamily: fontName,
+    // 说明：manifest 是成品的唯一权威记录，风格必须落盘才能核对「成品画风 == 简报风格」。
+    style: styleManifest(brief),
     models: {
       video: brief?.videoModel || null,
       tts: voice?.model || null,

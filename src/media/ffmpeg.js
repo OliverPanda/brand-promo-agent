@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 import { resolveCanvas } from "./canvas.js";
+import { styleManifest } from "./style.js";
 import {
   MEDIA_LIMITS,
   promoteArtifacts,
@@ -460,6 +461,11 @@ export async function assertSubtitleFilters(binary, options = {}) {
   return filters;
 }
 
+/** 未显式传入风格时的默认记录，与 Brief 默认预设 photoreal 同源。 */
+function defaultStyleManifest() {
+  return styleManifest({ stylePreset: undefined });
+}
+
 /**
  * 以权威语音时间轴合成带配音、配乐与中文硬字幕的成片，校验后原子提升到 run 目录。
  *
@@ -469,6 +475,7 @@ export async function assertSubtitleFilters(binary, options = {}) {
  *   music: {musicPath?: string, musicUrl?: string},
  *   paths: ReturnType<typeof import("./artifacts.js").artifactPaths>,
  *   canvasPreset?: string,
+ *   style?: {preset: string, label: string, description: string},
  *   fontPath: string,
  *   fontFamily?: string,
  *   models?: Record<string, unknown>,
@@ -636,6 +643,8 @@ export async function composeFinalVideo(options) {
       version: 1,
       runId,
       canvas: { id: canvas.id, width: canvas.width, height: canvas.height, aspectRatio: canvas.aspectRatio },
+      // 说明：风格必须与画面一起落盘，交付回显才能核对「成品画风 == 简报风格」。
+      style: options.style || defaultStyleManifest(),
       models: { ...(options.models || {}) },
       scenes: [],
       timeline: {

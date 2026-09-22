@@ -484,6 +484,22 @@
           <option value="social-square">方形短视频 1080×1080（1:1）</option>
         </select>
       </div>
+      <div class="field">
+        <label class="lbl" for="stylePreset">画面风格 <span class="opt">（全片分镜、场景图与动态视频统一固化为此风格，避免逐镜换画风）</span></label>
+        <select id="stylePreset">
+          <option value="photoreal" selected>真人实拍</option>
+          <option value="anime">动漫</option>
+          <option value="three-d">3D 渲染</option>
+          <option value="illustration">插画</option>
+          <option value="ink-wash">国风水墨</option>
+          <option value="custom">自定义</option>
+        </select>
+      </div>
+      <div class="field hidden" id="styleDescField">
+        <label class="lbl" for="styleDescription">自定义风格描述 <span class="opt">（≤200 字；选「自定义」时必填）</span></label>
+        <input id="styleDescription" maxlength="200" placeholder="例如：黏土定格动画，暖色木质场景，均匀柔光" />
+        <div class="err" id="err-styleDescription" role="alert"></div>
+      </div>
       <div class="grid3">
         <div class="field">
           <label class="lbl" for="durationSec">期望时长</label>
@@ -519,7 +535,7 @@
           <textarea id="keyMessages" placeholder="例如：&#10;续航 30 小时&#10;支持离线生成"></textarea>
         </div>
         <div class="field">
-          <label class="lbl" for="styleReference">风格参考 <span class="opt">（关键词或图片 URL）</span></label>
+          <label class="lbl" for="styleReference">风格参考图 <span class="opt">（关键词或图片 URL，与上方预设并存）</span></label>
           <input id="styleReference" placeholder="例如：赛博朋克 / https://..." data-page-node-id="bSPjEcfd74mUtjWiFHp1O6" />
         </div>
       </div>
@@ -790,14 +806,19 @@ if (_csp) { _csp.addEventListener("input", syncCounter); syncCounter(); }
 document.getElementById("formCard").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); submitBrief(); }
 });
+document.getElementById("stylePreset")?.addEventListener("change", syncStyleDescField);
+document.getElementById("styleDescription")?.addEventListener("input", () => validateStylePreset());
 
 // 重置简报：清空文本、取消 chip 选中、清校验态
 function resetBrief() {
   appliedTemplateId = null;
   document.querySelectorAll(".template-tag").forEach((tag) => tag.setAttribute("aria-pressed", "false"));
-  ["brandName", "productName", "coreSellingPoint", "keyMessages", "styleReference", "bannedWords"].forEach((id) => {
+  ["brandName", "productName", "coreSellingPoint", "keyMessages", "styleReference", "styleDescription", "bannedWords"].forEach((id) => {
     const el = document.getElementById(id); if (el) el.value = "";
   });
+  const styleSel = document.getElementById("stylePreset");
+  if (styleSel) styleSel.value = DEFAULT_STYLE_PRESET;
+  syncStyleDescField();
   REQUIRED_FIELDS.forEach((id) => setFieldError(id, ""));
   audienceSel.clear(); toneSel.clear();
   document.querySelectorAll("#audienceChips .chip, #toneChips .chip").forEach((c) => c.classList.remove("on"));
@@ -1314,6 +1335,16 @@ const CANVAS_LABEL = {
   "social-landscape": "横屏短视频 1920×1080（16:9）",
   "social-square": "方形短视频 1080×1080（1:1）",
 };
+// 画面风格：id 与服务端 src/media/style.js 的 STYLE_PRESETS 枚举一一对应，默认同为 photoreal。
+const DEFAULT_STYLE_PRESET = "photoreal";
+const STYLE_LABEL = {
+  photoreal: "真人实拍",
+  anime: "动漫",
+  "three-d": "3D 渲染",
+  illustration: "插画",
+  "ink-wash": "国风水墨",
+  custom: "自定义",
+};
 // 自动优先级与服务端 src/media/model-selection.js 保持一致（minimax-h3 → 7zhe-seedance → seedance-2.0）。
 const VIDEO_MODEL_PRIORITY = ["minimax-h3", "7zhe-seedance", "seedance-2.0"];
 const SEEDANCE_20_RE = /seedance[-_.]?2[-_.]?0/i;
@@ -1366,6 +1397,49 @@ function isMp4Delivery(run) { return !!run?.videoUrl && run?.artifactManifest?.v
  * @example canvasLabel("social-square");
  */
 function canvasLabel(id) { return CANVAS_LABEL[id] || (id ? id : CANVAS_LABEL[DEFAULT_CANVAS_PRESET]); }
+
+/**
+ * 画面风格 id 转中文标签；未知 id 直接回显，避免静默显示成默认「真人实拍」。
+ * @param {string} [id] 风格预设标识（与服务端 STYLE_PRESETS 同源）。
+ * @returns {string} 中文风格标签。
+ * @example styleLabel("ink-wash"); // "国风水墨"
+ */
+function styleLabel(id) { return STYLE_LABEL[id] || (id ? id : STYLE_LABEL[DEFAULT_STYLE_PRESET]); }
+
+/**
+ * 校验「自定义」风格必须填写描述。
+ * 说明：服务端 schema 也会返回 400，但前端先拦可以避免用户提交后才发现自己漏填，
+ * 也避免一次无效生成消耗额度。
+ * @returns {boolean} 通过返回 true；不通过时标红字段并提示原因。
+ * @example validateStylePreset(); // 选 custom 且未填描述 → false
+ */
+function validateStylePreset() {
+  const input = document.getElementById("styleDescription");
+  const preset = document.getElementById("stylePreset")?.value || DEFAULT_STYLE_PRESET;
+  const ok = preset !== "custom" || !!(input && input.value.trim());
+  if (input) input.classList.toggle("invalid", !ok);
+  const err = document.getElementById("err-styleDescription");
+  if (err) {
+    err.textContent = ok ? "" : "选「自定义」时必须填写风格描述（≤200 字）";
+    err.classList.toggle("show", !ok);
+  }
+  return ok;
+}
+
+/**
+ * 切换「自定义风格描述」输入区的显隐。
+ * 说明：只有 custom 需要补充描述，其余预设隐藏该输入，避免用户填写了却不生效。
+ * @returns {void}
+ * @example syncStyleDescField();
+ */
+function syncStyleDescField() {
+  const preset = document.getElementById("stylePreset")?.value || DEFAULT_STYLE_PRESET;
+  const field = document.getElementById("styleDescField");
+  if (field) field.classList.toggle("hidden", preset !== "custom");
+  if (preset !== "custom") validateStylePreset();
+}
+// 初始化：此处常量区（DEFAULT_STYLE_PRESET）已执行完毕，可安全调用。
+syncStyleDescField();
 
 // 视频模型下拉：首项「自动（当前：xxx）」值留空 = 服务端按优先级解析；其余为网关实时清单，可手动覆盖。
 function fillVideoModelSelect(videoDef, list) {
@@ -1469,12 +1543,16 @@ function updateProgress() {
 async function submitBrief() {
   // 先做内联校验：失败时定位到第一个问题字段并弹 toast，不再用原生 alert 打断
   if (!validateForm()) return;
+  if (!validateStylePreset()) { toastErr("画面风格选「自定义」时必须填写风格描述"); return; }
   const { logoColor, bannedWords } = readBrandConstraints();
   const brief = {
     brandName: v("brandName"), productName: v("productName"), coreSellingPoint: v("coreSellingPoint"),
     durationSec: Number(v("durationSec")), language: v("language"), voiceTone: v("voiceTone"),
     // 说明：画布决定分镜尺寸、成片分辨率与字幕安全区；留空回落到服务端默认竖屏 1080×1920。
     canvasPreset: v("canvasPreset") || DEFAULT_CANVAS_PRESET,
+    // 说明：风格预设是全片画风的唯一来源，服务端据此生成分镜/场景图/动态视频共用的风格锚点。
+    stylePreset: v("stylePreset") || DEFAULT_STYLE_PRESET,
+    styleDescription: v("styleDescription") || undefined,
     audience: [...audienceSel], tones: [...toneSel],
     keyMessages: v("keyMessages").split("\n").map(s=>s.trim()).filter(Boolean),
     styleReference: v("styleReference") || undefined, hitlEnabled: document.getElementById("hitlEnabled").checked,
@@ -1789,6 +1867,11 @@ function renderDelivery(run) {
     <span>状态：<b>${esc(run.status || "unknown")}</b></span>
     <span>画布：<b>${esc(canvasLabel(brief.canvasPreset || manifest.canvas?.id))}` +
     (manifest.canvas?.width ? `（${manifest.canvas.width}×${manifest.canvas.height}）` : "") + `</b></span>
+    <span>风格：<b>${esc(styleLabel(manifest.style?.preset || brief.stylePreset))}` +
+    (function () {
+      const d = manifest.style?.description || brief.styleDescription || "";
+      return d ? `（${esc(d)}）` : "";
+    })() + `</b></span>
     <span>时长：<b>${esc(brief.durationSec ?? manifest.timeline?.durationSec ?? "?")}s</b></span>
     <span>语言：<b>${esc(brief.language || "?")}</b></span>
     <span>校验：<b>${manifest.validated === true ? "已通过（可交付）" : mp4 ? "已通过" : "不适用（无 MP4 产物）"}</b></span>

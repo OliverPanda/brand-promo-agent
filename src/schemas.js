@@ -2,6 +2,7 @@
 // 工作流步骤的 schema 刻意放宽（passthrough），避免 Mastra 严格校验阻断 DEMO 确定性数据。
 import { z } from "zod";
 import { CANVAS_PRESETS, DEFAULT_CANVAS_PRESET } from "./media/canvas.js";
+import { DEFAULT_STYLE_PRESET, STYLE_DESCRIPTION_MAX, STYLE_PRESETS } from "./media/style.js";
 
 export const LANGUAGES = ["zh-CN", "zh-TW", "en", "ja", "ko"];
 export const DURATIONS = [15, 30, 60, 90];
@@ -22,6 +23,9 @@ export const BrandBriefSchema = z.object({
   keyMessages: z.array(z.string()).default([]),
   durationSec: z.union([z.literal(15), z.literal(30), z.literal(60), z.literal(90)]).default(30),
   styleReference: z.string().optional(),
+  // 全片视觉风格固化（PRD §16.13）：预设决定唯一风格锚点，custom 时必须补风格描述，否则无法生成锚点。
+  stylePreset: z.enum(Object.keys(STYLE_PRESETS)).default(DEFAULT_STYLE_PRESET),
+  styleDescription: z.string().max(STYLE_DESCRIPTION_MAX, `风格描述不超过 ${STYLE_DESCRIPTION_MAX} 字`).optional(),
   language: z.enum(LANGUAGES).default("zh-CN"),
   voiceTone: z.string().default("男声"),
   hitlEnabled: z.boolean().default(true),
@@ -35,6 +39,12 @@ export const BrandBriefSchema = z.object({
   llmModel: z.string().max(80).optional(),
   imageModel: z.string().max(80).optional(),
   videoModel: z.string().max(80).optional(),
+}).superRefine((brief, ctx) => {
+  // 说明：custom 预设的锚点完全来自 styleDescription，缺描述时 stylePrompt 会抛错，
+  // 那会在工作流中途才失败；这里提前到提交校验，让 POST /api/generate 直接返回 400。
+  if (brief.stylePreset === "custom" && !String(brief.styleDescription || "").trim()) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["styleDescription"], message: "画面风格为自定义时必须填写风格描述" });
+  }
 });
 
 // 品牌模板（FR-1.3 / M4 模板库）：市场运营保存一套品牌预设，下次一键套用，保证调性统一。
