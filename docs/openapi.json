@@ -407,6 +407,24 @@
             "default": "social-portrait",
             "description": "社交媒体画布：默认 1080x1920 竖版，可切换横版与方形"
           },
+          "stylePreset": {
+            "type": "string",
+            "enum": [
+              "photoreal",
+              "anime",
+              "three-d",
+              "illustration",
+              "ink-wash",
+              "custom"
+            ],
+            "default": "photoreal",
+            "description": "全片画面风格预设：真人实拍/动漫/3D 渲染/插画/国风水墨/自定义；默认真人实拍，同一支片子内所有分镜与动态视频共用同一风格锚点"
+          },
+          "styleDescription": {
+            "type": "string",
+            "description": "自定义风格描述，不超过 200 字；stylePreset 为 custom 时必填",
+            "maxLength": 200
+          },
           "videoModel": {
             "type": "string",
             "description": "手选动态视频模型；不传则按 minimax-h3 → 7zhe-seedance → seedance-2.0 优先级自动选择"

@@ -102,11 +102,12 @@
   - 宣传调性（多选：科技感/温情/高端/国潮/搞笑/专业…）
   - 核心信息点（多行，可列 1–5 条）
   - 期望时长（15s / 30s / 60s / 90s）
-  - 画面风格参考（可选：关键词或参考图 URL）
+  - 画面风格（受控预设：真人实拍/动漫/3D 渲染/插画/国风水墨/自定义；自定义时须填 ≤200 字风格描述）
+  - 风格参考图（可选：关键词或参考图 URL，用于图生图）
   - 语言（复用 MingStar 全局语言提示词：zh-CN/zh-TW/en/ja/ko）
   - 配音音色（男声/女声/沉稳/活泼…）
   - 是否启用 HITL 审核门（默认开启脚本门）
-- **FR-1.2** 表单校验：必填项、卖点长度、时长合法性。
+- **FR-1.2** 表单校验：必填项、卖点长度、时长合法性、风格预设枚举合法性（custom 时必须提供风格描述）。
 - **FR-1.3** 支持「从模板加载」：预置 ≤ 5 个品牌模板（含 Logo 主色、禁用词、默认调性）。
 
 ### FR-2 脚本生成（Agent）
@@ -126,7 +127,7 @@
   - 镜头运动（推/拉/摇/固定）
   - 时长
   - 是否需要配乐高潮点
-- **FR-3.3** 全片视觉风格统一（色彩/光线/主体一致性约束）。
+- **FR-3.3** 全片视觉风格统一（色彩/光线/主体一致性约束）。风格由 Brief.stylePreset（+ styleDescription）解析为唯一「风格锚点」，该锚点必须同时注入分镜提示词、场景图提示词与动态视频提示词，三段同源；分镜提示词须显式禁止模型逐镜自定义画风，并下调分镜生成 `temperature` 以降低漂移（见 §16.13）。
 - **FR-3.4** 分镜请求启用 JSON 对象响应模式，解析层须容忍数组键名漂移（`scenes`/`array`/`storyboard` 及一层嵌套）与文本包裹，`musicClimax` 数值按 ≥0.8 归一为高潮；分镜数量仍须与确认旁白严格相等，否则该步失败。
 
 ### FR-4 场景素材生成（Provider）
@@ -134,7 +135,7 @@
 - **FR-4.2** 支持参考图输入（图生图，复用 Seedream 参考图免费能力）。
 - **FR-4.3** 失败重试与降级：单场景失败不阻断全片，标记后跳过/用占位。
 - **FR-4.4** 并行生成（Mastra `.parallel()` 或 Provider 批量），控制并发与配额。
-- **FR-4.5** 图生视频首帧只接受图像渠道返回的公网 http(s) URL。上游自行下载首帧，`data:`/裸 base64/本机地址（含 `localhost`、`host.docker.internal`）一律拒绝；图像渠道不可用时该片段降级为文生并记录可审计原因。首帧是否生效以任务响应 `usage.input_image_count` 为准（纯文生为 0）。`first_frame_image` 对 `minimax-h3` 无效。 **首帧被上游内容审核拒绝时（`InputImageSensitiveContentDetected.PrivacyInformation`：图中疑似真人），必须去掉首帧、退化为文生视频后在同一模型内重试一次，仍失败才进入候选降级链**：各候选渠道都会下载同一张首帧并被同样拒绝，换模型无效，换输入形态才是唯一活路；该退化只改变输入形态，不改变画面诉求与 prompt。
+- **FR-4.5** 图生视频首帧只接受图像渠道返回的公网 http(s) URL。上游自行下载首帧，`data:`/裸 base64/本机地址（含 `localhost`、`host.docker.internal`）一律拒绝；图像渠道不可用时该片段降级为文生并记录可审计原因。首帧是否生效以任务响应 `usage.input_image_count` 为准（纯文生为 0）。`first_frame_image` 对 `minimax-h3` 无效。 **首帧被上游内容审核拒绝时（`InputImageSensitiveContentDetected.PrivacyInformation`：图中疑似真人），必须去掉首帧、退化为文生视频后在同一模型内重试一次，仍失败才进入候选降级链**：各候选渠道都会下载同一张首帧并被同样拒绝，换模型无效，换输入形态才是唯一活路；该退化只改变输入形态，不改变画面诉求与 prompt。**动态视频提交体的 prompt 必须携带与分镜、场景图同源的风格锚点**（见 §16.13），带首帧与文生退化两条路径均不得丢失。
 - **FR-4.6** 动态视频提交体携带模型硬校验字段：`duration` 取 4~30 整数秒（场景权威时长向上取整后夹取，归一化阶段再裁到权威时长），`ratio` 显式取画布白名单比例（`21:9/16:9/4:3/1:1/3:4/9:16`，不接受 `adaptive`）。成功地址解析须覆盖 `metadata.url`；失败原因须从对象 `error:{code,message}` 抽取 `message`，不得输出 `[object Object]`。轮询必须在同一轮内遍历候选端点并择优（`/video/generations/{id}` 优先，`/videos/{id}` 返回 200 的空壳响应不得遮蔽权威失败信息），`result_url` 只有通过可物化地址形态校验（`http(s):`/`data:`/`file:`）才能当成成片地址，`status:"unknown"` 带 `fail_reason` 时按失败终止。**成片地址择优**：网关容器内回环地址（实测 `result_url=http://localhost:3000/v1/videos/{id}/content`，宿主机 `ECONNREFUSED`）与公网 `metadata.url`（`https://ark-*.tos-*.volces.com/*.mp4` 签名地址）同时出现时，必须优先取公网可达地址；解析层先收集全部候选，再按「公网可达 > 其他可物化形态」择优，不得按首次命中返回，否则已出片的付费任务会在下载阶段失败。单镜视频对上游瞬时故障（如 `upstream returned unrecognized message`）有限重试：默认 2 次尝试、上限 3 次（`PROMO_VIDEO_ATTEMPTS`），同一模型内退避为指数 `PROMO_VIDEO_RETRY_BACKOFF_MS × 2^(n-1)`（默认 2000ms，`PROMO_VIDEO_RETRY_MAX_BACKOFF_MS` 默认封顶 30000ms）；契约类错误（4xx、字段缺失、首帧不合法）立即失败，不重试；**例外**为首帧图内容审核拒绝（`InputImageSensitiveContentDetected.PrivacyInformation`），按 FR-4.5 去掉首帧退文生重试一次。**模型级降级**：单个候选模型尝试耗尽后，按交付优先级 `minimax-h3 → 7zhe-seedance → seedance-2.0`（`Brief.videoModelFallbacks`，与 `VIDEO_MODEL_PRIORITY` 同源）换下一渠道重试整镜，手选/env 只决定「先试哪个」而不关闭降级链；失败任务由网关自动冲正，换渠道不产生额外净费用；全部候选失败才判定整镜失败。**渠道级不可用**（余额不足 `insufficient_user_quota`/`预扣费额度失败`、分组未开通、无可用渠道 `No available channel`/`model_not_found`）与请求契约无关：重发同一模型必然同样失败，但换下一个候选仍可能出片，必须跳过本模型剩余尝试直接降级，仅最后一个候选不可用时才失败。成本按每镜真实生效模型（`scene.videoModel`）计价。重试边界必须区分生成与物化：只有提交/轮询失败才重试生成；成片下载或归一化失败只对同一成片 URL 重试下载（`PROMO_MEDIA_DOWNLOAD_ATTEMPTS` 默认 4、上限 6，退避为指数 `PROMO_MEDIA_DOWNLOAD_BACKOFF_MS × 2^(n-1)`，默认 1500ms、`PROMO_MEDIA_DOWNLOAD_MAX_BACKOFF_MS` 默认封顶 15000ms），不得因下载失败重新提交已付费的生成任务。HTTP 下载错误必须携带底层 cause（如 `ECONNRESET`/`EAI_AGAIN`），供排障定位。
 
 ### FR-5 配音生成（TTS Provider）
@@ -212,6 +213,8 @@ interface BrandBrief {
   keyMessages: string[];
   durationSec: 15 | 30 | 60 | 90;
   styleReference?: string;         // 参考图 URL/关键词
+  stylePreset: 'photoreal' | 'anime' | 'three-d' | 'illustration' | 'ink-wash' | 'custom'; // 全片画面风格预设，默认 photoreal
+  styleDescription?: string;       // stylePreset=custom 时必填，≤200字
   language: 'zh-CN' | 'zh-TW' | 'en' | 'ja' | 'ko';
   voiceTone: string;               // 男声/女声/沉稳...
   hitlEnabled: boolean;
@@ -773,6 +776,26 @@ REAL 模式删除全部「成功降级」行为：单镜动态视频失败、TTS
 - 动态视频模型下拉首项为「自动（当前：<解析结果>）」，空值交服务端解析。
 - 交付区以最终 MP4 播放器为主，提供「下载 MP4」「下载字幕 SRT」「下载封面」；未通过校验时只展示分镜故事板并标注降级原因。
 - 覆盖 1440、768、375px 三个视口，无横向溢出、无 pageerror。
+
+---
+
+### 16.13 全片视觉风格固化基线（v0.7 新增）
+
+> 设计依据：[全片视觉风格一致性设计](../docs/superpowers/specs/2026-09-23-visual-style-consistency-design.md)。本节是风格语义的当前事实来源，与 FR-3.3 配套。
+
+- `Brief.stylePreset` 为受控枚举，默认 `photoreal`；`custom` 时必须提供 ≤200 字的 `styleDescription`，否则 `POST /api/generate` 返回 400。`Brief.styleReference` 保留原语义（关键词或参考图 URL），与预设并存，不替代预设。
+- 解析规则：`src/media/style.js` 的 `resolveStyle(brief)` 把预设（或 custom + 描述）解析为唯一「风格锚点」字符串 `stylePrompt(brief)`；未知枚举直接抛错，不做静默兜底，避免风格悄悄退化。
+- 三段同源：同一 run 内分镜提示词、场景图提示词、动态视频提示词必须注入同一份锚点字符串。任何一段缺失锚点都视为风格固化失效。
+- 分镜阶段：锚点写入 system 与 user prompt，并显式要求 `visualPrompt` 只描述画面内容（主体、动作、环境、镜头），不得自行声明画风；分镜生成 `temperature` 下调至 0.4 以降低逐镜漂移。
+- 图像阶段：锚点置于提示词前部，先定风格再描述内容。
+- 动态视频阶段：`requestSceneVideoTask` 提交体的 prompt 必须携带同一锚点；带首帧的图生视频与首帧审核拒绝后的文生退化两条路径均不得丢失锚点，且退化只改输入形态、不改画面诉求与 prompt。
+- 演示模式：`demoStoryboard` 不得逐镜随机风格，全部镜头共用同一锚点。
+- 交付回显：`manifest.json` 新增 `style` 段（`preset`/`label`/`description`），交付页据此展示风格标签。
+
+#### 16.13.1 前端行为
+
+- 「画面风格」提供受控预设下拉（真人实拍/动漫/3D 渲染/插画/国风水墨/自定义），默认「真人实拍」；选「自定义」时展开 ≤200 字风格描述输入且为必填。
+- 交付区的 manifest 回显段展示解析后的风格标签，便于人工核对成片风格与简报一致。
 
 ---
 
