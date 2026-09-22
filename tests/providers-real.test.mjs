@@ -16,6 +16,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { artifactPaths } from "../src/media/artifacts.js";
+import { STYLE_PRESETS } from "../src/media/style.js";
 
 const { test, after } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
@@ -292,7 +293,7 @@ test("generateScript 真实模式：POST /chat/completions + 解析 JSON + _usag
 
 test("generateStoryboard 真实模式：返回 Scene[] 且提示词含画布安全构图", async () => {
   calls = [];
-  const brief = { ...baseBrief, canvasPreset: "social-square" };
+  const brief = { ...baseBrief, canvasPreset: "social-square", stylePreset: "anime" };
   const script = await generateScript(brief);
   const scenes = await generateStoryboard(brief, script);
   assert.ok(calls.some((c) => c.url.endsWith("/chat/completions")));
@@ -308,6 +309,13 @@ test("generateStoryboard 真实模式：返回 Scene[] 且提示词含画布安�
   assert.match(storyboardCall.body.messages[1].content, /主体居中/);
   assert.match(storyboardCall.body.messages[1].content, /安全区/);
   assert.match(storyboardCall.body.messages[1].content, /恰好输出 2 个分镜|严格.*2.*分镜/);
+  // 全片画风漂移回归（PRD §16.13）：分镜提示词必须携带与下图阶段同源的风格锚点。
+  assert.equal(storyboardCall.body.temperature, 0.4, "分镜 temperature 应下调到 0.4 以降低逐镜漂移");
+  const styleAnchor = STYLE_PRESETS.anime.anchor;
+  assert.ok(storyboardCall.body.messages[1].content.includes(styleAnchor), "user prompt 必须原文携带 anime 风格锚点");
+  assert.ok(storyboardCall.body.messages[0].content.includes(styleAnchor), "system prompt 必须原文携带同一风格锚点");
+  assert.match(storyboardCall.body.messages[1].content, /不得逐镜切换画风/);
+  assert.match(storyboardCall.body.messages[0].content, /不得自行声明或更改画风|不得自行声明或更改/);
   // response_format=json_object 强制顶层为对象，契约必须与解析层同为对象语义。
   assert.match(storyboardCall.body.messages[0].content, /scenes/);
   assert.match(storyboardCall.body.messages[0].content, /JSON 对象/);
@@ -405,6 +413,11 @@ test("generateSceneMedia 真实模式：POST /images/generations + 返回 url + 
   assert.equal(calls[calls.length - 1].body.aspect_ratio, "9:16");
   assert.match(calls[calls.length - 1].body.prompt, /1080×1920/);
   assert.match(calls[calls.length - 1].body.prompt, /主体居中/);
+  // 场景图必须与分镜、动态视频同源：风格锚点前置，模型先按锚点定画风再读画面内容。
+  const imagePrompt = calls[calls.length - 1].body.prompt;
+  const anchorAt = imagePrompt.indexOf(STYLE_PRESETS.photoreal.anchor);
+  assert.ok(anchorAt >= 0, "图像 prompt 必须原文携带风格锚点");
+  assert.ok(anchorAt < imagePrompt.indexOf(scenes[0].visualPrompt), "风格锚点必须前置在画面描述之前");
   assert.equal(media.mediaUrl, "https://cdn.example/scene.png");
   assert.equal(media._usage.images, 1);
 });
@@ -432,6 +445,7 @@ test("generateSceneMedia 参考图为 data:image → 走图生图（image 字段
   assert.match(last.url, /\/images\/generations$/);
   assert.ok(last.body.image, "应携带 image 参考图字段");
   assert.equal(last.body.image, "iVBORw0KGgo="); // 去 data: 前缀，留 base64
+  assert.match(last.body.prompt, /全片统一风格锚点/, "图生图同样必须携带风格锚点");
   assert.equal(media._usage.images, 1);
 });
 
@@ -451,6 +465,7 @@ test("generateSceneMedia 参考图为纯关键词 → 追加到 prompt（M2 行�
   const media = await generateSceneMedia(scenes[0], { ...baseBrief, styleReference: "赛博朋克" });
   assert.equal(calls[calls.length - 1].body.image, undefined, "关键词不应走 image 字段");
   assert.match(calls[calls.length - 1].body.prompt, /赛博朋克/, "关键词应拼入 prompt");
+  assert.match(calls[calls.length - 1].body.prompt, /全片统一风格锚点/, "关键词路径同样携带风格锚点");
 });
 
 test("generateVoiceover 真实模式：每句调用 TTS、物化探测、拼接并聚合真实用量", async () => {

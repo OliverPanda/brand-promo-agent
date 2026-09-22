@@ -14,6 +14,7 @@ import { pathToFileURL } from "node:url";
 import { resolveCanvas } from "../src/media/canvas.js";
 import { artifactPaths, MEDIA_LIMITS, resolveRunArtifact } from "../src/media/artifacts.js";
 import { buildVoiceTimeline, concatenateVoiceSegments, probeAudioDuration } from "../src/media/audio.js";
+import { styleManifest } from "../src/media/style.js";
 import { configuredFontPath, fontSupportsChinese } from "../src/media/font-readiness.js";
 import {
   CHINESE_RENDER_PROBE,
@@ -130,10 +131,10 @@ let scenarioIndex = 0;
 
 /**
  * 构造与真实工作流一致的一次运行：受管目录内的标准化片段 + 逐句配音 + 权威时间轴 + 配乐。
- * @param {{preset: string, speechDurationsSec?: number[], tag?: string}} options 画布预设与逐句语音时长。
- * @returns {Promise<object>} 合成所需的分镜、音轨、时间轴与受管路径。
+ * @param {{preset: string, speechDurationsSec?: number[], tag?: string, stylePreset?: string, styleDescription?: string}} options 画布预设、逐句语音时长与全片风格。
+ * @returns {Promise<object>} 合成所需的分镜、音轨、时间轴、风格与受管路径。
  */
-async function buildScenario({ preset, speechDurationsSec = [1.2, 1.3], tag = "compose" }) {
+async function buildScenario({ preset, speechDurationsSec = [1.2, 1.3], tag = "compose", stylePreset, styleDescription }) {
   const runId = `${tag}-${scenarioIndex += 1}`;
   const paths = artifactPaths(runId);
   const canvas = resolveCanvas(preset);
@@ -164,7 +165,8 @@ async function buildScenario({ preset, speechDurationsSec = [1.2, 1.3], tag = "c
 
   const musicPath = path.join(paths.audio, "music.wav");
   synthTone(musicPath, { durationSec: timeline.durationSec + 1.5, frequency: 220 });
-  return { runId, paths, canvas, timeline, scenes, voicePath, musicPath };
+  const style = styleManifest({ stylePreset, styleDescription });
+  return { runId, paths, canvas, timeline, scenes, voicePath, musicPath, style };
 }
 
 function composeOptions(scenario, overrides = {}) {
@@ -178,6 +180,7 @@ function composeOptions(scenario, overrides = {}) {
     music: { musicPath: scenario.musicPath },
     paths: scenario.paths,
     canvasPreset: scenario.canvas.id,
+    style: scenario.style,
     fontPath: FONT_PATH,
     ...overrides,
   };
@@ -248,6 +251,8 @@ function assertDeliverable(scenario, result) {
     height: canvas.height,
     aspectRatio: canvas.aspectRatio,
   });
+  // 交付清单必须记录风格，否则无法核对「成品画风 == 简报风格」（PRD §16.13）。
+  assert.deepEqual(manifest.style, scenario.style);
   assert.deepEqual(manifest.timeline.sceneDurationsSec, scenario.scenes.map((scene) => scene.durationSec));
   assert.deepEqual(
     manifest.timeline.cues.map((cue) => [cue.startMs, cue.endMs]),
@@ -292,6 +297,34 @@ for (const preset of ["social-portrait", "social-landscape", "social-square"]) {
     assertDeliverable(scenario, result);
   });
 }
+
+test("全片风格固化：非默认预设与自定义描述经合成管线写入交付清单", async () => {
+  const variants = [
+    { stylePreset: "anime", styleDescription: undefined, expected: { preset: "anime", label: "动漫", description: "" } },
+    { stylePreset: "custom", styleDescription: "手绘水彩绘本风，暖色调平涂", expected: { preset: "custom", label: "自定义", description: "手绘水彩绘本风，暖色调平涂" } },
+  ];
+  for (const variant of variants) {
+    const scenario = await buildScenario({
+      preset: "social-square",
+      speechDurationsSec: [0.8, 0.8],
+      tag: `style-${variant.stylePreset}`,
+      stylePreset: variant.stylePreset,
+      styleDescription: variant.styleDescription,
+    });
+    const result = await composeFinalVideo(composeOptions(scenario));
+    assertDeliverable(scenario, result);
+    assert.deepEqual(
+      result.manifest.style,
+      variant.expected,
+      `交付清单必须记录本次实际风格，而不是默认值（${variant.stylePreset}）`,
+    );
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(scenario.paths.manifest, "utf8")).style,
+      variant.expected,
+      "落盘 manifest 的风格必须与本次简报一致",
+    );
+  }
+});
 
 test("配音与配乐可从 file / data / HTTP 来源进入合成", async () => {
   const scenario = await buildScenario({ preset: "social-square", speechDurationsSec: [0.8, 0.8], tag: "source" });

@@ -50,6 +50,16 @@ test("交付下载契约声明了媒体类型、Range 与附件下载语义", ()
   }
 });
 
+test("BrandBrief 契约声明全片风格字段与受控枚举", () => {
+  const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
+  const props = spec.components.schemas.BrandBrief.properties;
+  assert.deepEqual(props.stylePreset.enum, ["photoreal", "anime", "three-d", "illustration", "ink-wash", "custom"]);
+  assert.equal(props.stylePreset.default, "photoreal");
+  assert.match(props.stylePreset.description, /全片/);
+  assert.equal(props.styleDescription.maxLength, 200);
+  assert.match(props.styleDescription.description, /custom/);
+});
+
 test("重跑契约限定 failed 输入并声明 201/404/409", () => {
   const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
   const rerun = spec.paths["/api/runs/{runId}/rerun"].post;

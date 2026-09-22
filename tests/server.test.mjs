@@ -301,6 +301,28 @@ test("非法 Brief 返回 400", async () => {
   }
 });
 
+test("POST /api/generate：非法画面风格与 custom 缺描述返回 400", async () => {
+  // 全片画风漂移回归（PRD §16.13）：风格字段必须在入口被拦，不能带进工作流中途才炸。
+  const { app } = await import("../src/server.js");
+  const server = app.listen(0);
+  const port = server.address().port;
+  const valid = { brandName: "铭星科技", productName: "星链 Pro", coreSellingPoint: "一句话生成专业宣传片" };
+  const post = (body) => fetch(BASE(port) + "/api/generate", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  try {
+    const badPreset = await post({ ...valid, stylePreset: "cyberpunk" });
+    assert.equal(badPreset.status, 400);
+    assert.match((await badPreset.json()).error, /stylePreset/);
+
+    const missingDesc = await post({ ...valid, stylePreset: "custom" });
+    assert.equal(missingDesc.status, 400);
+    assert.match((await missingDesc.json()).error, /styleDescription: 画面风格为自定义时必须填写风格描述/);
+  } finally {
+    server.close();
+  }
+});
+
 test("HITL 关闭：端到端产出分镜画廊 + SRT", async () => {
   const { app } = await import("../src/server.js");
   const server = app.listen(0);

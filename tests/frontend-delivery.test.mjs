@@ -33,6 +33,91 @@ test("提交简报时带上画布，空值回落到默认竖屏且不伪造手�
   assert.equal(body.videoModel, undefined);
 });
 
+test("画面风格下拉提供六个受控预设，默认真人实拍且有中文标签", () => {
+  const h = harness();
+  assert.equal(h.run("DEFAULT_STYLE_PRESET"), "photoreal");
+  const options = [...HTML.matchAll(/<option value="(photoreal|anime|three-d|illustration|ink-wash|custom)"([^>]*)>([^<]+)<\/option>/g)];
+  assert.deepEqual(options.map((m) => m[1]), ["photoreal", "anime", "three-d", "illustration", "ink-wash", "custom"]);
+  assert.match(options[0][2], /selected/, "默认真人实拍必须 selected");
+  assert.deepEqual(options.map((m) => m[3]), ["真人实拍", "动漫", "3D 渲染", "插画", "国风水墨", "自定义"]);
+  assert.equal(h.run('styleLabel("ink-wash")'), "国风水墨");
+  assert.equal(h.run("styleLabel(undefined)"), "真人实拍");
+  // 未知 id 直接回显，不得静默显示成默认画风，否则用户会以为风格已生效。
+  assert.equal(h.run('styleLabel("cyberpunk")'), "cyberpunk");
+});
+
+test("风格描述输入仅在选择「自定义」时展开", () => {
+  const h = harness();
+  h.nodes.get("styleDescription").value = "黏土定格动画";
+  h.nodes.get("stylePreset").value = "custom";
+  h.run("syncStyleDescField()");
+  assert.equal(h.nodes.get("styleDescField").classList.contains("hidden"), false, "custom 应展开描述输入");
+  h.nodes.get("stylePreset").value = "photoreal";
+  h.run("syncStyleDescField()");
+  assert.equal(h.nodes.get("styleDescField").classList.contains("hidden"), true, "非 custom 应隐藏描述输入");
+});
+
+test("提交简报时带上画面风格预设，非自定义不带风格描述", async () => {
+  const h = harness();
+  let body = null;
+  h.context.fetch = async (url, options) => {
+    if (url === "/api/generate") body = JSON.parse(options.body);
+    return { ok: true, status: 201, json: async () => ({ runId: "r1" }) };
+  };
+  h.nodes.get("stylePreset").value = "anime";
+  await h.run("submitBrief()");
+  assert.equal(body.stylePreset, "anime");
+  assert.equal(body.styleDescription, undefined, "非自定义不该提交描述字段");
+  h.nodes.get("stylePreset").value = "";
+  await h.run("submitBrief()");
+  assert.equal(body.stylePreset, "photoreal", "空值回落到默认风格");
+});
+
+test("选自定义但未填描述：前端直接拦下，不发起请求", async () => {
+  const h = harness();
+  let called = false;
+  h.context.fetch = async () => {
+    called = true;
+    return { ok: true, status: 201, json: async () => ({ runId: "r1" }) };
+  };
+  h.nodes.get("stylePreset").value = "custom";
+  h.nodes.get("styleDescription").value = "   ";
+  await h.run("submitBrief()");
+  assert.equal(called, false, "custom 缺描述必须在前端拦下，避免一次无效付费生成");
+  assert.match(h.notices.at(-1)[0], /自定义/);
+  h.nodes.get("styleDescription").value = "黏土定格动画";
+  await h.run("submitBrief()");
+  assert.equal(called, true, "补上描述后应正常提交");
+});
+
+test("交付页回显风格标签，manifest 记录优先于 Brief", () => {
+  const h = harness({ stubDelivery: false });
+  const baseRun = {
+    runId: "r1", status: "success", videoUrl: "/api/video/r1",
+    brief: { canvasPreset: "social-portrait", stylePreset: "anime", durationSec: 30, language: "zh-CN" },
+    artifactManifest: { validated: true, canvas: { id: "social-portrait", width: 1080, height: 1920 } },
+    storyboard: [], storyboardGallery: [],
+  };
+  h.run("renderDelivery(" + JSON.stringify(baseRun) + ")");
+  assert.match(deliveryHtml(h), /风格：<b>动漫<\/b>/);
+  h.run("renderDelivery(" + JSON.stringify({
+    ...baseRun,
+    artifactManifest: { ...baseRun.artifactManifest, style: { preset: "ink-wash", label: "国风水墨", description: "" } },
+  }) + ")");
+  assert.match(deliveryHtml(h), /风格：<b>国风水墨<\/b>/, "成交付清单记录应覆盖 Brief");
+});
+
+test("交付页回显自定义风格描述", () => {
+  const h = harness({ stubDelivery: false });
+  h.run("renderDelivery(" + JSON.stringify({
+    runId: "r1", status: "success", videoUrl: "/api/video/r1",
+    brief: { canvasPreset: "social-portrait", durationSec: 30, language: "zh-CN" },
+    artifactManifest: { validated: true, style: { preset: "custom", label: "自定义", description: "黏土定格动画" } },
+    storyboard: [], storyboardGallery: [],
+  }) + ")");
+  assert.match(deliveryHtml(h), /风格：<b>自定义（黏土定格动画）<\/b>/);
+});
+
 test("动态视频默认显示自动解析结果，不再显示「不启用」", () => {
   const h = harness();
   assert.equal(h.run('pickDefaultVideoModel({ current: "" }, ["veo-3", "seedance-2.0", "minimax-h3"])'), "minimax-h3");

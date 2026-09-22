@@ -83,6 +83,9 @@ test("generateSceneVideo：同步返回 {data:[{url}]}（图生视频 image 已�
     assert.equal(gotBody.height, 1920);
     assert.equal(gotBody.size, "1080x1920");
     assert.match(gotBody.prompt, /#6366f1/, "logoColor 应注入 prompt");
+    // 全片画风漂移回归（PRD §16.13）：视频提交体必须与分镜、场景图同源携带风格锚点。
+    assert.match(gotBody.prompt, /全片统一风格锚点/, "视频提交 prompt 必须携带风格锚点");
+    assert.match(gotBody.prompt, /不得逐镜切换画风/);
   } finally {
     stub.close();
   }
@@ -387,6 +390,8 @@ test("generateSceneVideo：没有公网首帧 URL → 退化为文生，不发�
     assert.equal(out.videoUrl, "https://cdn.example.com/text2video.mp4");
     assert.equal("image" in gotBody, false, "无公网 URL 时不得发送 image 字段");
     assert.match(gotBody.prompt, /产品特写/);
+    // 退化只改输入形态，不得丢风格锚点。
+    assert.match(gotBody.prompt, /全片统一风格锚点/, "文生退化路径同样必须携带风格锚点");
   } finally {
     stub.close();
   }
