@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { generateSceneVideo } from "../src/mastra/providers.js";
+import { deliverySeed, generateSceneVideo } from "../src/mastra/providers.js";
 import { artifactPaths } from "../src/media/artifacts.js";
 import { setRuntimeConfig, getEffectiveOneApiBase } from "../src/runtime-config.js";
 
@@ -86,6 +86,13 @@ test("generateSceneVideo：同步返回 {data:[{url}]}（图生视频 image 已�
     // 全片画风漂移回归（PRD §16.13）：视频提交体必须与分镜、场景图同源携带风格锚点。
     assert.match(gotBody.prompt, /全片统一风格锚点/, "视频提交 prompt 必须携带风格锚点");
     assert.match(gotBody.prompt, /不得逐镜切换画风/);
+    // 固定 seed 只认 metadata：网关 TaskSubmitReq 的顶层 seed 会被直接丢弃（设计文档 §5.2）。
+    assert.equal(gotBody.seed, undefined, "顶层 seed 会被网关丢弃，不得只写顶层");
+    const expectedSeed = deliverySeed({ ...brief, videoModel: "kling-v1-6" });
+    assert.ok(Number.isInteger(expectedSeed), "种子必须是整数");
+    assert.equal(gotBody.metadata?.seed, expectedSeed, "视频 metadata.seed 必须与 Brief 同源");
+    // 生成审计：带公网首帧即图生视频，逐镜记录供 manifest 回显（PRD §16.13.2）。
+    assert.equal(out.videoMode, "image-to-video", "带公网首帧的镜次应记录为图生视频");
   } finally {
     stub.close();
   }
@@ -392,6 +399,8 @@ test("generateSceneVideo：没有公网首帧 URL → 退化为文生，不发�
     assert.match(gotBody.prompt, /产品特写/);
     // 退化只改输入形态，不得丢风格锚点。
     assert.match(gotBody.prompt, /全片统一风格锚点/, "文生退化路径同样必须携带风格锚点");
+    assert.equal(out.videoMode, "text-to-video", "无公网首帧时输入形态必须记录为文生视频");
+    assert.equal(gotBody.metadata?.seed, deliverySeed({ ...brief, videoModel: "kling-v1-6" }), "文生退化路径同样携带固定 seed");
   } finally {
     stub.close();
   }
@@ -959,6 +968,7 @@ test("generateSceneVideo：首帧图被上游内容审核拒绝 → 去掉首帧
     assert.equal(images.length, 2, "应先以带首帧被拒，再退化文生重试一次");
     assert.match(String(images[0]), /^https:\/\//u, "首次提交必须带首帧公网 URL");
     assert.equal(images[1], null, "退化重试不得再发送首帧图片");
+    assert.equal(out.videoMode, "text-to-video", "被审核拒绝后实际以文生出片，审计必须如实记录");
   } finally {
     stub.close();
     delete process.env.PROMO_VIDEO_ATTEMPTS;

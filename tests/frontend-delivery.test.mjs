@@ -162,6 +162,37 @@ test("已校验成片渲染 MP4 播放器与三类下载，并回显画布、模
   assert.match(html, /已通过（可交付）/);
 });
 
+test("交付区回显逐镜生成审计：模型与输入形态来自 manifest，缺失时不编造", () => {
+  const h = harness({ stubDelivery: false });
+  const run = {
+    runId: "r1", status: "success", videoUrl: "/api/video/r1",
+    brief: { canvasPreset: "social-portrait", durationSec: 30, language: "zh-CN", videoModel: "minimax-h3" },
+    artifactManifest: {
+      validated: true,
+      models: { video: "minimax-h3", tts: "speech-02-hd", music: "mureka-song" },
+      scenes: [
+        { index: 1, durationSec: 6, videoModel: "doubao-seedance-2-0-260128", videoMode: "image-to-video" },
+        { index: 2, durationSec: 6, videoModel: "minimax-h3", videoMode: "text-to-video" },
+      ],
+      timeline: { durationSec: 30 },
+    },
+    storyboard: [{ index: 1, videoUrl: "/api/runs/r1/scenes/1/video", videoMode: "image-to-video", subtitle: "第一句" }],
+    storyboardGallery: [],
+  };
+  h.run(`renderDelivery(${JSON.stringify(run)})`);
+  const html = deliveryHtml(h);
+  assert.match(html, /逐镜生成审计：图生视频 1 镜｜文生视频 1 镜/);
+  assert.match(html, /#1 图生视频 · <b>doubao-seedance-2-0-260128<\/b>/);
+  assert.match(html, /#2 文生视频 · <b>minimax-h3<\/b>/);
+  // 分镜卡片同步标注输入形态，用户不必对照两份清单
+  assert.match(html, /#1 ⦿动态 〔图生视频〕 第一句/);
+  // 历史 run 没有审计字段时不得编造标签或伪造计数
+  h.run(`renderDelivery(${JSON.stringify({ ...run, artifactManifest: { ...run.artifactManifest, scenes: [{ index: 1, durationSec: 6 }] }, storyboard: [{ index: 1, subtitle: "第一句" }] })})`);
+  const legacy = deliveryHtml(h);
+  assert.ok(!/逐镜生成审计/.test(legacy), "无审计字段时不得展示审计区块");
+  assert.ok(!/〔图生视频〕/.test(legacy), "无 videoMode 时不得编造输入形态标签");
+});
+
 test("校验通过的成片走 run-done 时提示 MP4 交付，DEMO 结果不得冒充成片", () => {
   const h = harness();
   const real = { runId: "r1", status: "success", videoUrl: "/api/video/r1", artifactManifest: { validated: true } };

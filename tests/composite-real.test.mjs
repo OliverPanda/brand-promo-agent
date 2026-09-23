@@ -326,6 +326,35 @@ test("全片风格固化：非默认预设与自定义描述经合成管线写�
   }
 });
 
+/** 说明：渠道降级后 manifest.models.video 不再等于实际出片模型，逐镜审计字段必须落盘（PRD §16.13.2）。*/
+test("生成审计：manifest.scenes 逐镜记录实际出片模型与输入形态", async () => {
+  const scenario = await buildScenario({ preset: "social-square", speechDurationsSec: [0.8, 0.8], tag: "audit" });
+  const audited = scenario.scenes.map((scene, index) => ({
+    ...scene,
+    videoModel: index === 0 ? "doubao-seedance-2-0-260128" : "minimax-h3",
+    videoMode: index === 0 ? "image-to-video" : "text-to-video",
+  }));
+  const result = await composeFinalVideo(composeOptions(scenario, { scenes: audited }));
+  assert.ok(result.validated, "带审计字段的片段必须照常通过成片校验");
+  assert.deepEqual(
+    result.manifest.scenes.map((scene) => [scene.videoModel, scene.videoMode]),
+    [["doubao-seedance-2-0-260128", "image-to-video"], ["minimax-h3", "text-to-video"]],
+    "交付清单必须逐镜记录实际模型与输入形态",
+  );
+  const onDisk = JSON.parse(fs.readFileSync(scenario.paths.manifest, "utf8"));
+  assert.deepEqual(onDisk.scenes, result.manifest.scenes, "落盘清单与返回清单的逐镜审计必须一致");
+});
+
+/** 说明：缺失审计字段的历史运行只能记为 null，不得伪造模型或输入形态（前端据此不展示标签）。*/
+test("生成审计：未提供模型与形态的镜次记为 null 而不是猜测值", async () => {
+  const scenario = await buildScenario({ preset: "social-square", speechDurationsSec: [0.8, 0.8], tag: "no-audit" });
+  const result = await composeFinalVideo(composeOptions(scenario));
+  assert.deepEqual(
+    result.manifest.scenes.map((scene) => [scene.videoModel, scene.videoMode]),
+    scenario.scenes.map(() => [null, null]),
+  );
+});
+
 test("配音与配乐可从 file / data / HTTP 来源进入合成", async () => {
   const scenario = await buildScenario({ preset: "social-square", speechDurationsSec: [0.8, 0.8], tag: "source" });
   const server = await listen((request, response) => {

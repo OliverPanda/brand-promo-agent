@@ -22,6 +22,7 @@ const { test, after } = await import("node:test");
 const assert = (await import("node:assert/strict")).default;
 const { normalizeSceneVideo } = await import("../src/media/ffmpeg.js");
 const providers = await import("../src/mastra/providers.js");
+const { deliverySeed } = providers;
 const {
   getProviderMode,
   generateScript,
@@ -466,6 +467,54 @@ test("generateSceneMedia 参考图为纯关键词 → 追加到 prompt（M2 行�
   assert.equal(calls[calls.length - 1].body.image, undefined, "关键词不应走 image 字段");
   assert.match(calls[calls.length - 1].body.prompt, /赛博朋克/, "关键词应拼入 prompt");
   assert.match(calls[calls.length - 1].body.prompt, /全片统一风格锚点/, "关键词路径同样携带风格锚点");
+});
+
+test("deliverySeed：同一 Brief 恒得同值，品牌名或卖点变化即换种子", () => {
+  const brief = { brandName: "铭星科技", coreSellingPoint: "一句话生成专业宣传片" };
+  assert.equal(deliverySeed(brief), deliverySeed({ ...brief }), "同 Brief 必须稳定，否则重跑会换片");
+  assert.equal(deliverySeed(brief), deliverySeed({ ...brief, productName: "别的产品" }), "与 Brand/卖点无关的字段不得影响种子");
+  assert.notEqual(deliverySeed(brief), deliverySeed({ ...brief, brandName: "别家公司" }));
+  assert.notEqual(deliverySeed(brief), deliverySeed({ ...brief, coreSellingPoint: "换个卖点" }));
+  const seed = deliverySeed(brief);
+  assert.ok(Number.isInteger(seed) && seed >= 0 && seed <= 0xffffffff, `种子必须是 32 位无符号整数，实际 ${seed}`);
+});
+
+test("generateSceneMedia：请求体携带与 Brief 一致的固定 seed（best-effort，网关当前会丢弃）", async () => {
+  calls = [];
+  const script = await generateScript(baseBrief);
+  const scenes = await generateStoryboard(baseBrief, script);
+  await generateSceneMedia(scenes[0], baseBrief);
+  assert.equal(calls[calls.length - 1].body.seed, deliverySeed(baseBrief), "图像请求必须带全片固定种子");
+});
+
+test("generateSceneMedia 像素锚点：无用户参考图时注入 image，用户显式参考图优先", async () => {
+  const script = await generateScript(baseBrief);
+  const scenes = await generateStoryboard(baseBrief, script);
+  const anchorUrl = "https://cdn.example/anchor-1.png";
+  // ① 无用户参考图 → 像素锚点写入 image 字段（图生图），与首帧同源
+  calls = [];
+  await generateSceneMedia(scenes[0], baseBrief, { referenceImageUrl: anchorUrl });
+  assert.equal(calls[calls.length - 1].body.image, anchorUrl, "像素锚点应作为 image 字段注入");
+  // ② 用户显式 data URL → 用户参考图优先，锚点不得覆盖
+  calls = [];
+  await generateSceneMedia(scenes[0], { ...baseBrief, styleReference: "data:image/png;base64,iVBORw0KGgo=" }, { referenceImageUrl: anchorUrl });
+  assert.equal(calls[calls.length - 1].body.image, "iVBORw0KGgo=", "用户显式参考图优先于系统像素锚点");
+  // ③ 用户显式 http URL → 同上
+  calls = [];
+  await generateSceneMedia(scenes[0], { ...baseBrief, styleReference: "https://cdn.example/user-ref.png" }, { referenceImageUrl: anchorUrl });
+  assert.equal(calls[calls.length - 1].body.image, "https://cdn.example/user-ref.png", "用户显式 URL 参考图优先于像素锚点");
+  // ④ 纯关键词 → 不占用 image 字段，锚点照常注入
+  calls = [];
+  await generateSceneMedia(scenes[0], { ...baseBrief, styleReference: "赛博朋克" }, { referenceImageUrl: anchorUrl });
+  assert.equal(calls[calls.length - 1].body.image, anchorUrl, "关键词路径必须仍走像素锚点");
+  assert.match(calls[calls.length - 1].body.prompt, /赛博朋克/);
+  // ⑤ 非公网 / 缺失锚点 → 不注入 image，也不得把本机地址发出去
+  calls = [];
+  await generateSceneMedia(scenes[0], baseBrief, { referenceImageUrl: "http://127.0.0.1:6777/local.png" });
+  assert.equal(calls[calls.length - 1].body.image, undefined, "本机地址不得作为像素锚点");
+  calls = [];
+  await generateSceneMedia(scenes[0], baseBrief, {});
+  assert.equal(calls[calls.length - 1].body.image, undefined, "无锚点时不注入 image");
 });
 
 test("generateVoiceover 真实模式：每句调用 TTS、物化探测、拼接并聚合真实用量", async () => {
