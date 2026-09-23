@@ -288,6 +288,11 @@
   .fail-box .fail-hd { font-weight:650; color:var(--bad); margin-bottom:var(--sp-2); }
   .cost-box { margin-top:var(--sp-3); padding:var(--sp-3); border:1px solid var(--line); border-radius:var(--r-sm); background:var(--card-inset); }
   .cost-box ul { margin:var(--sp-2) 0 0; padding-left:18px; font-size:12.5px; color:var(--sub); }
+  /* 逐镜生成审计：渠道降级后 manifest.models.video 不再等于实际出片模型，必须逐镜回显（PRD §16.13.2）*/
+  .gen-audit { margin-top:var(--sp-2); font-size:13px; color:var(--sub); }
+  .gen-audit ul { display:flex; flex-wrap:wrap; gap:4px var(--sp-3); margin:var(--sp-1) 0 0; padding:0; list-style:none; }
+  .gen-audit li { color:var(--sub); }
+  .gen-audit b { color:var(--txt); font-weight:600; }
 
   /* ══ 弹层：ESC / 点遮罩 / 关闭按钮 三种退出路径 ══ */
   .modal { position:fixed; inset:0; background:rgba(15,23,42,.45); display:flex; align-items:center; justify-content:center;
@@ -1825,7 +1830,9 @@ async function approveFinal(approve) {
 function sceneHtml(s, opts) {
   const fail = opts?.fail || s.status === "failed";
   const cls = fail ? "scene failed" : "scene";
-  const cap = `#${s.index}${s.videoUrl ? " ⦿动态" : ""} ${esc(s.subtitle || s.visualPrompt || "")}`;
+  // 说明：videoMode 由服务端逐镜记录，直接来自 manifest 同源字段；缺失时不得编造标签。
+  const modeTag = s.videoMode === "image-to-video" ? "图生视频" : s.videoMode === "text-to-video" ? "文生视频" : "";
+  const cap = `#${s.index}${s.videoUrl ? " ⦿动态" : ""}${modeTag ? ` 〔${modeTag}〕` : ""} ${esc(s.subtitle || s.visualPrompt || "")}`;
   let media;
   if (s.videoUrl) {
     media = `<video src="${esc(s.videoUrl)}" poster="${s.mediaUrl ? esc(s.mediaUrl) : ""}" controls preload="metadata" style="width:100%;max-height:190px;background:#000;border-radius:6px;"></video>`;
@@ -1886,6 +1893,18 @@ function renderDelivery(run) {
   html += `<div class="kv">${bits.map((b) => `<span>${esc(b)}</span>`).join("")}</div>`;
   if (manifest.scenes?.length) {
     html += `<div class="kv"><span>成片镜头：<b>${manifest.scenes.length} 个</b></span><span>时间轴：<b>${timeOf(manifest.timeline?.durationSec)}s</b></span></div>`;
+    // 生成审计（PRD §16.13.2）：渠道降级后逐镜实际出片模型与输入形态与请求端不一致，这里给出权威口径。
+    const modes = manifest.scenes.map((scene) => scene?.videoMode);
+    const countOf = (value) => modes.filter((mode) => mode === value).length;
+    const modeLabel = (mode) => mode === "image-to-video" ? "图生视频" : mode === "text-to-video" ? "文生视频" : "";
+    const audited = manifest.scenes.filter((scene) => modeLabel(scene?.videoMode) || scene?.videoModel);
+    if (audited.length) {
+      const summary = [`图生视频 ${countOf("image-to-video")} 镜`, `文生视频 ${countOf("text-to-video")} 镜`]
+        .filter((item) => !/ 0 镜$/.test(item)).join("｜");
+      html += `<div class="gen-audit"><div>逐镜生成审计${summary ? `：${summary}` : ""}</div><ul>` +
+        audited.map((scene) => `<li>#${esc(scene.index ?? "?")} ${esc(modeLabel(scene.videoMode) || "输入形态未记录")}${scene.videoModel ? ` · <b>${esc(scene.videoModel)}</b>` : ""}</li>`).join("") +
+        `</ul></div>`;
+    }
   }
   // 成本汇总（M2 / FR-10）—— 用 cost-box 组件
   if (run.cost && run.cost.length) {
