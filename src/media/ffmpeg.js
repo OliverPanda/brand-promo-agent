@@ -470,7 +470,7 @@ function defaultStyleManifest() {
  * 以权威语音时间轴合成带配音、配乐与中文硬字幕的成片，校验后原子提升到 run 目录。
  *
  * @param {{
- *   scenes: Array<{index?: number, videoPath: string, durationSec: number}>,
+ *   scenes: Array<{index?: number, videoPath: string, durationSec: number, videoModel?: string|null, videoMode?: string|null}>,
  *   voice: {voicePath?: string, voiceUrl?: string, cues: Array<{lineIndex?: number, startMs: number, endMs: number, text: string}>, durationSec: number},
  *   music: {musicPath?: string, musicUrl?: string},
  *   paths: ReturnType<typeof import("./artifacts.js").artifactPaths>,
@@ -507,6 +507,9 @@ export async function composeFinalVideo(options) {
     return {
       clip: managedFile(paths.scenes, scene?.videoPath, `第 ${index + 1} 镜标准化动态片段`),
       durationSec,
+      // 说明：逐镜记录实际出片模型与输入形态（图生视频/文生退化），交付清单据此审计渠道降级（见 PRD §16.13.2）。
+      videoModel: scene?.videoModel ?? null,
+      videoMode: scene?.videoMode ?? null,
     };
   });
 
@@ -666,6 +669,8 @@ export async function composeFinalVideo(options) {
       index: index + 1,
       durationSec: clip.durationSec,
       bytes: (await fs.promises.stat(clip.clip)).size,
+      videoModel: clip.videoModel,
+      videoMode: clip.videoMode,
     })));
 
     await promoteArtifacts(paths, {

@@ -44,6 +44,20 @@ function hashSeed(str = "") {
   }
   return h >>> 0;
 }
+
+/**
+ * 交付级固定 seed：同一 Brief 恒得同值，全片图像与视频共用一个种子，收敛同 prompt 下的随机抖动。
+ *
+ * 说明：seed 只降低抖动，不替代风格锚点（见 PRD §16.13.3）；图像侧 seed 在当前网关版本会被丢弃，属 best-effort。
+ *
+ * @param {Record<string, any>} brief 已解析 Brief。
+ * @returns {number} 32 位无符号整数。
+ * @example deliverySeed({ brandName: "MingStar", coreSellingPoint: "AI 创作" }); // 1234567890
+ */
+export function deliverySeed(brief = {}) {
+  return hashSeed(`${brief.brandName || ""}${brief.coreSellingPoint || ""}`);
+}
+
 function mulberry32(a) {
   return function () {
     a |= 0;
@@ -566,7 +580,8 @@ function demoStoryboard(brief, script) {
  * 生成场景图；传入受管目录时立即物化并归一化为所选画布。
  * @param {Record<string, any>} scene 场景描述，归一化成功后写入 `mediaPath`。
  * @param {Record<string, any>} brief 已解析 Brief。
- * @param {{inputsWorkspace?: string, scenesWorkspace?: string}} [options] `artifactPaths(runId)` 提供的受管目录。
+ * @param {{inputsWorkspace?: string, scenesWorkspace?: string, referenceImageUrl?: string}} [options] `artifactPaths(runId)` 提供的受管目录；
+ *   `referenceImageUrl` 为像素锚点（通常取第 1 镜成图的公网 URL），仅当用户未显式提供参考图时作为 `image` 字段注入。
  * @returns {Promise<{mediaPath?: string, mediaUrl: string, frameImageUrl?: string, kind: string, model: string, _usage?: object}>} 标准场景图或 DEMO 媒体；
  *   `frameImageUrl` 仅当图像渠道返回公网 http(s) URL 时存在，供图生视频首帧使用（本地标准化文件不能作首帧，见设计文档 §6.2）。
  * @example await generateSceneMedia(scene, brief, { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes });
@@ -585,23 +600,31 @@ export async function generateSceneMedia(scene, brief, options = {}) {
   const size = isSeedream && /^(1K|2K|4K)$/i.test(configuredSeedreamSize || "")
     ? configuredSeedreamSize.toUpperCase()
     : isSeedream ? "1K" : `${canvas.width}x${canvas.height}`;
-  const body = { model, prompt, n: 1, size };
+  // 说明：seed 为 best-effort——当前网关 calciumion/new-api:v0.13.2 的 ImageRequest 不识别该字段且 Extra 合并被注释掉，
+  // 序列化时会丢弃；仍按标准字段提交，待网关放开 Extra 合并后自动生效（见 PRD §16.13.3、设计文档 §5.2）。
+  const body = { model, prompt, n: 1, size, seed: deliverySeed(brief) };
   if (isSeedream) {
     body.aspect_ratio = canvas.aspectRatio;
   }
   // M3-D 真实参考图图生图（Seedream 参考图输入，M2 仅关键词透传）：
   //   styleReference 为 data:image 或 http(s) URL → 作为 image 字段走图生图（参考图输入免费，见 PRD §10）。
   //   纯关键词（非 URL）→ 追加到 prompt（M2 行为，向后兼容）。
+  // 参考图优先级：用户显式 styleReference（data:/http）> 系统像素锚点；纯关键词不占用 image 字段，像素锚点照常注入。
   const ref = brief.styleReference;
+  let imageInput = null;
   if (ref) {
     if (/^data:image\//i.test(ref)) {
-      body.image = ref.replace(/^data:image\/[^;]+;base64,/, ""); // 去前缀，留 base64
+      imageInput = ref.replace(/^data:image\/[^;]+;base64,/, ""); // 去前缀，留 base64
     } else if (/^https?:\/\//i.test(ref)) {
-      body.image = ref; // one-api 支持 URL 参考图
+      imageInput = ref; // one-api 支持 URL 参考图
     } else {
       body.prompt = `${prompt}；参考风格：${ref}`;
     }
   }
+  // 说明：像素锚点把「文字锚点」升级为「像素锚点」——第 1 镜成图作为后续镜的参考图，压制跨镜画风漂移。
+  // 退化：图像渠道只回 b64_json 时没有公网 URL，锚点不可用，静默回落纯文字锚点（由调用方 warn）。
+  if (!imageInput && isPublicHttpUrl(options.referenceImageUrl)) imageInput = options.referenceImageUrl;
+  if (imageInput) body.image = imageInput;
   const data = await oneApiPost("/images/generations", body);
   const item = data.data?.[0] || {};
   const mediaUrl = item.url || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null);
@@ -695,7 +718,7 @@ function videoFailureReason(task) {
  * @returns {boolean} 可作为图生视频首帧时返回 true。
  * @example isPublicHttpUrl("https://example.com/s1.png"); // true
  */
-function isPublicHttpUrl(value) {
+export function isPublicHttpUrl(value) {
   if (typeof value !== "string" || !/^https?:\/\//i.test(value)) return false;
   let host;
   try {
@@ -890,7 +913,7 @@ export function isFrameRejectedVideoError(error) {
  * @param {Record<string, any>} scene 已含标准场景图、公网首帧 URL（可选）和权威 `durationSec` 的场景。
  * @param {Record<string, any>} brief 已解析 Brief。
  * @param {{inputsWorkspace?: string, scenesWorkspace?: string}} [options] `artifactPaths(runId)` 提供的受管目录。
- * @returns {Promise<{videoPath?: string, videoUrl: string|null, kind: string, model: string, _usage?: object}>} 标准视频或 DEMO stub。
+ * @returns {Promise<{videoPath?: string, videoUrl: string|null, kind: string, model: string, videoMode?: string, _usage?: object}>} 标准视频或 DEMO stub；`videoMode` 为 `image-to-video` / `text-to-video`。
  * @throws {Error} 重试耗尽、或遇到契约类错误时抛出，错误信息含上游真实原因。
  * @example await generateSceneVideo(scene, brief, { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes });
  */
@@ -954,7 +977,9 @@ export async function generateSceneVideo(scene, brief, options = {}) {
   }
   if (!task) throw lastError || new Error("视频生成失败");
   // 物化与生成重试完全分离：这里失败只会对同一 URL 重试下载/归一化，绝不重新提交付费生成任务。
-  return await finalizeSceneVideoWithRetry(task, scene, brief, options);
+  const result = await finalizeSceneVideoWithRetry(task, scene, brief, options);
+  // 说明：videoMode 记录本镜实际输入形态（与 requestSceneVideoTask 的首帧判定同源），供 manifest 逐镜审计。
+  return { ...result, videoMode: canDropFrame && !frameDropped ? "image-to-video" : "text-to-video" };
 }
 
 /**
@@ -968,7 +993,7 @@ export async function generateSceneVideo(scene, brief, options = {}) {
  * @param {string} [modelOverride] 本次尝试使用的模型；缺省取 Brief.videoModel / env，供整镜降级链逐级指定。
  * @param {{dropFrame?: boolean}} [options] `dropFrame` 为 true 时不发送首帧，强制走文生视频
  *   （首帧图被上游内容审核拒绝后的退化路径，见设计文档 §6.2 第 5 条）。
- * @returns {Promise<{videoUrl: string, model: string, taskStatus: string|null}>} 成片地址与上游任务终态。
+ * @returns {Promise<{videoUrl: string, model: string, taskStatus: string|null}>} 成片地址与上游任务终态；提交体通过 `metadata.seed` 携带全片固定种子。
  * @throws {Error} 提交失败、轮询失败或任务到达失败终态时抛出。
  * @example await requestSceneVideoTask(scene, { ...brief, videoModel: "minimax-h3" }, "minimax-h3", { dropFrame: true });
  */
@@ -996,6 +1021,9 @@ async function requestSceneVideoTask(scene, brief, modelOverride, { dropFrame = 
     width: canvas.width,
     height: canvas.height,
     size: `${canvas.width}x${canvas.height}`,
+    // 说明：网关 TaskSubmitReq 只透传 metadata，顶层 seed 会被直接丢弃；metadata 经 UnmarshalMetadata 合入渠道请求，
+    // 无 seed 字段的渠道（minimax-h3）会静默忽略该键，因此对所有候选模型都安全（见设计文档 §5.2）。
+    metadata: { seed: deliverySeed(brief) },
   };
   // 首帧来源：上游视频渠道自行下载该图片，只接受公网 http(s) URL。2026-09 实测：data: URL 被上游拒绝
   // （refusing to download from disallowed scheme 'data'），localhost/host.docker.internal 等本机地址同样不可达，

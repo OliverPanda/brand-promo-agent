@@ -26,6 +26,7 @@ import {
   generateMusic,
   composite,
   getProviderMode,
+  isPublicHttpUrl,
 } from "./providers.js";
 import { emitProgress, emitRunDone } from "./eventBus.js";
 import { updateRun, setStep, getRun } from "../store.js";
@@ -397,11 +398,22 @@ const generateScenes = createStep({
       // 后续预览、图生视频首帧与最终合成都只消费这些标准资产（不暴露渠道原始 URL 或本机路径）。
       const paths = artifactPaths(rid);
       const mediaOptions = { inputsWorkspace: paths.inputs, scenesWorkspace: paths.scenes };
+      // 说明：第 1 镜成图后把它的公网 URL 作为后续镜的像素锚点（图生图参考），把文字锚点升级为像素锚点；
+      // 只有在图像渠道返回公网 URL 时才可用，否则静默回落纯文字锚点（见 PRD §16.13.4）。
+      let pixelAnchorUrl = null;
+      let pixelAnchorMissWarned = false;
       for (const scene of storyboard) {
-        const media = await generateSceneMedia(scene, brief, mediaOptions);
+        const media = await generateSceneMedia(scene, brief, { ...mediaOptions, referenceImageUrl: pixelAnchorUrl || undefined });
         // mediaModel 透传实际使用的图像模型（brief.imageModel 请求级覆盖 > env 默认），供交付页展示
         // frameImageUrl：图像渠道的公网首帧 URL，供图生视频使用；本地 mediaPath 只用于预览与合成。
         const done = { ...scene, mediaUrl: media.mediaUrl, frameImageUrl: media.frameImageUrl, mediaModel: media.model, status: "done" };
+        if (!pixelAnchorUrl && isPublicHttpUrl(media.frameImageUrl)) {
+          pixelAnchorUrl = media.frameImageUrl;
+        } else if (!pixelAnchorUrl && !pixelAnchorMissWarned && getProviderMode() === "real") {
+          // 说明：b64_json 形态没有公网 URL，像素锚点不可用；只 warn 一次，不得影响链路成功。
+          pixelAnchorMissWarned = true;
+          console.warn(`[scenes] 图像渠道未返回公网 URL，像素锚点不可用（第 ${done.index} 镜），本次运行回落到纯文字风格锚点`);
+        }
         // 说明：REAL 模式任一动态片段失败即整步失败（不再退回静态图）；DEMO 走 stub 不计费。
         if (getProviderMode() === "real") {
           if (!brief.videoModel) throw new Error("真实成片要求动态视频模型（Brief.videoModel 未解析）");
@@ -410,6 +422,8 @@ const generateScenes = createStep({
           done.videoPath = vid.videoPath;
           done.videoUrl = vid.videoUrl;
           done.videoModel = vid.model;
+          // 说明：逐镜记录实际输入形态，交付 manifest 据此审计「图生视频 / 文生退化」。
+          done.videoMode = vid.videoMode;
           emitProgress(rid, STEP.SCENES, "step-progress", { scene: done.index, result: "video-done" });
         } else {
           if (brief.videoModel) {
