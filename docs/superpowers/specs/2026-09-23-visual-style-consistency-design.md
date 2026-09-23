@@ -65,3 +65,35 @@ FR-4.5 的首帧内容审核退化（`InputImageSensitiveContentDetected.Privacy
 3. 纯文生与首帧退化两条视频路径的 prompt 都包含风格锚点。
 4. 未知 `stylePreset` / `custom` 缺 `styleDescription` 在 `POST /api/generate` 返回 400。
 5. 交付页在 `brief.stylePreset` 或 `manifest.style` 存在时展示风格标签。
+
+## 5. 第二阶：生成审计、固定 seed 与像素锚点
+
+第一阶只解决了「提示词同源」。实测仍存在三类残余漂移：交付清单看不到每镜实际用的是哪个视频模型、走的是图生视频还是文生退化；同 prompt 下逐镜仍有随机抖动；以及跨镜之间没有任何像素级约束。第二阶按序补齐这三点。
+
+### 5.1 生成审计（manifest 逐镜记录）
+
+- `providers.generateSceneVideo` 在返回结果上附加 `videoMode`，取值由与首帧判定同源的谓词导出：`canDropFrame && !frameDropped` 为 `image-to-video`，否则为 `text-to-video`。
+- `workflow.generateScenes` 把 `vid.videoMode` 写入该镜；`ffmpeg.composeFinalVideo` 把 `videoModel` / `videoMode` 带入 `manifest.scenes[i]`。
+- 语义分工：`manifest.models.video` 是请求端解析出的模型，`manifest.scenes[i].videoModel` 是实际出片模型。渠道降级后两者不同，逐镜记录是权威口径。
+
+### 5.2 固定 seed
+
+- seed 取 `hashSeed(brief.brandName + brief.coreSellingPoint)`，全片同值、不逐镜变化；同一 Brief 重复生成得到相同 seed。
+- 视频提交体走 `body.metadata.seed`。依据（网关源码 `napi-audit/src/new-api-0.13.2`）：`relay/common/relay_info.go:676-687` 的 `TaskSubmitReq` 只认 `prompt/model/mode/image/images/size/duration/seconds/input_reference/metadata`，顶层 `seed` 被丢弃；`relay/channel/task/doubao/adaptor.go:59` 定义 `Seed *dto.IntValue`，`:289` 经 `taskcommon.UnmarshalMetadata` 把 `metadata` 合入渠道请求；`task/taskcommon/helpers.go:16-30` 先删掉 metadata 里的 model 键再 JSON 往返，全仓库无 `DisallowUnknownFields`，因此未知 metadata 键静默忽略——minimax-h3（`task/hailuo/models.go:8-20` 无 seed 字段）收到该键无副作用。`dto/values.go:30-52` 的 `IntValue` 同时接受数字与数字字符串，传整数即可。
+- 图像提交体带 `seed` 属于 best-effort：`dto/openai_image.go:14-37` 的 `ImageRequest` 不含 `seed`，未知字段落入 `Extra`，而 `:82-88` 的 `Extra` 合并被显式注释掉（原文 `// 不能合并ExtraFields！！！！！！！！`），序列化即丢；`relay/channel/volcengine/adaptor.go:108-111` 对 `RelayModeImagesGenerations` 直接原样返回，不做补救。既有测试只断言客户端 body，所以仍会通过。结论是图像 seed 当前不会到达上游，本改动不声称它已生效。
+- 不为此打真实付费接口做验证；以客户端请求体断言覆盖。
+
+### 5.3 像素锚点
+
+- `generateSceneMedia` 新增 `options.referenceImageUrl`；命中公网 http(s) 且未被用户显式参考图占用时，写入 `body.image`。
+- 优先级显式定义：用户显式 `styleReference`（`data:` 或 http(s)）> 像素锚点；纯关键词 `styleReference` 不占用 `image` 字段，像素锚点照常注入。理由是用户最新明确要求优先于系统默认策略（AGENTS.md 优先级规则）。
+- `workflow.generateScenes` 保持单循环 image→video 的既有顺序，第 1 镜图像完成后把其 `frameImageUrl` 记为像素锚点，后续镜以 `mediaOptions.referenceImageUrl` 传入。
+- 退化：`frameImageUrl` 只在图像渠道返回公网 URL 时存在。只回 `b64_json` 时静默跳过并 `warn` 一次，回到纯文字锚点；`tests/workflow-real-budget.test.mjs` 的图像 mock 正好只回 `b64_json`，该链路必须继续通过。
+- `frameImageUrl` 语义不变，仍供本镜图生视频首帧使用；像素锚点是对它的额外复用，不改变首帧来源。
+
+## 6. 验收（第二阶）
+
+1. 带公网首帧的镜次 `videoMode` 为 `image-to-video`，无首帧或被拒退化的镜次为 `text-to-video`。
+2. `manifest.scenes[i]` 含 `videoModel` / `videoMode`，且与 store 中该镜实际值一致。
+3. 同一 Brief 两次求 seed 相同，不同 Brief 不同；视频提交体 `metadata.seed` 与之相等。
+4. 用户显式 `styleReference`（data:/http）时 `body.image` 仍为用户的参考图；纯关键词时像素锚点照常注入；无公网锚点时不注入且不失败。

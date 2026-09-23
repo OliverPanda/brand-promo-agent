@@ -755,7 +755,7 @@ REAL 模式删除全部「成功降级」行为：单镜动态视频失败、TTS
 ### 16.12.5 成片校验门与交付契约
 
 - 进入 `awaiting_delivery` 前校验：文件存在且大于下限、容器为 MP4/MOV、视频 H.264、音频 AAC 且声道非空、分辨率与像素格式等于画布、时长偏差在容差内、SRT 含全部确认台词、首末字幕区域像素差异超阈值、产物位于持久化目录。
-- 产物落盘：`data/outputs/<runId>/{final.mp4,subtitles.srt,poster.jpg,manifest.json}`；`manifest.json` 记录画布、模型、各镜时长、音频参数、FFmpeg 版本与摘要，不含密钥。
+- 产物落盘：`data/outputs/<runId>/{final.mp4,subtitles.srt,poster.jpg,manifest.json}`；`manifest.json` 记录画布、模型、各镜时长、每镜实际生效的视频模型与生成模式（`image-to-video` / `text-to-video`）、音频参数、FFmpeg 版本与摘要，不含密钥。
 - 下载契约：`GET /api/video/:runId` 为 `video/mp4` 且支持 Range 在线播放；`GET /api/runs/:runId/artifacts/{video|subtitles|poster}` 为附件下载，仅 `success`/`awaiting_delivery` 且 REAL 下 `artifactManifest.validated===true` 时可下载，否则 409。
 - 输出目录生命周期与 run 一致：store 淘汰最旧 run 时只删除该 runId 在 `data/outputs` 下的目录，应用重启不清理有效 run。
 
@@ -796,6 +796,26 @@ REAL 模式删除全部「成功降级」行为：单镜动态视频失败、TTS
 
 - 「画面风格」提供受控预设下拉（真人实拍/动漫/3D 渲染/插画/国风水墨/自定义），默认「真人实拍」；选「自定义」时展开 ≤200 字风格描述输入且为必填。
 - 交付区的 manifest 回显段展示解析后的风格标签，便于人工核对成片风格与简报一致。
+
+#### 16.13.2 生成审计（manifest 逐镜记录）
+
+- `manifest.models.video` 记录的是「请求端解析出的」视频模型；`manifest.scenes[i].videoModel` 才是第 i 镜「实际出片」的模型。渠道降级后两者可能不同，交付核对与计费口径均以逐镜记录为准。
+- `manifest.scenes[i].videoMode` 记录该镜实际输入形态：带公网首帧且成功走图生视频为 `image-to-video`；没有公网首帧、或首帧被上游内容审核拒绝后退化为纯文生为 `text-to-video`。
+- 逐镜条目保留既有 `index` / `durationSec` / `bytes`，新增字段向后兼容，旧消费方不受影响。
+
+#### 16.13.3 固定 seed（同片同种子）
+
+- 同一 run 内的全部图像与视频调用共用同一个 seed，取值 `hashSeed(brief.brandName + brief.coreSellingPoint)`（32 位无符号整数）。同一 Brief 恒得同值，不同 Brief 得不同值。
+- 视频侧 seed 必须写入提交体的 `metadata.seed`：网关 `TaskSubmitReq` 只透传 `metadata`，顶层 `seed` 会被直接丢弃；`metadata` 经 `UnmarshalMetadata` 合入渠道请求，未知键静默忽略，因此对无 seed 能力的渠道（如 minimax-h3）无害。
+- 图像侧 seed 为 best-effort：当前网关 `calciumion/new-api:v0.13.2` 的 `dto/openai_image.go` 不识别 `seed` 字段，`Extra` 合并逻辑在 `:82-88` 被显式注释，`relay/channel/volcengine/adaptor.go:108-111` 对 `images/generations` 原样透传，因此 seedream 系图像请求不会真正收到 seed。仍按标准字段提交，待网关放开 Extra 合并后自动生效；本节不宣称图像 seed 已生效。
+- seed 只收敛同 prompt 下的随机抖动，不替代 §16.13 的风格锚点：风格一致性由文字锚点与像素锚点共同保证。
+
+#### 16.13.4 像素锚点（第 1 镜成图作后续镜参考）
+
+- 第 1 镜图像完成后，若图像渠道返回了公网 http(s) URL（`frameImageUrl`），该 URL 作为后续所有镜头 `generateSceneMedia` 的 `image` 参考图（像素锚点），把纯文字锚点升级为像素锚点。
+- 优先级：用户显式 `styleReference` 为 `data:image` 或 http(s) URL 时占用 `image` 字段，像素锚点不得覆盖用户显式参考图；纯关键词 `styleReference`（非 URL）只拼入 prompt，不占用 `image` 字段，像素锚点照常注入。
+- 退化策略：图像渠道只返回 `b64_json`（无公网 URL）时像素锚点不可用，静默跳过并 `warn` 一次，回落到纯文字锚点；不得因此让整条链路失败。
+- `frameImageUrl` 语义不变，仍指本镜自身成图、供图生视频首帧使用；像素锚点只是把它额外复用为后续镜头的图像参考。
 
 ---
 
